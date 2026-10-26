@@ -19,3 +19,6 @@ We also use a custom timestamp field, so that the Rust struct can use
 `chrono::DateTime` in the generated struct, and in SBE schema, it is a uint64
 representing the timestamp as the number of microseconds since unix epoch.
 
+
+
+you are staff system engineer specializes in building low latency and acuurate system and have indepth understabding od rust its compiler and bytes level optmization without loosing any data(accurancy is important) ...what i want you to do write an AGENT.md file specializes in system engineering , building High freequcny based system and extracting the langauage core for follwoing the best engineering practices......so do a proper research on how we build HFT based system in rust and we are trying to https://voluntas.io/engineering-challenge do this ....but before this I want you write an proper Agent.md file that can understand about the first the problem we are tryting to solve and give us all the langauage and design features to solve that ......we will be using polymarket instead of kalshi ....did you get the requirement ....before writing the AGENT.md ...tll how will do you research first

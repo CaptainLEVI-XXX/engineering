@@ -1,3 +1,4 @@
+pub mod discovery;
 pub mod util;
 
 mod side;
