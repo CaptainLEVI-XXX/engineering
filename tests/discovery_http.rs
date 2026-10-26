@@ -111,6 +111,7 @@ async fn pagination_is_incremental_and_a_failed_version_does_not_erase_the_other
     assert!(!report.scans[0].pagination_complete);
     assert!(report.scans[0].error.is_some());
     assert!(report.scans[1].pagination_complete);
+    assert!(!report.coverage_accepted());
     server.join().unwrap();
 }
 
@@ -140,7 +141,84 @@ async fn uncertain_record_triggers_closed_any_lookup_and_does_not_block_other_ma
     assert_eq!(report.desired_assets, 4);
     assert_eq!(report.pending_verifications, 0);
     assert_eq!(report.scans[0].unresolved_records, 1); // Historical scan accounting is not rewritten.
+    assert!(!report.coverage_accepted());
     server.join().unwrap();
+}
+
+#[tokio::test]
+async fn v2_verification_uses_its_adapter_even_when_native_ids_overlap_v1() {
+    let v1 = market(0);
+    let mut v2 = market(1);
+    v2["id"] = v1["id"].clone();
+    v2["positionIds"] = serde_json::from_str(v1["clobTokenIds"].as_str().unwrap()).unwrap();
+    let mut uncertain = v2.clone();
+    uncertain["active"] = Value::Null;
+    let (url, server) = server(vec![
+        (
+            vec!["version=v1", "closed=false"],
+            200,
+            json!({"markets":[v1]}),
+        ),
+        (
+            vec!["version=v2", "closed=false"],
+            200,
+            json!({"markets":[uncertain]}),
+        ),
+        (
+            vec!["version=v2", "closed=any", "id=559651"],
+            200,
+            json!({"markets":[v2]}),
+        ),
+    ]);
+    let (mut discovery, _commands, _changes) = Discovery::new(Gamma::new(&url).unwrap());
+    let report = discovery.run_for(Duration::from_secs(10), true).await;
+    assert_eq!(report.desired_assets, 4);
+    assert_eq!(report.identity_conflicts, 0);
+    assert_eq!(report.uncertain_markets, 0);
+    assert_eq!(report.pending_verifications, 0);
+    assert_eq!(report.scans[0].unresolved_records, 0);
+    assert_eq!(report.scans[1].unresolved_records, 1);
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn strict_acceptance_requires_clean_complete_traversals_not_just_connectivity() {
+    let mut disabled = market(0);
+    disabled["id"] = json!("disabled");
+    disabled["enableOrderBook"] = json!(false);
+    disabled["clobTokenIds"] = Value::Null;
+    let (url, server) = server(vec![
+        (
+            vec!["version=v1", "closed=false"],
+            200,
+            json!({"markets":[market(0),disabled],"next_cursor":"tail"}),
+        ),
+        (
+            vec!["version=v2", "closed=false"],
+            200,
+            json!({"markets":[market(1)]}),
+        ),
+        (
+            vec!["version=v1", "after_cursor=tail"],
+            200,
+            json!({"markets":[]}),
+        ),
+    ]);
+    let (mut discovery, _commands, _changes) = Discovery::new(Gamma::new(&url).unwrap());
+    let mut report = discovery.run_for(Duration::from_secs(10), true).await;
+    assert_eq!(report.desired_assets, 4);
+    assert!(report.coverage_accepted());
+    server.join().unwrap();
+    // Counterexamples: discarded unknown work and conflicts cannot pass by
+    // merely emptying pending work. These counters outlive individual sweeps.
+    report.expired_verifications = 1;
+    assert!(!report.coverage_accepted());
+    report.expired_verifications = 0;
+    report.verification_overflow = 1;
+    assert!(!report.coverage_accepted());
+    report.verification_overflow = 0;
+    report.identity_conflicts = 1;
+    assert!(!report.coverage_accepted());
 }
 
 #[tokio::test]
@@ -164,6 +242,38 @@ async fn retryable_error_is_bounded_and_repeated_cursor_is_not_success() {
     assert_eq!(report.desired_assets, 4);
     assert!(!report.scans[0].pagination_complete);
     server.join().unwrap();
+}
+
+#[tokio::test]
+async fn oversized_final_verification_page_cannot_retire_known_market() {
+    for (count, desired, failures) in [(1000, 2, 0), (1001, 4, 1)] {
+        let mut closed = market(0);
+        closed["closed"] = json!(true);
+        closed["acceptingOrders"] = json!(false);
+        let (url, server) = server(vec![
+            (
+                vec!["version=v1", "closed=false"],
+                200,
+                json!({"markets":[market(0),closed.clone()]}),
+            ),
+            (
+                vec!["version=v1", "closed=any", "id=559651"],
+                200,
+                json!({"markets":vec![closed; count]}),
+            ),
+            (
+                vec!["version=v2", "closed=false"],
+                200,
+                json!({"markets":[market(1)]}),
+            ),
+        ]);
+        let (mut discovery, _commands, _changes) = Discovery::new(Gamma::new(&url).unwrap());
+        let report = discovery.run_for(Duration::from_secs(10), true).await;
+        assert_eq!(report.desired_assets, desired);
+        assert_eq!(report.failed_verification_batches, failures);
+        assert_eq!(report.uncertain_markets, failures);
+        server.join().unwrap();
+    }
 }
 
 #[tokio::test]
@@ -232,9 +342,7 @@ async fn live_discovery_coverage() {
         serde_json::to_string_pretty(&report).unwrap()
     );
     assert!(
-        report.scans.iter().all(|s| s.pages > 0),
-        "both protocol versions must be reached"
+        report.coverage_accepted(),
+        "strict observed-discovery acceptance failed; see report (not proof of exchange-wide coverage)"
     );
-    assert!(report.desired_assets > 0);
-    // Traversal completion and unresolved coverage are reported, not assumed.
 }

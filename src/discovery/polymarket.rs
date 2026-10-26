@@ -1,5 +1,5 @@
 //! Gamma transport and paginated discovery driver.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -9,7 +9,10 @@ use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, sleep, sleep_until};
 
-use super::{MarketKey, Page, Registry, Snapshot, Version};
+use super::{AdapterId, MarketKey, Registry, Snapshot};
+
+mod adapters;
+pub use adapters::{GammaAdapter, PolymarketV1, PolymarketV2, Version, adapter};
 
 pub const GAMMA_MARKETS: &str = "https://gamma-api.polymarket.com/markets/keyset";
 
@@ -31,7 +34,7 @@ impl Gamma {
 
     async fn page(
         &self,
-        version: Version,
+        adapter: &dyn GammaAdapter,
         cursor: Option<&str>,
         ids: &[String],
     ) -> Result<Vec<u8>> {
@@ -39,7 +42,7 @@ impl Gamma {
         {
             let mut query = url.query_pairs_mut();
             query
-                .append_pair("version", version.as_str())
+                .append_pair("version", adapter.version().as_str())
                 .append_pair("limit", "100")
                 .append_pair("closed", if ids.is_empty() { "false" } else { "any" });
             if let Some(cursor) = cursor {
@@ -123,10 +126,11 @@ pub enum Command {
 
 #[derive(Debug, Serialize)]
 pub struct ScanReport {
-    pub version: Version,
+    pub adapter: AdapterId,
     pub pages: usize,
     pub records: usize,
     pub unresolved_records: usize,
+    pub identity_conflicts: usize,
     pub pagination_complete: bool,
     pub error: Option<String>,
 }
@@ -140,13 +144,14 @@ struct Scan {
 }
 
 impl Scan {
-    fn new(version: Version, registry: &Registry) -> Self {
+    fn new(adapter: AdapterId, registry: &Registry) -> Self {
         Self {
             report: ScanReport {
-                version,
+                adapter,
                 pages: 0,
                 records: 0,
                 unresolved_records: 0,
+                identity_conflicts: 0,
                 pagination_complete: false,
                 error: None,
             },
@@ -156,7 +161,7 @@ impl Scan {
             missing: registry
                 .markets
                 .iter()
-                .filter(|(k, m)| k.version == version && m.desired)
+                .filter(|(k, m)| k.adapter == adapter && m.desired)
                 .map(|(k, _)| k.clone())
                 .collect(),
         }
@@ -173,8 +178,32 @@ pub struct DiscoveryReport {
     pub desired_assets: usize,
     pub uncertain_markets: usize,
     pub pending_verifications: usize,
+    /// Cumulative run counters; expiry/overflow must not look like resolution.
+    pub expired_verifications: usize,
+    pub verification_overflow: usize,
+    pub identity_conflicts: usize,
     pub failed_verification_batches: usize,
     pub stopped: bool,
+}
+
+impl DiscoveryReport {
+    /// Strict observed-discovery acceptance, not proof of exchange coverage.
+    pub fn coverage_accepted(&self) -> bool {
+        self.scans.iter().all(|s| {
+            s.pagination_complete
+                && s.pages > 0
+                && s.error.is_none()
+                && s.unresolved_records == 0
+                && s.identity_conflicts == 0
+        }) && self.desired_assets > 0
+            && self.uncertain_markets == 0
+            && self.pending_verifications == 0
+            && self.expired_verifications == 0
+            && self.verification_overflow == 0
+            && self.identity_conflicts == 0
+            && self.failed_verification_batches == 0
+            && !self.stopped
+    }
 }
 
 /// One mutable owner, one request future at a time. Commands remain serviceable
@@ -184,7 +213,6 @@ pub struct Discovery {
     registry: Registry,
     commands: mpsc::Receiver<Command>,
     commands_open: bool,
-    next_check: HashMap<MarketKey, Instant>,
     stopped: bool,
     failed_checks: usize,
 }
@@ -200,7 +228,6 @@ impl Discovery {
                 registry,
                 commands,
                 commands_open: true,
-                next_check: HashMap::new(),
                 stopped: false,
                 failed_checks: 0,
             },
@@ -211,12 +238,12 @@ impl Discovery {
 
     async fn request(
         &mut self,
-        version: Version,
+        adapter: &dyn GammaAdapter,
         cursor: Option<&str>,
         ids: &[String],
         deadline: Instant,
     ) -> Option<Result<Vec<u8>>> {
-        let request = self.gamma.page(version, cursor, ids);
+        let request = self.gamma.page(adapter, cursor, ids);
         tokio::pin!(request);
         loop {
             tokio::select! {
@@ -231,24 +258,11 @@ impl Discovery {
     }
 
     async fn verify_one_batch(&mut self, deadline: Instant) -> bool {
-        let now = Instant::now();
-        let Some(first) = self
-            .registry
-            .pending
-            .iter()
-            .find(|k| self.next_check.get(*k).is_none_or(|t| *t <= now))
-        else {
+        let keys = self.registry.verification_batch(Instant::now());
+        let Some(first) = keys.first() else {
             return false;
         };
-        let version = first.version;
-        let keys: Vec<_> = self
-            .registry
-            .pending
-            .iter()
-            .filter(|k| k.version == version && self.next_check.get(*k).is_none_or(|t| *t <= now))
-            .take(100)
-            .cloned()
-            .collect();
+        let adapter = adapter(first.adapter);
         let ids: Vec<_> = keys.iter().map(|k| k.id.clone()).collect();
         let mut records = Vec::new();
         let mut cursor = None;
@@ -256,25 +270,29 @@ impl Discovery {
         let mut failure = None;
         loop {
             let Some(result) = self
-                .request(version, cursor.as_deref(), &ids, deadline)
+                .request(adapter, cursor.as_deref(), &ids, deadline)
                 .await
             else {
                 return true;
             };
-            let result =
-                result.and_then(|bytes| serde_json::from_slice::<Page>(&bytes).map_err(Into::into));
+            let result = result.and_then(|bytes| adapter.decode_page(&bytes));
             match result {
                 Ok(page) => {
                     records.extend(page.markets);
+                    if records.len() > 1000 {
+                        failure =
+                            Some("verification response exceeds page/record budget".to_owned());
+                        break;
+                    }
                     if let Some(next) = page.next_cursor {
-                        if next.is_empty() || !seen.insert(next.clone()) || records.len() > 1000 {
+                        if next.is_empty() || !seen.insert(next.clone()) || seen.len() >= 10 {
                             failure =
                                 Some("invalid/budget-exceeding verification pagination".to_owned());
                             break;
                         }
                         cursor = Some(next);
                     } else {
-                        self.registry.verify_records(version, &ids, &records);
+                        self.registry.verify_records(adapter.id(), &ids, records);
                         break;
                     }
                 }
@@ -290,14 +308,7 @@ impl Discovery {
             for key in &keys {
                 self.registry.uncertain(key, "targeted request failed");
             }
-        }
-        for key in keys {
-            if self.registry.pending.contains(&key) {
-                self.next_check
-                    .insert(key, Instant::now() + Duration::from_secs(30));
-            } else {
-                self.next_check.remove(&key);
-            }
+            self.registry.flush_changes();
         }
         true
     }
@@ -320,8 +331,8 @@ impl Discovery {
         let mut max_page_apply_us = 0;
         let scans = loop {
             let mut scans = [
-                Scan::new(Version::V1, &self.registry),
-                Scan::new(Version::V2, &self.registry),
+                Scan::new(PolymarketV1.id(), &self.registry),
+                Scan::new(PolymarketV2.id(), &self.registry),
             ];
             while !self.stopped && scans.iter().any(|s| !s.finished) {
                 for scan in &mut scans {
@@ -331,19 +342,21 @@ impl Discovery {
                     if scan.finished {
                         continue;
                     }
-                    let version = scan.report.version;
+                    let adapter = adapter(scan.report.adapter);
                     let Some(result) = self
-                        .request(version, scan.cursor.as_deref(), &[], deadline)
+                        .request(adapter, scan.cursor.as_deref(), &[], deadline)
                         .await
                     else {
                         break;
                     };
                     let apply_started = Instant::now();
-                    match result.and_then(|bytes| self.registry.apply_listing(version, &bytes)) {
+                    match result.and_then(|bytes| adapter.decode_page(&bytes)) {
                         Ok(page) => {
+                            let page = self.registry.apply_page(adapter.id(), page);
                             scan.report.pages += 1;
                             scan.report.records += page.records;
                             scan.report.unresolved_records += page.unresolved;
+                            scan.report.identity_conflicts += page.identity_conflicts;
                             for key in page.observed {
                                 scan.missing.remove(&key);
                             }
@@ -360,12 +373,13 @@ impl Discovery {
                                 for key in scan.missing.drain() {
                                     self.registry.uncertain(&key, "absent from completed scan");
                                 }
+                                self.registry.flush_changes();
                             }
                         }
                         Err(error) => {
                             scan.report.error = Some(format!("{error:#}"));
                             scan.finished = true;
-                            eprintln!("{} scan failed: {error:#}", version.as_str());
+                            eprintln!("{:?} scan failed: {error:#}", adapter.id());
                         }
                     }
                     max_page_apply_us = max_page_apply_us.max(apply_started.elapsed().as_micros());
@@ -383,10 +397,8 @@ impl Discovery {
             while !self.stopped && Instant::now() < resume {
                 if !self.verify_one_batch(deadline).await {
                     let wake = self
-                        .next_check
-                        .values()
-                        .copied()
-                        .min()
+                        .registry
+                        .next_verification()
                         .unwrap_or(resume)
                         .min(resume);
                     self.idle(wake, deadline).await;
@@ -409,6 +421,9 @@ impl Discovery {
                 .filter(|m| m.uncertainty.is_some())
                 .count(),
             pending_verifications: self.registry.pending.len(),
+            expired_verifications: self.registry.expired_verifications,
+            verification_overflow: self.registry.verification_overflow,
+            identity_conflicts: self.registry.identity_conflicts,
             failed_verification_batches: self.failed_checks,
             stopped: self.stopped,
         }

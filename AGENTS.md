@@ -21,6 +21,7 @@ Read only the relevant reference sections for the current task. Preserve existin
 ## Current design decisions (not yet benchmark-proven)
 
 - **Control plane:** a minimal, exchange-adapter-based **instrument discovery and desired-state registry**. Use paginated Gamma REST for Polymarket, plus lifecycle hints and periodic full reconciliation. Never derive new instruments by incrementing IDs; external IDs are opaque and version-scoped.
+- **Adapter boundary:** `PolymarketV1` and `PolymarketV2` are separate adapters with shared Gamma transport, pagination, retries and common lifecycle parsing. Future `Kalshi` is a separate adapter with its own transport, not a Gamma version. The registry accepts normalized records keyed by adapter namespace plus exact native ID; keep wire fields and binary-outcome cardinality in the Polymarket adapters. Do not collapse these adapters merely because they share endpoints, or implement Kalshi prematurely.
 - **No category/tags on the critical path.** Keep only identity, protocol, market/outcome relationship and collection eligibility. An optional timestamped metadata/strategy index can join on exact IDs for category-filtered backtests later.
 - Use `HashMap` for registry lookup and temporary `HashSet` for scan reconciliation when useful. Do **not** maintain a redundant persistent `active_assets` set if the registry already expresses the desired set. Keep **desired**, **subscription-confirmed**, and **book-initialized** separate. Component 1 owns **desired state**; the WebSocket subscription manager owns **confirmed state** when implemented in stage 4 (it is not part of Component 1).
 - **Data plane baseline candidate:** multiple Tokio WebSocket workers, each initially owning and updating its assigned books locally, feeding one ordered SBE output owner. Benchmark this against separately sharded book processors before adding an extra queue/handoff. One mutable owner per source/book; no global book mutex.
@@ -59,6 +60,55 @@ Read only the relevant reference sections for the current task. Preserve existin
 ## Agent working protocol
 
 Justify an architectural change by a credible, explicitly described correctness failure it prevents, a concrete simplification, or a measured performance improvement. Correctness prevention does not require a prior production incident; performance claims do require evidence.
+
+## Implementation gates — Stateful and network components
+
+Apply these gates to consequential stateful, concurrent, networking, and performance-sensitive changes. Do not impose irrelevant requirements on trivial or isolated changes.
+
+Before implementation, establish the applicable contracts:
+
+1. **State and invariants**
+   - Define valid state transitions and ownership.
+   - Distinguish unknown, temporarily unavailable, invalid, and terminal states.
+   - Identify what must never happen, including ordering and data-integrity violations.
+
+2. **Work lifetime**
+   - Define what starts, retries, cancels, and completes work.
+   - Bound individual requests and repeated scheduling.
+   - Specify whether duplicate observations reset retry budgets.
+   - Ensure failed work cannot silently invalidate authoritative state.
+
+3. **Resource and overload behavior**
+   - Identify queues, buffers, tasks, and retained state that can grow.
+   - Establish justified capacity, retention, and overload policies.
+   - Distinguish recoverable control-plane work from irreplaceable market-data updates.
+   - Never silently drop historical market-data updates or represent an invalid book as valid.
+
+4. **Performance contract**
+   - Identify the latency-critical path and necessary work.
+   - Avoid unnecessary allocations, copies, synchronization, scheduling, and I/O.
+   - Establish baseline throughput, tail latency, memory use, and queue behavior where relevant.
+   - Test sustained load, bursts, and downstream stalls.
+   - Accept optimization only when measured improvements preserve correctness.
+   - Do not introduce low-level complexity without demonstrated benefit.
+
+5. **Acceptance and evidence**
+   - Separate connectivity, partial progress, completed traversal, validated coverage, and downstream readiness.
+   - Mark protocol assumptions as documented, fixture-observed, or unresolved.
+   - Test safety, progress, boundedness, and relevant performance behavior.
+   - For confirmed bugs, first reproduce the failure in a regression test where practical. If not reproducible deterministically, document the evidence and add the strongest feasible test.
+   - Map acceptance criteria to executed evidence.
+   - Passing existing tests alone is not sign-off.
+
+### Engineering decision rule
+
+Prefer the simplest implementation that satisfies correctness, completeness, and measured performance requirements.
+
+Do not introduce abstractions, synchronization, additional queues, dependencies, or low-level optimizations without a specific problem they solve.
+
+Keep discovery and administrative work outside the market-data hot path.
+
+Never trade silent data corruption or historical data loss for improved benchmark numbers.
 
 For each task: **(a)** restate the component boundary and success contract in 3–6 lines; **(b)** inspect repository and relevant current docs/fixtures; **(c)** identify uncertainty and expected failure cases; **(d)** implement the smallest correct slice; **(e)** run format/check/test/replay and relevant benchmarks; **(f)** report exact files changed, evidence, remaining risks and the next test. If a gate fails, fix it before performance tuning.
 

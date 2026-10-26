@@ -8,6 +8,7 @@ use engineering_challenge::discovery::polymarket::{Command, Discovery, GAMMA_MAR
 async fn main() -> Result<()> {
     let mut seconds = 120;
     let mut once = false;
+    let mut strict = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -18,7 +19,8 @@ async fn main() -> Result<()> {
                     .parse::<u64>()?
             }
             "--once" => once = true,
-            _ => anyhow::bail!("usage: discovery [--seconds N] [--once]"),
+            "--strict" => strict = true,
+            _ => anyhow::bail!("usage: discovery [--seconds N] [--once] [--strict]"),
         }
     }
     ensure!(seconds > 0, "duration must be positive");
@@ -32,6 +34,12 @@ async fn main() -> Result<()> {
     signal.abort();
     let _ = signal.await;
     eprintln!("{}", serde_json::to_string_pretty(&report)?);
+    if strict {
+        ensure!(
+            report.coverage_accepted(),
+            "strict discovery acceptance failed; inspect coverage report"
+        );
+    }
     ensure!(
         report.scans.iter().any(|s| s.pages > 0),
         "no discovery page succeeded"
