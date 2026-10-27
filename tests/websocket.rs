@@ -743,3 +743,191 @@ async fn heartbeat_failure_ends_the_session_and_shutdown_interrupts_backoff() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn unsubscribe_batches_allow_incoming_messages_to_progress() {
+    timeout(Duration::from_secs(10), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = config(format!("ws://{}", listener.local_addr().unwrap()));
+        let settings = Arc::make_mut(&mut config);
+        settings.subscription_batch = 1;
+        settings.heartbeat = Duration::from_secs(30);
+        settings.pong_timeout = Duration::from_secs(60);
+        let assets: Vec<_> = (0..512).map(|i| format!("{i:077}")).collect();
+        let (tx, commands) = mpsc::channel(8);
+        let (output, received) = output::channel(2048, 2 << 20).unwrap();
+        let (stop, _) = watch::channel(false);
+        let worker = tokio::spawn(run_worker(
+            0, AdapterId::PolymarketV1, assets.clone(), commands,
+            output, config, stop.clone(),
+        ));
+        let (socket, _) = listener.accept().await.unwrap();
+        socket.set_nodelay(true).unwrap();
+        let mut ws = accept_async(socket).await.unwrap();
+        for _ in &assets {
+            ws.next().await.unwrap().unwrap();
+        }
+        tx.send(WorkerCommand { add: vec![], remove: assets[..511].to_vec() }).await.unwrap();
+        let mut wire_removals = vec![];
+        let mut sent_at = None;
+        for i in 0..511 {
+            let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let request: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(request["operation"], "unsubscribe");
+            wire_removals.push(request["assets_ids"][0].as_str().unwrap().to_owned());
+            if i == 0 {
+                sent_at = Some(std::time::Instant::now());
+                for text in ["during-unsubscribe-1", "during-unsubscribe-2", "during-unsubscribe-3"] {
+                    ws.send(Message::Text(text.into())).await.unwrap();
+                }
+                // Repeated intent while removals are pending must not duplicate
+                // requests or consume the pending-work budget twice.
+                tx.send(WorkerCommand { add: vec![], remove: assets[..511].to_vec() }).await.unwrap();
+            }
+        }
+        assert_eq!(wire_removals, assets[..511]);
+        // Wait for the complete accepted prefix before establishing the cutoff.
+        let mut removals = 0;
+        let mut data = 0;
+        while removals < 511 || data < 3 {
+            while let Ok(envelope) = received.try_recv() {
+                match envelope.message {
+                    OutputMessage::SubscriptionsRequested { remove, .. } => removals += remove.len(),
+                    OutputMessage::Data { session, ordinal, payload, .. } => {
+                        data += 1;
+                        assert_eq!(session.generation, 1);
+                        assert_eq!(ordinal, data);
+                        assert_eq!(payload.as_str(), format!("during-unsubscribe-{data}"));
+                        // A whole command must not monopolize reception. Allow ample
+                        // scheduling slack; this is not a hard real-time guarantee.
+                        assert!(removals < 64, "received only after {removals} unsubscribe batches");
+                        eprintln!("unsubscribe receive progress: batches={removals} peer-send-to-enqueue={:?}", envelope.queued_at.duration_since(sent_at.unwrap()));
+                    }
+                    _ => {}
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        tx.send(WorkerCommand { add: vec![], remove: vec![assets[511].clone()] }).await.unwrap();
+        let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
+        let request: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(request["operation"], "unsubscribe");
+        assert_eq!(request["assets_ids"], json!([assets[511]]));
+        while let Some(Ok(message)) = ws.next().await {
+            if matches!(message, Message::Close(_)) {
+                let _ = ws.flush().await;
+                break;
+            }
+        }
+        stop.send_replace(true);
+        let report = worker.await.unwrap().unwrap();
+        assert_eq!(report.sessions, 1);
+        assert_eq!(report.messages, 3);
+        let tail: Vec<_> = received.try_iter().map(|e| e.message).collect();
+        assert!(matches!(&tail[..], [OutputMessage::SubscriptionsRequested { remove, .. }, OutputMessage::Ended { reason, .. }]
+            if remove == &vec![assets[511].clone()] && reason == "no assignments"));
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn stalled_unsubscribe_writes_end_on_timeout_or_shutdown() {
+    for shutdown in [false, true] {
+        timeout(Duration::from_secs(15), async {
+            // Bound the peer's TCP receive window, then stop reading requests.
+            // The unusually large synthetic assignment fills the OS send buffers;
+            // it is fault injection, not a proposed production socket budget.
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.set_recv_buffer_size(16 << 10).unwrap();
+            socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let listener = socket.listen(1).unwrap();
+            let mut config = config(format!("ws://{}", listener.local_addr().unwrap()));
+            let settings = Arc::make_mut(&mut config);
+            settings.assets_per_socket = 32768;
+            settings.subscription_batch = 512;
+            settings.io_timeout = Duration::from_millis(if shutdown { 5000 } else { 600 });
+            settings.heartbeat = Duration::from_secs(30);
+            settings.pong_timeout = Duration::from_secs(60);
+            settings.reconnect_min = Duration::from_secs(30);
+            settings.reconnect_max = Duration::from_secs(30);
+            let assets: Vec<_> = (0..32768).map(|i| format!("{i:077}")).collect();
+            let (tx, commands) = mpsc::channel(8);
+            let (output, received) = output::channel(1024, 16 << 20).unwrap();
+            let (stop, _) = watch::channel(false);
+            let worker = tokio::spawn(run_worker(
+                0, AdapterId::PolymarketV1, assets.clone(), commands,
+                output, config, stop.clone(),
+            ));
+            let (socket, _) = listener.accept().await.unwrap();
+            socket.set_nodelay(true).unwrap();
+            let mut ws = accept_async(socket).await.unwrap();
+            let mut subscribed = 0;
+            while subscribed < assets.len() {
+                let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
+                let request: Value = serde_json::from_str(&text).unwrap();
+                subscribed += request["assets_ids"].as_array().unwrap().len();
+            }
+            received.try_iter().for_each(drop);
+            tx.send(WorkerCommand { add: vec![], remove: assets[..32767].to_vec() }).await.unwrap();
+            let started = std::time::Instant::now();
+            let mut last_progress = started;
+            let mut cutoff = None;
+            let mut sent = 0;
+            let mut accepted = 0;
+            let mut removed = 0;
+            let mut peer_writable = true;
+            let reason = 'peer: loop {
+                // No ws.next(): client writes must eventually block while this
+                // direction stays writable and produces ordered numbered messages.
+                if cutoff.is_none() && peer_writable {
+                    // The worker may close just before we observe its Ended event.
+                    if ws.send(Message::Text(format!("peer-{sent}").into())).await.is_ok() {
+                        sent += 1;
+                    } else {
+                        peer_writable = false;
+                    }
+                }
+                while let Ok(envelope) = received.try_recv() {
+                    match envelope.message {
+                        OutputMessage::Data { session, ordinal, payload, .. } => {
+                            assert_eq!(session.generation, 1);
+                            assert_eq!(ordinal, accepted + 1);
+                            assert_eq!(payload.as_str(), format!("peer-{accepted}"));
+                            accepted += 1;
+                            last_progress = std::time::Instant::now();
+                        }
+                        OutputMessage::SubscriptionsRequested { remove, .. } => {
+                            removed += remove.len();
+                            last_progress = std::time::Instant::now();
+                        }
+                        OutputMessage::Ended { session, reason } => {
+                            assert_eq!(session.generation, 1);
+                            break 'peer reason;
+                        }
+                        _ => panic!("unexpected session restart"),
+                    }
+                }
+                if shutdown && cutoff.is_none() && last_progress.elapsed() > Duration::from_millis(100) {
+                    cutoff = Some(std::time::Instant::now());
+                    stop.send_replace(true);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert!(removed < 32767, "test failed to create backpressure");
+            assert!(sent > accepted, "test failed to expose unread incoming traffic");
+            assert!(reason.contains("unsubscribe uncertain"), "{reason}");
+            if shutdown {
+                assert!(reason.contains("shutdown"), "{reason}");
+                assert!(cutoff.unwrap().elapsed() < Duration::from_secs(2));
+            } else {
+                assert!(reason.contains("socket write timeout"), "{reason}");
+                assert!(started.elapsed() < Duration::from_secs(3));
+                stop.send_replace(true);
+            }
+            let report = worker.await.unwrap().unwrap();
+            assert_eq!(report.sessions, 1);
+            assert_eq!(report.messages, accepted);
+            assert!(received.is_empty());
+            eprintln!("stalled unsubscribe: shutdown={shutdown} removed={removed} sent={sent} accepted={accepted} elapsed={:?} reason={reason}", started.elapsed());
+        }).await.unwrap();
+    }
+}

@@ -230,6 +230,7 @@ impl Worker {
         let mut requested = HashSet::new();
         let mut removed = HashSet::new();
         let mut pending_subscriptions: Vec<_> = self.desired.iter().cloned().collect();
+        let mut pending_unsubscriptions = Vec::new();
         pending_subscriptions.sort();
         let mut initial = true;
         let mut heartbeat = interval_at(Instant::now() + config.heartbeat, config.heartbeat);
@@ -239,6 +240,9 @@ impl Worker {
         let result = 'session: loop {
             if *self.stop.borrow() {
                 break Ok("shutdown".into());
+            }
+            if self.desired.is_empty() && pending_unsubscriptions.is_empty() {
+                break Ok("no assignments".into());
             }
             tokio::select! {
                 _ = stopping(&mut self.stop) => continue,
@@ -275,25 +279,30 @@ impl Worker {
                     self.update(&command)?;
                     pending_subscriptions.retain(|id| self.desired.contains(id));
                     for id in &command.remove {
-                        removed.insert(id.clone());
+                        if removed.insert(id.clone()) && requested.contains(id) {
+                            pending_unsubscriptions.push(id.clone());
+                        }
                     }
                     if command.add.iter().any(|id| removed.contains(id)) || removed.len() >= config.assets_per_socket {
                         break 'session Ok("assignment reactivation requires fresh connection".into());
                     }
-                    let removals: Vec<_> = command.remove.into_iter().filter(|id| requested.contains(id)).collect();
-                    for batch in removals.chunks(config.subscription_batch) {
-                        let payload = json!({"operation":"unsubscribe", "assets_ids":batch});
-                        if let Err(error) = io(socket.send(Message::Text(payload.to_string().into())), config.io_timeout, &mut self.stop).await {
-                            break 'session Ok(format!("unsubscribe uncertain: {error}"));
-                        }
-                        for id in batch { requested.remove(id); }
-                        self.output.send(ingress::Message::SubscriptionsRequested {
-                            session: self.session, add: vec![], remove: batch.to_vec(),
-                        })?;
-                    }
-                    if self.desired.is_empty() { break 'session Ok("no assignments".into()); }
                 }
-                _ = tokio::task::yield_now(), if !pending_subscriptions.is_empty() => {
+                // One batch per iteration gives reception, heartbeat and shutdown
+                // another polling opportunity. A single write can still stall reads
+                // until io_timeout; uncertain writes always end this session.
+                _ = tokio::task::yield_now(), if !pending_unsubscriptions.is_empty() => {
+                    let count = config.subscription_batch.min(pending_unsubscriptions.len());
+                    let removals: Vec<_> = pending_unsubscriptions.drain(..count).collect();
+                    let payload = json!({"operation":"unsubscribe", "assets_ids":removals});
+                    if let Err(error) = io(socket.send(Message::Text(payload.to_string().into())), config.io_timeout, &mut self.stop).await {
+                        break 'session Ok(format!("unsubscribe uncertain: {error}"));
+                    }
+                    for id in &removals { requested.remove(id); }
+                    self.output.send(ingress::Message::SubscriptionsRequested {
+                        session: self.session, add: vec![], remove: removals,
+                    })?;
+                }
+                _ = tokio::task::yield_now(), if !pending_subscriptions.is_empty() && pending_unsubscriptions.is_empty() => {
                     let count = config.subscription_batch.min(pending_subscriptions.len());
                     let additions: Vec<_> = pending_subscriptions.drain(..count).collect();
                     let payload = if initial {
