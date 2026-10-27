@@ -15,6 +15,7 @@ use tokio::{
 pub struct AssignmentChange {
     pub worker: usize,
     pub adapter: AdapterId,
+    pub revision: u64,
     pub add: Vec<String>,
     pub remove: Vec<String>,
 }
@@ -24,6 +25,7 @@ pub struct Assignments {
     workers: Vec<(AdapterId, usize)>,
     capacity: usize,
     maximum: usize,
+    revision: u64,
 }
 
 impl Assignments {
@@ -33,12 +35,17 @@ impl Assignments {
             workers: vec![],
             capacity,
             maximum,
+            revision: 0,
         }
     }
     pub fn assigned_assets(&self) -> usize {
         self.workers.iter().map(|(_, load)| load).sum()
     }
     pub fn reconcile(&mut self, snapshot: &Snapshot) -> Result<Vec<AssignmentChange>> {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .context("assignment revision exhausted")?;
         let mut changes: BTreeMap<usize, AssignmentChange> = BTreeMap::new();
         let removed: Vec<_> = self
             .markets
@@ -54,6 +61,7 @@ impl Assignments {
                 .or_insert_with(|| AssignmentChange {
                     worker,
                     adapter: key.adapter,
+                    revision: self.revision,
                     add: vec![],
                     remove: vec![],
                 })
@@ -99,6 +107,7 @@ impl Assignments {
                 .or_insert_with(|| AssignmentChange {
                     worker,
                     adapter: key.adapter,
+                    revision: self.revision,
                     add: vec![],
                     remove: vec![],
                 })
@@ -118,6 +127,7 @@ pub async fn run_manager(
     output: ingress::Sender,
     config: Arc<Config>,
     stop: watch::Sender<bool>,
+    mut recovery: mpsc::Receiver<ingress::Session>,
 ) -> Result<Vec<WorkerReport>> {
     config.validate()?;
     let mut shutdown = stop.subscribe();
@@ -127,6 +137,7 @@ pub async fn run_manager(
     let mut tick = interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut repair = 5;
+    let mut recovery_open = true;
     let result: Result<()> = async {
         loop {
             tokio::select! {
@@ -135,6 +146,14 @@ pub async fn run_manager(
                 finished = workers.join_next(), if !workers.is_empty() => {
                     finished.context("worker set ended")???;
                     anyhow::bail!("worker exited before shutdown");
+                },
+                request = recovery.recv(), if recovery_open => {
+                    if let Some(session) = request {
+                        ensure!(assignments.workers.get(session.worker).is_some_and(|(a, _)| *a == session.adapter), "unknown recovery assignment");
+                        commands[session.worker].try_send(WorkerCommand {
+                            restart: Some(session), ..WorkerCommand::default()
+                        }).context("recovery delivery failed")?;
+                    } else { recovery_open = false; }
                 },
                 _ = tick.tick() => {
                     repair += 1;
@@ -154,17 +173,26 @@ pub async fn run_manager(
                         result = timeout(config.io_timeout, request) => result.context("discovery snapshot timeout")??,
                     };
                     for change in assignments.reconcile(&snapshot)? {
+                        if !change.remove.is_empty() {
+                            output.send(ingress::Message::Retired {
+                                worker: change.worker, adapter: change.adapter,
+                                revision: change.revision, assets: change.remove.clone(),
+                            })?;
+                        }
                         if change.worker == commands.len() {
                             let (send, receive) = mpsc::channel(32);
+                            send.try_send(WorkerCommand { add: change.add, remove: change.remove, revision: change.revision, ..WorkerCommand::default() })?;
                             commands.push(send);
                             workers.spawn(run_worker(
-                                change.worker, change.adapter, change.add, receive,
+                                change.worker, change.adapter, vec![], receive,
                                 output.clone(), config.clone(), stop.clone(),
                             ));
                         } else {
                             commands[change.worker].try_send(WorkerCommand {
                                 add: change.add,
                                 remove: change.remove,
+                                revision: change.revision,
+                                ..WorkerCommand::default()
                             }).context("assignment delivery failed")?;
                         }
                     }

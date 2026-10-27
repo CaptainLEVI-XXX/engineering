@@ -1,28 +1,31 @@
 # Read before getting started!!
 
-## Running Components 1 and 2
+## Running Components 1–4
 
 The executable runs continuous discovery and stable per-adapter WebSocket
-subscriptions. **It is a transport-validation runner, not a recording collector:**
-the consumer checks session/message order, counts raw messages and discards them.
-Stdout stays empty; diagnostics go to stderr. Book reconstruction, financial
-decoding, periodic snapshots and SBE output are not implemented.
+subscriptions. **It is a book-validation runner, not a recording collector:**
+one consumer validates exact Polymarket values and reconstructs source-specific
+L2 books. Invalid input marks the affected replicas unavailable and requests a
+bounded session restart. Source selection exposes snapshots before its deltas.
+Stdout stays empty; diagnostics go to stderr. C5 periodic snapshots and SBE output
+are not implemented; selected observations are consumed but not persisted.
 See [architecture](docs/architecture.md) and [protocol evidence](docs/protocol.md).
 
 ```sh
 cargo build --locked --release
-target/release/engineering-challenge --seconds 120 > /dev/null 2> transport.log
+target/release/engineering-challenge --seconds 120 > /dev/null 2> collector.log
 ```
 
 Omit `--seconds` to run until SIGINT. The library boundary supplies owned raw text,
 application-receive timestamps, adapter/session identity, per-session ordinals and
 ordered lifecycle/subscription-request events. Full/closed ingress fails visibly;
 shutdown allows 15 seconds to drain accepted messages. A successful run does not
-prove exchange-wide coverage, confirmed subscriptions, valid books or persistence.
+prove full-universe coverage, confirmed subscriptions or persistence. Use
+`--transport-only true` to retain the original opaque-message validation mode.
 
 Options (each requires a value): `--seconds`, `--gamma-url`, `--ws-url`,
 `--assets-per-socket` (1000), `--max-sockets` (1024),
-`--queue-items` (8192), `--queue-bytes` (67108864). Socket/message/queue settings are
+`--queue-items` (8192), `--queue-bytes` (67108864), `--transport-only` (false). Socket/message/queue settings are
 collector safety budgets, **not verified exchange limits or a total RSS cap**.
 
 ```sh
@@ -38,7 +41,8 @@ cargo test --locked --test discovery_http live_discovery_coverage -- --ignored -
 
 The original template's schema, generated codecs and file-oriented reader/writer
 remain available for a separately authorized output component. They are not used
-by the transport-validation executable.
+by the current validation executable. See [the C3/C4 plan](3%264.md),
+[protocol contracts](docs/protocol.md) and [remaining checks](docs/revision-check.md).
 
 This repo uses the [FIX SBE standard](https://fixtrading.org/packages/simple-binary-encoding-technical-specification-v2-rc2/)
 for its eventual binary output. The supplied Rust helpers abstract encoding and decoding.

@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -30,6 +30,8 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub struct WorkerCommand {
     pub add: Vec<String>,
     pub remove: Vec<String>,
+    pub revision: u64,
+    pub restart: Option<Session>,
 }
 
 #[derive(Debug, Default)]
@@ -54,7 +56,7 @@ pub async fn run_worker(
             generation: 0,
             adapter,
         },
-        desired: initial.into_iter().collect(),
+        desired: initial.into_iter().map(|id| (id, 0)).collect(),
         commands,
         output,
         config,
@@ -75,7 +77,7 @@ pub async fn run_worker(
 
 struct Worker {
     session: Session,
-    desired: HashSet<String>,
+    desired: HashMap<String, u64>,
     commands: mpsc::Receiver<WorkerCommand>,
     output: ingress::Sender,
     config: Arc<Config>,
@@ -89,7 +91,8 @@ impl Worker {
         for id in &command.remove {
             self.desired.remove(id);
         }
-        self.desired.extend(command.add.iter().cloned());
+        self.desired
+            .extend(command.add.iter().map(|id| (id.clone(), command.revision)));
         ensure!(
             self.desired.len() <= self.config.assets_per_socket,
             "worker assignment budget exceeded"
@@ -229,7 +232,7 @@ impl Worker {
         let config = self.config.clone();
         let mut requested = HashSet::new();
         let mut removed = HashSet::new();
-        let mut pending_subscriptions: Vec<_> = self.desired.iter().cloned().collect();
+        let mut pending_subscriptions: Vec<_> = self.desired.keys().cloned().collect();
         let mut pending_unsubscriptions = Vec::new();
         pending_subscriptions.sort();
         let mut initial = true;
@@ -274,13 +277,16 @@ impl Worker {
                 }
                 command = self.commands.recv() => {
                     let command = command.context("assignment owner closed")?;
+                    if command.restart == Some(self.session) {
+                        break 'session Ok("processor requested fresh baseline".into());
+                    }
                     // Persist intent BEFORE any fallible send.
-                    pending_subscriptions.extend(command.add.iter().filter(|id| !self.desired.contains(*id)).cloned());
+                    pending_subscriptions.extend(command.add.iter().filter(|id| !self.desired.contains_key(*id)).cloned());
                     self.update(&command)?;
-                    pending_subscriptions.retain(|id| self.desired.contains(id));
+                    pending_subscriptions.retain(|id| self.desired.contains_key(id));
                     for id in &command.remove {
                         if removed.insert(id.clone()) && requested.contains(id) {
-                            pending_unsubscriptions.push(id.clone());
+                            pending_unsubscriptions.push((id.clone(), command.revision));
                         }
                     }
                     if command.add.iter().any(|id| removed.contains(id)) || removed.len() >= config.assets_per_socket {
@@ -292,14 +298,14 @@ impl Worker {
                 // until io_timeout; uncertain writes always end this session.
                 _ = tokio::task::yield_now(), if !pending_unsubscriptions.is_empty() => {
                     let count = config.subscription_batch.min(pending_unsubscriptions.len());
-                    let removals: Vec<_> = pending_unsubscriptions.drain(..count).collect();
+                    let (removals, revisions): (Vec<_>, Vec<_>) = pending_unsubscriptions.drain(..count).unzip();
                     let payload = json!({"operation":"unsubscribe", "assets_ids":removals});
                     if let Err(error) = io(socket.send(Message::Text(payload.to_string().into())), config.io_timeout, &mut self.stop).await {
                         break 'session Ok(format!("unsubscribe uncertain: {error}"));
                     }
                     for id in &removals { requested.remove(id); }
                     self.output.send(ingress::Message::SubscriptionsRequested {
-                        session: self.session, add: vec![], remove: removals,
+                        session: self.session, source_slot: 0, revisions, add: vec![], remove: removals,
                     })?;
                 }
                 _ = tokio::task::yield_now(), if !pending_subscriptions.is_empty() && pending_unsubscriptions.is_empty() => {
@@ -315,8 +321,9 @@ impl Worker {
                     }
                     initial = false;
                     requested.extend(additions.iter().cloned());
+                    let revisions = additions.iter().map(|id| self.desired[id]).collect();
                     self.output.send(ingress::Message::SubscriptionsRequested {
-                        session: self.session, add: additions, remove: vec![],
+                        session: self.session, source_slot: 0, revisions, add: additions, remove: vec![],
                     })?;
                 }
                 _ = heartbeat.tick() => {

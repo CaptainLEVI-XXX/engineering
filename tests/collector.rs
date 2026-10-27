@@ -1,4 +1,4 @@
-//! Exercise Components 1/2 through real HTTP/WS sockets and process shutdown.
+//! Exercise discovery, transport and optional books through local sockets and shutdown.
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
@@ -18,7 +18,9 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 #[tokio::test]
 async fn transport_runner_drains_on_deadline_and_sigint_without_writing_stdout() {
-    for mode in ["deadline", "sigint"] {
+    for mode in ["deadline", "sigint", "books", "books-sigint"] {
+        let books = mode.starts_with("books");
+        let interrupt = mode.ends_with("sigint");
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gamma_url = format!("http://{}/markets/keyset", http.local_addr().unwrap());
@@ -63,15 +65,20 @@ async fn transport_runner_drains_on_deadline_and_sigint_without_writing_stdout()
                     let text = socket.next().await.unwrap().unwrap().into_text().unwrap();
                     let request: Value = serde_json::from_str(&text).unwrap();
                     assert_eq!(request["assets_ids"], json!(["00123", "00456"]));
-                    // No book initialization required: these must be handed off as-is.
-                    socket
-                        .send(Message::Text("opaque raw message".into()))
-                        .await
-                        .unwrap();
-                    socket
-                        .send(Message::Text("another message λ".into()))
-                        .await
-                        .unwrap();
+                    if books {
+                        socket.send(Message::Text(json!([
+                            {"event_type":"book","asset_id":"00123","timestamp":"42","bids":[{"price":"0.2","size":"3"}],"asks":[]},
+                            {"event_type":"book","asset_id":"00456","timestamp":"41","bids":[],"asks":[]}
+                        ]).to_string().into())).await.unwrap();
+                        socket.send(Message::Text(json!({"event_type":"price_change","timestamp":"42","price_changes":[
+                            {"asset_id":"00123","side":"BUY","price":"0.2","size":"5"},
+                            {"asset_id":"00123","side":"BUY","price":"0.2","size":"0"}
+                        ]}).to_string().into())).await.unwrap();
+                    } else {
+                        // Transport-only coverage must continue to accept opaque text.
+                        socket.send(Message::Text("opaque raw message".into())).await.unwrap();
+                        socket.send(Message::Text("another message λ".into())).await.unwrap();
+                    }
                     socket.send(Message::Ping(vec![42].into())).await.unwrap();
                     while let Some(Ok(message)) = socket.next().await {
                         match message {
@@ -102,8 +109,10 @@ async fn transport_runner_drains_on_deadline_and_sigint_without_writing_stdout()
                 &ws_url,
                 "--assets-per-socket",
                 "2",
+                "--transport-only",
+                if books { "false" } else { "true" },
                 "--seconds",
-                if mode == "sigint" { "30" } else { "3" },
+                if interrupt { "30" } else { "3" },
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -115,7 +124,7 @@ async fn transport_runner_drains_on_deadline_and_sigint_without_writing_stdout()
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
             }
-            if mode == "sigint" && !interrupted && received_prefixes.load(Ordering::SeqCst) == 2 {
+            if interrupt && !interrupted && received_prefixes.load(Ordering::SeqCst) == 2 {
                 assert!(
                     Command::new("kill")
                         .args(["-INT", &child.id().to_string()])
@@ -146,12 +155,19 @@ async fn transport_runner_drains_on_deadline_and_sigint_without_writing_stdout()
             .unwrap()
             .unwrap();
         assert!(status.success(), "{mode}: {diagnostics}");
-        assert!(mode != "sigint" || interrupted);
+        assert!(!interrupt || interrupted);
         assert!(output.stdout.is_empty());
-        assert!(
-            diagnostics.contains("transport validation only"),
-            "{diagnostics}"
-        );
+        if books {
+            assert!(
+                diagnostics.contains("snapshots: 4, changes: 4, selected_changes: 4, rejected: 0"),
+                "{diagnostics}"
+            );
+        } else {
+            assert!(
+                diagnostics.contains("transport validation only"),
+                "{diagnostics}"
+            );
+        }
         assert!(
             diagnostics.contains("requested_at_cutoff=4"),
             "{diagnostics}"

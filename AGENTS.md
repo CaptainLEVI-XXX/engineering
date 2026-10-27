@@ -20,7 +20,7 @@ Read only the relevant reference sections for the current task. Preserve existin
 
 ## Component scope and authorization
 
-The user develops this project **one component at a time**: investigate its requirements and contracts, review its implementation plan, then execute and validate the approved scope. **The currently authorized component is Component 2: subscription management and WebSocket ingestion.** The full collector mission describes the eventual system, not permission to implement every component now.
+The user develops this project **one component at a time**: investigate its requirements and contracts, review its implementation plan, then execute and validate the approved scope. **Currently authorized: Components 3 and 4 under `3&4.md`: exact decoding and source-specific L2 reconstruction, plus necessary C2 integration.** The complete challenge and all four extensions are the eventual target, not permission to implement their later delivery stages now.
 
 - Use the user's component names and boundaries consistently. Do not substitute a different numbered implementation sequence or redefine Component 2 to mean the entire data plane.
 - Requests such as “go ahead,” “execute it,” or “complete Component 2” authorize the agreed component plan, not downstream components or extensions. Finish that component's acceptance checks, report limitations, and stop before starting another component.
@@ -58,7 +58,7 @@ These are system-wide contracts to apply when implementing the component that ow
 
 Own eligibility, exact version-scoped identities and authoritative desired state. Preserve validated incremental additions, atomic market updates, uncertainty reporting and safe retirement/reactivation. Incomplete scans cannot erase prior desire. Keep its tests independent of WebSockets. During Component 2 work, retain this implementation except for required integration, such as a continuous lifecycle reusing its existing scheduler and snapshot/notification interface.
 
-### Component 2 — Subscription management and WebSocket ingestion (current scope)
+### Component 2 — Subscription management and WebSocket ingestion
 
 - **Input:** Component 1's authoritative desired-state snapshots and change notifications.
 - **Ownership:** one subscription manager owns stable market-to-worker assignments; one Tokio task owns each socket, its desired/requested subscriptions and connection generation.
@@ -68,9 +68,24 @@ Own eligibility, exact version-scoped identities and authoritative desired state
 - **Acceptance:** validate stable assignments and capacity, dynamic changes, reconnect generations, ordered accepted-message delivery, missed-notification recovery, message/queue limits, full/closed consumers, stalled I/O and shutdown. Run bounded live probes when feasible and measure transport throughput, receive-to-handoff latency and queue behavior. Report missing evidence rather than building another component to fill it.
 - **Not implicitly authorized:** production financial decoding, exact book reconstruction, periodic book snapshots, SBE serialization/stdout integration, downstream book recovery, redundant feeds, automatic rebalancing, Kalshi, or full-pipeline performance tuning. Existing implementations of these are not part of Component 2's acceptance merely because they currently run inside a socket worker.
 
+### Components 3/4 — Decoding and source-specific books (current scope)
+
+Use the approved `3&4.md` contracts: exact scaled values, bounded typed parsing,
+whole-event prevalidation, independent source replicas, assignment revisions,
+session validity, deterministic selection snapshots and bounded recovery.
+Retain one synchronous processing owner behind existing C2 ingress. C2 changes
+are limited to assignment context, an ordered retirement cutoff (including while
+disconnected), and session-checked restart controls. Preserve transport-only tests.
+Validate state and intermediate observations against an independent oracle;
+separate genuine fixtures from synthetic cases and report missing live evidence.
+
 ### Later components — require their own reviewed plans and authorization
 
-Preserve these eventual contracts without implementing them during Component 2 work: exact decimal parsing and book replay with an independent oracle; supplied-reader-compatible SBE output and tail flushing; book validity/recovery and visible snapshot boundaries; and representative full-pipeline performance measurement. The user defines their component numbering and scope. Basic socket reconnect and session boundaries remain Component 2 responsibilities; downstream book recovery and optional redundancy do not.
+C5 owns supplied-reader-compatible binary stdout, minute snapshots, buffering and
+tail flushing. Later extension work owns redundant socket provisioning, automatic
+health-based failover, monitoring/rotation policies and connection experiments.
+Do not implement those or Kalshi during C3/C4 work. Independent replicas and an
+explicit selection API are current C4 contracts, not live redundancy delivery.
 
 ## Performance discipline
 

@@ -25,6 +25,7 @@ async fn offered_bursts_preserve_every_raw_message_in_order() {
         let mut ended = false;
         for envelope in receive {
             match &envelope.message {
+                ingress::Message::Retired { .. } => panic!("unexpected retirement"),
                 ingress::Message::Started(session) => {
                     assert!(!started);
                     assert_eq!(session.generation, 1);
@@ -136,5 +137,179 @@ async fn offered_bursts_preserve_every_raw_message_in_order() {
         ages[COUNT * 99 / 100].as_micros(),
         ages[COUNT * 999 / 1000].as_micros(),
         ages.last().unwrap().as_micros()
+    );
+}
+
+#[test]
+#[ignore = "explicit release-mode paced C3/C4 replica replay; no network or SBE"]
+fn paced_replica_replay_preserves_selected_history() {
+    use chrono::Utc;
+    use engineering_challenge::{
+        Side,
+        orderbook::{self, ObservationKind, Processor},
+    };
+    use serde_json::json;
+    const COUNT: usize = 100_000;
+    const ASSETS: usize = 32;
+    let (send, receive) = ingress::channel(8192, 64 << 20).unwrap();
+    let consumer = std::thread::spawn(move || {
+        let mut p = Processor::new(orderbook::Config::default()).unwrap();
+        let start = std::time::Instant::now();
+        let mut queue = Vec::with_capacity(COUNT);
+        let mut completion = Vec::with_capacity(COUNT);
+        let mut processing = Vec::with_capacity(COUNT);
+        let mut levels = 0;
+        let mut snapshots = 0;
+        let mut sink = |o: orderbook::Observation<'_>| {
+            match o.kind {
+                ObservationKind::Level {
+                    price,
+                    quantity,
+                    side,
+                } => {
+                    let m = o.metadata.unwrap();
+                    let i = (m.cursor.ordinal as usize - 1) * 2 + m.cursor.session.worker;
+                    let entry = m.cursor.entry.unwrap();
+                    assert_eq!(o.binding.slot, 0);
+                    assert_eq!(o.asset, format!("A{}", (i / 2) % ASSETS));
+                    assert_eq!(price.value(), 500000);
+                    assert_eq!(quantity.value(), ((i + entry) % 13) as i64 * 1_000_000);
+                    assert_eq!(
+                        side,
+                        if (i / 64).is_multiple_of(2) {
+                            Side::Buy
+                        } else {
+                            Side::Sell
+                        }
+                    );
+                    levels += 1;
+                }
+                ObservationKind::Snapshot(book) => {
+                    let asset = o.asset[1..].parse::<usize>().unwrap();
+                    assert_eq!(book.len(), asset % 16 + 1);
+                    assert_eq!(
+                        book.best(Side::Buy).unwrap().0.value(),
+                        (asset % 16 + 1) as i64 * 10000
+                    );
+                    snapshots += 1;
+                }
+                ObservationKind::Invalidated { .. } => {}
+            }
+            Ok(())
+        };
+        for envelope in receive {
+            let before = std::time::Instant::now();
+            let age = envelope.queued_at.elapsed();
+            p.process(&envelope.message, start.elapsed(), &mut sink)
+                .unwrap();
+            if let ingress::Message::Data { received_at, .. } = &envelope.message {
+                processing.push(before.elapsed());
+                queue.push(age);
+                // Same-process wall-clock difference; not NIC/network latency.
+                completion.push((Utc::now() - *received_at).num_microseconds().unwrap());
+            }
+        }
+        p.finish().unwrap();
+        assert_eq!(p.stats().messages, COUNT as u64);
+        assert_eq!(p.stats().changes, (COUNT - 100) as u64 * 4);
+        assert_eq!(p.stats().rejected, 0);
+        assert_eq!(levels, (COUNT / 2 - 50) * 4);
+        assert_eq!(snapshots, 50 * ASSETS);
+        // The last update for each replica/asset must survive independently.
+        for slot in 0..2 {
+            for asset in 0..ASSETS {
+                let r = p
+                    .replica(AdapterId::PolymarketV2, &format!("A{asset}"), slot)
+                    .unwrap();
+                let i = (0..COUNT)
+                    .rev()
+                    .find(|i| i % 2 == slot as usize && (i / 2) % ASSETS == asset)
+                    .unwrap();
+                let side = if (i / 64) % 2 == 0 {
+                    Side::Buy
+                } else {
+                    Side::Sell
+                };
+                let quantity = r
+                    .book
+                    .quantity(
+                        side,
+                        engineering_challenge::market_data::Price::new(500000).unwrap(),
+                    )
+                    .map_or(0, |q| q.value());
+                assert_eq!(quantity, ((i + 3) % 13) as i64 * 1_000_000);
+            }
+        }
+        queue.sort_unstable();
+        completion.sort_unstable();
+        processing.sort_unstable();
+        (queue, completion, processing)
+    });
+    let sessions = [0, 1].map(|worker| ingress::Session {
+        worker,
+        generation: 1,
+        adapter: AdapterId::PolymarketV2,
+    });
+    for s in sessions {
+        send.send(ingress::Message::Started(s)).unwrap();
+        send.send(ingress::Message::SubscriptionsRequested {
+            session: s,
+            source_slot: s.worker as u16,
+            revisions: vec![1; ASSETS],
+            add: (0..ASSETS).map(|i| format!("A{i}")).collect(),
+            remove: vec![],
+        })
+        .unwrap();
+    }
+    let snapshot=json!((0..ASSETS).map(|i|json!({"event_type":"book","asset_id":format!("A{i}"),"timestamp":"42","bids":(1..=i%16+1).map(|n|json!({"price":format!("0.{:02}",n),"size":n.to_string()})).collect::<Vec<_>>(),"asks":[]})).collect::<Vec<_>>()).to_string();
+    // Prebuild a finite workload so JSON construction does not pace the producer.
+    let changes:Vec<_>=(0..(ASSETS*2*13*2)).map(|i|json!({"event_type":"price_change","timestamp":"42","price_changes":(0..4).map(|j|json!({"asset_id":format!("A{}",(i/2)%ASSETS),"side":if (i/64)%2==0 {"BUY"}else{"SELL"},"price":"0.5","size":((i+j)%13).to_string()})).collect::<Vec<_>>()} ).to_string()).collect();
+    let start = std::time::Instant::now();
+    let mut lag = Duration::ZERO;
+    let mut bytes = 0;
+    for i in 0..COUNT {
+        let scheduled = start + Duration::from_millis((i / 40) as u64);
+        if i % 40 == 0 {
+            std::thread::sleep(scheduled.saturating_duration_since(std::time::Instant::now()));
+        }
+        lag = lag.max(std::time::Instant::now().saturating_duration_since(scheduled));
+        let payload = if i % 2000 < 2 {
+            &snapshot
+        } else {
+            &changes[i % changes.len()]
+        };
+        bytes += payload.len();
+        send.send(ingress::Message::Data {
+            session: sessions[i % 2],
+            ordinal: (i / 2 + 1) as u64,
+            received_at: Utc::now(),
+            payload: payload.clone().into(),
+        })
+        .unwrap();
+    }
+    for session in sessions {
+        send.send(ingress::Message::Ended {
+            session,
+            reason: "replay end".into(),
+        })
+        .unwrap();
+    }
+    drop(send);
+    let (queue, completion, processing) = consumer.join().unwrap();
+    let elapsed = start.elapsed().as_secs_f64();
+    let indices = [
+        COUNT / 2,
+        COUNT * 95 / 100,
+        COUNT * 99 / 100,
+        COUNT * 999 / 1000,
+        COUNT - 1,
+    ];
+    eprintln!(
+        "BOOK_LOAD messages={COUNT} instruments={ASSETS} replicas=64 bytes={bytes} target_rate=40000 achieved_rate={:.0} seconds={elapsed:.6} max_offer_lag_us={} queue_us={:?} completion_us={:?} processing_us={:?}",
+        COUNT as f64 / elapsed,
+        lag.as_micros(),
+        indices.map(|i| queue[i].as_micros()),
+        indices.map(|i| completion[i]),
+        indices.map(|i| processing[i].as_micros())
     );
 }

@@ -17,10 +17,21 @@ pub struct Session {
 #[derive(Debug)]
 pub enum Message {
     Started(Session),
+    /// Authoritative assignment cutoff, even if the worker is disconnected.
+    /// This is NOT a successfully sent unsubscribe request.
+    Retired {
+        worker: usize,
+        adapter: AdapterId,
+        revision: u64,
+        assets: Vec<String>,
+    },
     /// Successfully sent requests, NOT exchange acknowledgements. Initial and
     /// incremental requests precede subsequent data in this session's stream.
     SubscriptionsRequested {
         session: Session,
+        source_slot: u16,
+        /// One assignment revision per ID, in add-then-remove order.
+        revisions: Vec<u64>,
         add: Vec<String>,
         remove: Vec<String>,
     },
@@ -73,8 +84,18 @@ impl Sender {
         let bytes = size_of::<Envelope>()
             + match &message {
                 Message::Data { payload, .. } => payload.len(),
-                Message::SubscriptionsRequested { add, remove, .. } => {
-                    (add.capacity() + remove.capacity()) * size_of::<String>()
+                Message::Retired { assets, .. } => {
+                    assets.capacity() * size_of::<String>()
+                        + assets.iter().map(String::capacity).sum::<usize>()
+                }
+                Message::SubscriptionsRequested {
+                    add,
+                    remove,
+                    revisions,
+                    ..
+                } => {
+                    revisions.capacity() * size_of::<u64>()
+                        + (add.capacity() + remove.capacity()) * size_of::<String>()
                         + add
                             .iter()
                             .chain(remove)

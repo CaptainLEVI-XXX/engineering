@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use engineering_challenge::{
     discovery::polymarket::{Command, Discovery, GAMMA_MARKETS, Gamma},
+    orderbook::{self, ObservationKind, Processor},
     websocket::{
         Config,
         ingress::{self, Message, Session},
@@ -9,7 +10,7 @@ use engineering_challenge::{
 };
 use std::{collections::HashMap, process::ExitCode, sync::Arc, time::Duration};
 use tokio::{
-    sync::{oneshot, watch},
+    sync::{mpsc, oneshot, watch},
     time::{Instant, timeout_at},
 };
 
@@ -39,6 +40,7 @@ async fn run() -> Result<()> {
     let mut seconds = None;
     let mut queue_items = 8192;
     let mut queue_bytes = 64 << 20;
+    let mut transport_only = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let value=args.next().context("options require a value: --seconds N --gamma-url URL --ws-url URL --assets-per-socket N --max-sockets N --queue-items N --queue-bytes N")?;
@@ -50,23 +52,45 @@ async fn run() -> Result<()> {
             "--max-sockets" => config.max_sockets = value.parse()?,
             "--queue-items" => queue_items = value.parse()?,
             "--queue-bytes" => queue_bytes = value.parse()?,
+            "--transport-only" => transport_only = value.parse()?,
             _ => anyhow::bail!("unknown option {arg}"),
         }
     }
     config.validate()?;
     ensure!(seconds != Some(0), "duration must be positive");
-    eprintln!(
-        "transport validation only: raw messages are counted and discarded; no book reconstruction or persistence; stdout remains empty"
-    );
+    if transport_only {
+        eprintln!(
+            "transport validation only: raw messages are counted and discarded; stdout remains empty"
+        );
+    } else {
+        eprintln!(
+            "C3/C4 validation: exact decoding and source-specific books; observations are not persisted; stdout remains empty until C5"
+        );
+    }
     let config = Arc::new(config);
     let (mut discovery, commands, changes) = Discovery::new(Gamma::new(&gamma)?);
     let (output, receiver) = ingress::channel(queue_items, queue_bytes)?;
     let (stop, _) = watch::channel(false);
+    let (recovery_send, recovery_receive) = mpsc::channel(config.max_sockets);
+    let consumer_stop = stop.subscribe();
+    let book_config = orderbook::Config {
+        sessions: config.max_sockets,
+        wire: engineering_challenge::market_data::Limits {
+            message_bytes: config.max_message_bytes,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let (consumer_send, mut consumer_receive) = oneshot::channel();
     let consumer = std::thread::Builder::new()
-        .name("transport-validation".into())
+        .name("market-data".into())
         .spawn(move || {
-            let _ = consumer_send.send(validate_transport(receiver));
+            let result = if transport_only {
+                validate_transport(receiver)
+            } else {
+                process_books(receiver, book_config, recovery_send, consumer_stop)
+            };
+            let _ = consumer_send.send(result);
         })?;
     let mut discovery_task = tokio::spawn(async move { discovery.run_until_stopped().await });
     let mut manager = tokio::spawn(run_manager(
@@ -75,6 +99,7 @@ async fn run() -> Result<()> {
         output,
         config.clone(),
         stop.clone(),
+        recovery_receive,
     ));
     let mut manager_result = None;
     let mut discovery_result = None;
@@ -156,9 +181,7 @@ async fn run() -> Result<()> {
     if let Some(result) = consumer_result {
         match result {
             Ok(Ok(messages)) => {
-                eprintln!(
-                    "transport drained_messages={messages}; payloads discarded, not persisted"
-                );
+                eprintln!("drained_messages={messages}; observations not persisted");
                 if messages == 0 {
                     errors.push("no raw messages received".into());
                 }
@@ -180,6 +203,7 @@ fn validate_transport(receiver: crossbeam::channel::Receiver<ingress::Envelope>)
     let mut messages = 0;
     for envelope in receiver {
         match &envelope.message {
+            Message::Retired { .. } => {}
             Message::Started(session) => {
                 if let Some((previous, _, active)) = sessions.get(&session.worker) {
                     ensure!(
@@ -230,4 +254,100 @@ fn validate_transport(receiver: crossbeam::channel::Receiver<ingress::Envelope>)
         "drained prefix but session boundary missing; history incomplete"
     );
     Ok(messages)
+}
+
+fn process_books(
+    receiver: crossbeam::channel::Receiver<ingress::Envelope>,
+    config: orderbook::Config,
+    recovery: mpsc::Sender<Session>,
+    stop: watch::Receiver<bool>,
+) -> Result<u64> {
+    let mut processor = Processor::new(config)?;
+    let start = std::time::Instant::now();
+    let mut next_tick = Duration::ZERO;
+    let mut sink = |observation: orderbook::Observation<'_>| {
+        if let ObservationKind::Invalidated { reason } = observation.kind {
+            eprintln!(
+                "book_unavailable input={} binding={:?} asset={} reason={reason}; replacement cannot recover missed history",
+                observation.input, observation.binding, observation.asset
+            );
+        }
+        Ok(())
+    };
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(envelope) => processor
+                .process(&envelope.message, start.elapsed(), &mut sink)
+                .context("C3/C4 processing failed; accepted tail incomplete")?,
+            Err(crossbeam::channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
+        }
+        if !*stop.borrow() {
+            let now = start.elapsed();
+            if now >= next_tick {
+                processor.tick(now)?;
+                next_tick = now + Duration::from_millis(100);
+            }
+            for session in processor.take_recovery() {
+                if let Err(error) = recovery.try_send(session)
+                    && !*stop.borrow()
+                {
+                    return Err(error).context("book recovery channel full or closed; coverage and accepted tail incomplete");
+                }
+            }
+        }
+    }
+    processor.finish()?;
+    eprintln!(
+        "books {:?}; initialization counts are observations, not full-universe coverage",
+        processor.stats()
+    );
+    Ok(processor.stats().messages)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn failed_recovery_delivery_is_explicit_but_shutdown_drains_without_scheduling() {
+        for mode in ["full", "closed", "shutdown"] {
+            let session = Session {
+                worker: 0,
+                generation: 1,
+                adapter: engineering_challenge::discovery::AdapterId::PolymarketV1,
+            };
+            let (send, receive) = ingress::channel(8, 1 << 20).unwrap();
+            send.send(Message::Started(session)).unwrap();
+            send.send(Message::SubscriptionsRequested {
+                session,
+                source_slot: 0,
+                revisions: vec![1],
+                add: vec!["A".into()],
+                remove: vec![],
+            })
+            .unwrap();
+            send.send(Message::Data {session,ordinal:1,received_at:chrono::Utc::now(),payload:r#"{"event_type":"book","asset_id":"A","timestamp":"1","bids":[{"price":"0.3","size":"bad"}],"asks":[]}"#.into()}).unwrap();
+            send.send(Message::Ended {
+                session,
+                reason: "shutdown".into(),
+            })
+            .unwrap();
+            drop(send);
+            let (recovery, mut requests) = mpsc::channel(1);
+            if mode == "full" {
+                recovery.try_send(session).unwrap();
+            }
+            if mode == "closed" {
+                requests.close();
+            }
+            let (_stop, stopped) = watch::channel(mode == "shutdown");
+            let result = process_books(receive, orderbook::Config::default(), recovery, stopped);
+            if mode == "shutdown" {
+                assert_eq!(result.unwrap(), 1);
+                assert!(requests.try_recv().is_err());
+            } else {
+                assert!(result.unwrap_err().to_string().contains("recovery channel"));
+            }
+        }
+    }
 }

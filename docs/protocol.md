@@ -146,6 +146,103 @@ Live exchange validation and the large-registry measurement were not rerun for t
 - On disconnect, malformed update, or detected inconsistency, mark the relevant book/source stale, surface an uncertainty interval, reinitialize or switch to a valid independent replica, and emit a new snapshot before downstream deltas.
 - Some quiet markets have no changes; use socket health, positive protocol evidence and optional redundant comparison before calling a quiet subscription stale. Avoid futile resubscribe loops.
 
+## C3/C4 implemented contracts and fixture evidence (2026-10-27)
+
+This section supersedes the historical transport-only executable description,
+not its transport boundary. Workers still forward owned complete text without
+financial parsing. The default consumer now decodes and reconstructs books;
+`--transport-only true` preserves raw validation. Neither mode persists history.
+
+### Wire interpretation and failure scope
+
+- Decimal strings use unsigned digits, optional fractional digits, checked i64
+  arithmetic and scale 1,000,000. Extra fractional zeros are exact; nonzero excess
+  precision, signs, exponent notation and rounding are rejected. Escaped JSON
+  strings are decoded before numeric interpretation. Polymarket prices are 0–1;
+  generic storage constructors do not impose that probability ceiling.
+- `book` requires asset ID, millisecond timestamp, bids and asks. Duplicate prices
+  on one side are rejected, including duplicates involving zero quantities.
+  Zero snapshot quantities are omitted. `price_change` requires a timestamp and
+  bounded `price_changes`; each entry requires asset ID, BUY/SELL, price and size.
+  Sizes are absolute, zero deletes, and repeated/no-op entries remain observations.
+- Exchange milliseconds convert to checked microseconds **within the supplied
+  Chrono-backed reader's range**, not merely within u64. Missing time is not
+  replaced with receive time. Original C2 receive time is preserved separately.
+- `tick_size_change` validates and retains the new tick; it does not rescale or
+  rebuild levels. `last_trade_price`, `best_bid_ask`, `new_market` and
+  `market_resolved` are recognized non-book traffic, not book liveness or deltas.
+  Initial snapshot tick metadata, hashes and market IDs are not correctness
+  checks; unused exchange metadata is ignored. This is financial-field validation,
+  not strict validation of every field in the exchange schema.
+- Full outer JSON syntax is validated first. Independent array elements then run
+  in order; one malformed financial event rejects all its changes and invalidates
+  its reliably identified source scope. A bounded cold-path identity scan handles
+  failures before later assets were decoded. Ambiguous/unknown scope invalidates
+  the source, never an independent backup. Valid inactive/uninitialized entries
+  are accounted without applying them. Resource exhaustion fails the run.
+
+### Assignment, selection and recovery
+
+Successful requests carry slot/revision context. The manager also emits an
+ordered `Retired` assignment cutoff **before dispatching removal**, independent
+of WebSocket connectivity; it is not an unsubscribe acknowledgement. Without
+this cutoff, retirement during failed I/O could leave a stale replica requiring
+recovery forever. Later successful unsubscribe notifications are idempotent.
+Older revisions cannot retire a newer cross-worker binding. C2 session/ordinal
+violations remain terminal; obsolete assignment data on an active session is
+inapplicable. Same-revision reconnection requires a fresh snapshot.
+
+Books use separate BTreeMap sides per replica. One processor prepares changes,
+preflights intermediate level counts, commits them, then synchronously exposes
+ordered selected-source observations. Numeric preparation buffers are reused;
+wire event arrays remain bounded temporary allocations. Backup books are updated
+without duplicating selected output. Explicit selection always emits a snapshot
+on a source change, including equal books, preserving state provenance and a
+separate selection time. Every observation carries its processing-input index;
+financial observations additionally carry the source/event/entry cursor.
+Publication failure is terminal: already committed input must not be retried.
+
+Initialization defaults to 30 seconds, total unavailable time to 120 seconds and
+at most three recovery requests without a successful baseline. These are
+provisional safety policies, not measured full-universe timing guarantees: the
+small probe initialized in approximately 239 ms after subscription, while C2 I/O
+timeouts are ten seconds. Repeated errors/duplicate requests do not reset the
+deadline; reconnect retains the budget. Recovery restarts a complete current
+session, checked again by the worker; stale-generation requests do nothing.
+Shutdown cancels scheduling but drains accepted ingress. Full/closed controls,
+exhausted budgets and missing end boundaries are explicit failures.
+
+Default logical limits: 1,000,000 retained instrument identities, 2,000,000
+replicas, 2,048 session owners (the executable uses its C2 max-socket setting),
+65,535 levels per side, 10,000,000 aggregate retained/construction levels,
+4,096 events/message, 65,535 entries/event, 256 bytes/identity and 2 MiB/message.
+Snapshot preflight includes old plus replacement levels; incremental preflight
+includes intermediate peaks. Scratch collections have at most entries/event
+logical elements, with standard Vec/HashMap capacity rounding. Payloads, decoder
+arrays, scratch and allocator overhead are additional to level counts. These
+limits are not exact RSS accounting or verified exchange capacities.
+
+### Retained genuine fixtures
+
+Both files preserve complete raw text payloads, including array shape/order;
+they are not reconstructed JSON examples. Endpoint:
+`wss://ws-subscriptions-clob.polymarket.com/ws/market`. Requests used
+`type=market`, `level=2`, `initial_dump=true`, with exact asset IDs selected from
+version-scoped Gamma records. Capture used verified Rustls TLS, no credentials.
+
+| Fixture | Provenance and observation | SHA-256 |
+|---|---|---|
+| `tests/fixtures/polymarket-v1-book.json` | Earlier same-day bounded preflight, retained from `ws-preflight-v1-retry.jsonl`; receive time 1793090285451078 µs. Gamma market IDs 561268/559700; initial request used the two IDs in this payload. Two books, 72 asks and 72 bids respectively, 5,284 bytes. | `503d785b529c273bdf39c4ec5a274f3318944e4e755d85c9331d506ad21296fe` |
+| `tests/fixtures/polymarket-v2-book.json` | Current 70-second C3/C4 probe, received 2026-10-27T16:44:52.840238Z. Request contained all four IDs in this payload; four empty books, 1,394 bytes. | `698127d772dc572eb8e8db69d6f7a1749e7bb82634ea80f4d34050629600c0a9` |
+
+Current V1 handshake failed with HTTP 525. V2 returned its four initial snapshots
+and six text PONGs; **no live price changes were observed**. V1 replay evidence is
+from the retained earlier capture, not a successful new V1 connection. Current
+raw request/receive provenance is in `.amp/in/artifacts/c34-*-capture.jsonl`;
+the older capture and source archive remain under `ws-preflight*`. All delta,
+malformed-input, lifecycle and load traces in tests are explicitly synthetic.
+Wire-format sign-off for genuine V1/V2 deltas remains open.
+
 ## Implementation checklist
 
 1. Save actual sanitized samples for V1/V2 discovery records, initial subscription and confirmation, `book`, `price_change`, `last_trade_price`, `tick_size_change`, lifecycle and malformed payloads.

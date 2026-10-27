@@ -115,6 +115,7 @@ async fn worker_preserves_history_across_dynamic_add_and_reconnect() {
         tx.send(WorkerCommand {
             add: vec!["B".into()],
             remove: vec![],
+            ..WorkerCommand::default()
         })
         .await
         .unwrap();
@@ -180,6 +181,7 @@ async fn worker_preserves_history_across_dynamic_add_and_reconnect() {
     let mut requests = vec![];
     for message in messages {
         match message {
+            OutputMessage::Retired { .. } => panic!("worker cannot retire assignments"),
             OutputMessage::Started(s) => {
                 assert!(ended);
                 assert_eq!(s.generation, generation + 1);
@@ -203,6 +205,7 @@ async fn worker_preserves_history_across_dynamic_add_and_reconnect() {
                 session,
                 add,
                 remove,
+                ..
             } => {
                 assert!(!ended);
                 assert_eq!(session.generation, generation);
@@ -520,6 +523,7 @@ async fn readmission_rotates_connection_and_forwards_raw_data_in_the_new_session
             .send(WorkerCommand {
                 add: vec![],
                 remove: vec!["A".into()],
+                ..WorkerCommand::default()
             })
             .await
             .unwrap();
@@ -539,6 +543,7 @@ async fn readmission_rotates_connection_and_forwards_raw_data_in_the_new_session
             .send(WorkerCommand {
                 add: vec!["A".into()],
                 remove: vec![],
+                ..WorkerCommand::default()
             })
             .await
             .unwrap();
@@ -640,6 +645,7 @@ async fn manager_repairs_a_missed_notification_without_migrating_existing_assets
         output,
         config,
         stop.clone(),
+        mpsc::channel(1).1,
     ));
     let server = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
@@ -695,6 +701,124 @@ async fn manager_repairs_a_missed_notification_without_migrating_existing_assets
             .any(|e| matches!(e.message, OutputMessage::Data { .. }))
     );
     owner.await.unwrap();
+}
+
+#[tokio::test]
+async fn processor_recovery_rotates_only_the_target_generation() {
+    use engineering_challenge::{
+        discovery::polymarket::Command,
+        orderbook::{self, Processor},
+        websocket::run_manager,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = config(format!("ws://{}", listener.local_addr().unwrap()));
+    let (discovery, mut requests) = mpsc::channel(8);
+    let (_notify, changes) = watch::channel(());
+    let (output, received) = output::channel(64, 1 << 20).unwrap();
+    let (stop, _) = watch::channel(false);
+    let (recovery, recoveries) = mpsc::channel(8);
+    let owner = tokio::spawn(async move {
+        let mut state = Snapshot::default();
+        market(&mut state, "M", AdapterId::PolymarketV1, &["A", "B"]);
+        while let Some(Command::Snapshot(reply)) = requests.recv().await {
+            let _ = reply.send(Arc::new(state.clone()));
+        }
+    });
+    let manager = tokio::spawn(run_manager(
+        discovery,
+        changes,
+        output,
+        config,
+        stop.clone(),
+        recoveries,
+    ));
+    let server = tokio::spawn(async move {
+        for generation in 1..=2 {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(socket).await.unwrap();
+            let request = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&request).unwrap()["assets_ids"],
+                json!(["A", "B"])
+            );
+            let text = if generation == 1 {
+                r#"{"event_type":"book","asset_id":"A","timestamp":"1","bids":[{"price":"0.3","size":"bad"}],"asks":[]}"#.to_owned()
+            } else {
+                format!("[{},{}]", snapshot("A"), snapshot("B"))
+            };
+            ws.send(Message::Text(text.into())).await.unwrap();
+            while let Some(Ok(message)) = ws.next().await {
+                match message {
+                    Message::Text(t) if t == "PING" => {
+                        ws.send(Message::Text("PONG".into())).await.unwrap()
+                    }
+                    Message::Close(_) => {
+                        let _ = ws.flush().await;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+    let start = std::time::Instant::now();
+    let mut processor = Processor::new(orderbook::Config::default()).unwrap();
+    let mut obsolete_sent = false;
+    let mut recovered_at = None;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            while let Ok(envelope) = received.try_recv() {
+                processor
+                    .process(&envelope.message, start.elapsed(), &mut |_| Ok(()))
+                    .unwrap();
+                for session in processor.take_recovery() {
+                    recovery.try_send(session).unwrap();
+                }
+                if processor.stats().snapshots == 2 && !obsolete_sent {
+                    recovery
+                        .try_send(output::Session {
+                            worker: 0,
+                            generation: 1,
+                            adapter: AdapterId::PolymarketV1,
+                        })
+                        .unwrap();
+                    obsolete_sent = true;
+                    recovered_at = Some(std::time::Instant::now());
+                }
+            }
+            if recovered_at.is_some_and(|at| at.elapsed() > Duration::from_millis(100)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.send_replace(true);
+    let reports = timeout(Duration::from_secs(2), manager)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(reports[0].sessions, 2);
+    server.await.unwrap();
+    for envelope in received {
+        processor
+            .process(&envelope.message, start.elapsed(), &mut |_| Ok(()))
+            .unwrap();
+    }
+    processor.finish().unwrap();
+    assert_eq!(processor.stats().rejected, 1);
+    assert_eq!(processor.stats().snapshots, 2);
+    assert_eq!(
+        processor
+            .replica(AdapterId::PolymarketV1, "A", 0)
+            .unwrap()
+            .binding
+            .revision,
+        1
+    );
+    owner.abort();
 }
 
 #[tokio::test]
@@ -767,7 +891,7 @@ async fn unsubscribe_batches_allow_incoming_messages_to_progress() {
         for _ in &assets {
             ws.next().await.unwrap().unwrap();
         }
-        tx.send(WorkerCommand { add: vec![], remove: assets[..511].to_vec() }).await.unwrap();
+        tx.send(WorkerCommand { add: vec![], remove: assets[..511].to_vec(), ..WorkerCommand::default() }).await.unwrap();
         let mut wire_removals = vec![];
         let mut sent_at = None;
         for i in 0..511 {
@@ -782,7 +906,7 @@ async fn unsubscribe_batches_allow_incoming_messages_to_progress() {
                 }
                 // Repeated intent while removals are pending must not duplicate
                 // requests or consume the pending-work budget twice.
-                tx.send(WorkerCommand { add: vec![], remove: assets[..511].to_vec() }).await.unwrap();
+                tx.send(WorkerCommand { add: vec![], remove: assets[..511].to_vec(), ..WorkerCommand::default() }).await.unwrap();
             }
         }
         assert_eq!(wire_removals, assets[..511]);
@@ -808,7 +932,7 @@ async fn unsubscribe_batches_allow_incoming_messages_to_progress() {
             }
             tokio::task::yield_now().await;
         }
-        tx.send(WorkerCommand { add: vec![], remove: vec![assets[511].clone()] }).await.unwrap();
+        tx.send(WorkerCommand { add: vec![], remove: vec![assets[511].clone()], ..WorkerCommand::default() }).await.unwrap();
         let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
         let request: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(request["operation"], "unsubscribe");
@@ -867,7 +991,7 @@ async fn stalled_unsubscribe_writes_end_on_timeout_or_shutdown() {
                 subscribed += request["assets_ids"].as_array().unwrap().len();
             }
             received.try_iter().for_each(drop);
-            tx.send(WorkerCommand { add: vec![], remove: assets[..32767].to_vec() }).await.unwrap();
+            tx.send(WorkerCommand { add: vec![], remove: assets[..32767].to_vec(), ..WorkerCommand::default() }).await.unwrap();
             let started = std::time::Instant::now();
             let mut last_progress = started;
             let mut cutoff = None;
