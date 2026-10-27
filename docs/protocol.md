@@ -53,7 +53,7 @@ cargo run --locked --release --bin discovery -- --seconds 120 --once --strict > 
 cargo test --locked --release --test discovery large_universe_measurement -- --ignored --nocapture
 ```
 
-The ignored live probe and `--strict` require clean completed V1/V2 traversals, nonempty desired state, zero unresolved scan records, pending/uncertain markets, conflicts, failed verification batches, expired unknown jobs and overflow. A timeout or Stop fails strict acceptance. Without `--strict`, the CLI remains a connectivity/progress probe, not an acceptance test. Historical unresolved scan records are not erased by a later successful targeted lookup. Reports distinguish last-sweep scan counts from owner-lifetime verification/error counters. There is no subscription manager or book initializer yet, so no confirmed-subscribed or initialized counts are claimed.
+The ignored live probe and `--strict` require clean completed V1/V2 traversals, nonempty desired state, zero unresolved scan records, pending/uncertain markets, conflicts, failed verification batches, expired unknown jobs and overflow. A timeout or Stop fails strict acceptance. Without `--strict`, the CLI remains a connectivity/progress probe, not an acceptance test. Historical unresolved scan records are not erased by a later successful targeted lookup. Reports distinguish last-sweep scan counts from owner-lifetime verification/error counters. This discovery-only executable does not start Component 2; no confirmed-subscribed or initialized counts are claimed.
 
 Unknown verification is bounded to three rounds within five minutes and 1,024 retained jobs. Repeated observations do not extend a job; after expiry a new observation may create a fresh bounded job. Known desired subscriptions never expire merely because verification fails. See [architecture.md](architecture.md#discovery-and-reconciliation-protocol) for capacity, backoff, publication and overload contracts.
 
@@ -63,7 +63,11 @@ Control-plane measurement before the adapter-boundary refactor on this macOS ARM
 
 After adapter separation, all 20 deterministic tests passed in debug/release, including overlapping native IDs across adapters, V2 targeted routing, wrong-version rejection and single-instrument registry records. A 30-second live smoke run reached both adapter namespaces: V1 read 67 pages / 6,700 records without completing, V2 completed 2 pages / 132 records, and 44 records remained unresolved. Strict acceptance correctly failed; stdout stayed empty. The same seven-sample synthetic workload measured median ingestion 108,397 µs, first snapshot 14,460 µs and cached requests approximately 3 ns. These are local observations, not an end-to-end latency claim; snapshot creation was slower than in the preceding run. The 120-second acceptance test above predates this refactor and was not rerun as part of the adapter change.
 
-First publication measures process-local discovery time, not exchange listing-to-subscription delay; page-apply maximum is one observation, not a latency percentile. The synthetic measurements exclude network, sustained churn, RSS and concurrent consumers. Full coverage and low latency remain unproven; next validate a sufficiently long complete traversal and resolve/classify remaining upstream missing-ID records without inventing subscription IDs.
+Later on 2026-10-26, a gzip-enabled release run completed both traversals in 694,719 ms: V1 2,424 pages / 242,317 records; V2 2 pages / 133 records; 484,704 desired instruments. There were 2,426 listing attempts and 6 verification attempts, no scan errors or identity conflicts, and 44 unresolved records. Strict acceptance failed; stdout stayed empty. Both keyset and legacy targeted lookups returned all 44 with missing outcome IDs and empty condition IDs. This run included an experimental cooldown, subsequently removed as unjustified; it is not post-revert live validation. Evidence: `.amp/in/artifacts/discovery-fixed-live.log`, `missing-ids-recheck.json`, and `missing-ids-legacy-check.json`.
+
+Gzip reduced one sampled response from 549,216 to 46,907 transferred bytes (about 91.5%). Identity/lifecycle fields and cursor matched; volatile metadata differed, so this is not a controlled latency benchmark. The retained gzip fixtures wrap the first reduced market fixture, with the oversized variant padded to 8 MiB + 1 decompressed byte; both use mtime=0. Local HTTP tests verify admission and rejection against the decompressed size limit.
+
+First publication measures process-local discovery time, not exchange listing-to-subscription delay; page-apply maximum is not a latency percentile. Completed pagination has been observed, but full coverage and low latency remain unproven. Preserve the original bounded retries and explicit upstream identity gaps; do not manufacture IDs or relax the strict coverage report.
 
 ## Market WebSocket semantics
 
@@ -79,7 +83,63 @@ Source: https://docs.polymarket.com/api-reference/wss/market and https://docs.po
 - Optional lifecycle notifications (previously enabled using `custom_feature_enabled`) can improve responsiveness, but they are not an authoritative complete universe-wide history. Reconcile with REST.
 - No authoritative maximum `assets_ids` per CLOB socket was established in the original research. Probe controlled subscription batches under published service limits; do not import limits from Perps, RTDS, PolyBolt, or REST APIs.
 
-## Snapshots, recovery and uncertainty
+### Ingestion preflight — executed with limitations (2026-10-27)
+
+The official market-channel specification and realtime-data guide were rechecked on 2026-10-27. They document text PING every 10 seconds, initial_dump defaulting to true, level defaulting to 2, dynamic subscribe/unsubscribe, and custom_feature_enabled for lifecycle events. These are documentation checks, not new live fixtures. Neither a subscription acknowledgement contract nor an authoritative assets-per-CLOB-socket ceiling was established by this review.
+
+Before committing the transport implementation to wire assumptions, run a read-only probe bounded to five minutes total, one connection at a time, and at most two binary markets per adapter (four outcome IDs). Resolve fresh IDs using a small bounded Gamma lookup for each version; do not blindly reuse old fixture IDs. If suitable IDs or connectivity are unavailable within the budget, report that adapter unverified rather than expanding the scan indefinitely. No credentials or trading requests are needed; keep TLS verification enabled, stdout empty and captures under .amp/in/artifacts/.
+
+- Subscribe to one market with explicit level=2 and initial_dump=true. Record sent requests and complete received messages with application-receive timestamps. Observe text PONG separately from WebSocket control frames, initial books, actual object/array envelopes and any rejection messages.
+- Add the second market without reconnecting. Then remove and re-add one market on the same socket. Record whether each operation supplies fresh snapshots, whether updates arrive around removal, and whether a safe reinitialization boundary can be established. A quiet interval is not proof of unsubscribe acceptance, and a successful send is not an acknowledgement.
+- Reconnect once per adapter with the latest assigned set and confirm fresh initialization. Stop at the deadline even if a market is silent. Missing observations remain unresolved; a sample does not prove exchange-wide ordering, capacity or losslessness.
+- Check the chosen Rust WebSocket/TLS version against the repository toolchain. Test fragmentation, oversize input, stalled sends, full/closed queues and shutdown deterministically on a local server; do not attempt to induce exchange overload. Document collector message/socket/batch budgets separately from exchange limits.
+
+This preflight can settle representative wire behavior, not full-universe capacity or p99 latency. Those require the integrated replay/load tests in architecture.md. If same-socket re-subscription lacks sufficient boundary evidence, do not silently approve it; select and test a fresh-connection recovery path before enabling that lifecycle transition.
+
+#### Observed evidence
+
+A throwaway Rust probe used tokio-tungstenite/tungstenite 0.28.0, Tokio 1.52.3 and Rustls with WebPKI roots on the repository's Rust 1.93.0-nightly macOS ARM64 toolchain. No TLS verification bypass, credentials or trading calls were used. Its isolated manifest/lockfile did not change application dependencies. Two executions took approximately 62 and 48 seconds, one socket at a time, with four outcome IDs per adapter. Stdout stayed empty. The first V1 Gamma lookup failed with a connection reset; only V1 was retried after the V2 probe completed.
+
+| Observation | V1 | V2 |
+|---|---|---|
+| Freshly selected Gamma market IDs | 561268, 559700 | 6245152, 6245150 |
+| Initial subscription | Both requested books received | Both requested books received |
+| Dynamic addition | Both added books received | Both added books received |
+| Same-socket re-addition | Both re-added books received | Both re-added books received |
+| Reconnect | Handshake failed with HTTP 525; initialization unverified | All four requested books received |
+| Captured book events / text PONGs | 6 / 4 | 10 / 5 |
+| Book contents | Nonempty, asymmetric sides (72 or 46 levels) | Empty bids and asks |
+| Price-change events | None observed | None observed |
+
+All seven data messages were top-level JSON arrays. Their observed maximum text sizes were 5,284 bytes (V1) and 1,394 bytes (V2), not safe production size ceilings. Re-addition snapshots repeated the initial exchange timestamps: a newly received initialization snapshot must not be discarded merely because its timestamp is old or unchanged. No explicit subscription/unsubscription acknowledgements were observed. The quiet sample cannot prove unsubscribe effectiveness or safe ordering between late deltas and reinitialization snapshots. Both V2 sessions and the first V1 session completed their close handshake; the failed V1 reconnect was not retried into a manufactured success.
+
+Five deterministic in-memory client/server/channel checks passed in debug and release: fragmented UTF-8 with an interleaved control ping and automatic pong; cancellation of a partial receive; exact-size versus oversized reassembled messages; cancellation of a stalled send; and full-versus-closed channel behavior with ordered draining. The stalled-send check demonstrated that cancelling a pending send does not roll back buffered/partially written data: a later flush delivered the original message. Scratch formatting and strict Clippy passed. These established dependency behavior, not acceptance of a production worker at that stage. See the integrated evidence below for subsequent worker tests.
+
+The probe capped incoming messages/frames at 2 MiB, the write buffer at 256 KiB, retained serialized capture at 32 MiB/20,000 entries, and individual HTTP/connect/send/close waits. These were small-probe safety limits, not measured full-universe budgets. Capture formatting and debug-build execution make its timings unsuitable for latency claims. Evidence and the scratch reproducer are under `.amp/in/artifacts/ws-preflight*`: raw messages, fresh Gamma pages, summary assertions, debug/release/Clippy logs and a source/lockfile archive. No permanent collector or benchmark framework was added.
+
+**Scope decision:** implement raw WebSocket transport only. These observations do not authorize a book engine or SBE pipeline. V1 reconnect, per-asset acknowledgements, capacity and stressed ordering remain unverified. This probe does not resolve Component 1's 44 missing-ID records or establish low latency/losslessness.
+
+### Component 2 boundary correction (2026-10-27)
+
+An earlier local implementation exceeded Component 2 by adding financial decoding, book reconstruction, periodic snapshots and SBE output. Those implementations and their dedicated tests/fixtures have been removed. The original template schema/codecs/file helpers remain; the stdout-writer extension was reverted. Historical `book-*` and `ingestion-*` artifacts describe that removed implementation and are **not current acceptance evidence**.
+
+The current worker timestamps and forwards complete text payloads byte-for-byte using owned Utf8Bytes, excluding application PONG. It carries adapter/session identity, per-session ordinals, successful subscription-request context and ordered lifecycle boundaries. It deliberately does not reject pre-snapshot deltas, unknown event types or financially invalid JSON; that belongs to a future downstream decoder. Binary and oversized messages still fail visibly. Requests are not exchange confirmations.
+
+The transport-boundary regression first failed against the coupled worker because it attempted JSON/book decoding. Local-server tests now exercise raw text preservation, timestamp bounds, ordered generations and subscription context, dynamic additions, fresh-connection reactivation, heartbeat failure, bounded queues, accepted-prefix retention and missed-notification repair. The executable integration test uses real local Gamma/WebSocket servers, overlapping native IDs across adapters, deadline and SIGINT shutdown, exact drained-message counts and empty stdout. It does not require a book or SBE reader.
+
+The executable is explicitly a diagnostic consumer: raw payloads are counted, checked for session order, then discarded. It is not a persistent capture tool. The opt-in `tests/ingestion_load.rs` now checks 100,000 raw messages in sequence using independently offered 40-message bursts every millisecond, one loopback worker and a small checking consumer. It measures monotonic queue age and total drain time, not financial correctness, exchange latency, maximum capacity or an SBE pipeline. Its workload is different from the removed SBE test; do not claim a speedup by comparing them.
+
+Post-removal checks passed on the same macOS ARM64 / Rust 1.93.0-nightly host: formatting, locked all-target check, strict Clippy and all 33 default deterministic tests in debug and release. The explicit raw-load run preserved all 100,000 messages in order, draining in 2.504461 seconds (39,929 messages/s at a nominal 40,000/s offered rate). Queue-age p50/p95/p99/p99.9/max were 5/432/7,382/17,617/17,637 µs; maximum producer scheduling lag was 18,977 µs. This small loopback workload excludes TLS, representative exchange payload sizes and discovery churn. No low-latency or speedup claim follows from it. Logs: `.amp/in/artifacts/component-scope-checks.log`.
+
+Live exchange validation and the large-registry measurement were not rerun for this scope correction. Earlier observations below do not replace those acceptance checks.
+
+### Earlier live observations — not post-removal acceptance
+
+- The explicit 120-second strict discovery test failed: 56,502 desired assets, V1 at 279 pages / 27,900 records without finishing, 44 unresolved records; V2 completed five pages / 449 records. No identity conflicts. Listing attempts: 286; verification attempts: six. These are discovery counts, not subscription counts.
+- A bounded repeat of the wire probe lasted 125.7 seconds. V1 Gamma failed with a connection reset. V2 supplied initial/add/re-add/reconnect snapshots and text PONGs, but no deltas. It used the earlier isolated Tokio 1.52.3 probe harness, not the current raw worker.
+- The now-removed integrated executable ran for 70 seconds on a restricted real V2 sample of four assets. Its book/SBE observations do not establish acceptance of the current raw transport. No live delta correctness or full-universe throughput was proven.
+
+## Future book component: snapshots, recovery and uncertainty
 
 - Prefer the initial WebSocket `book` snapshot followed by ordered updates **on the same connection** as the baseline. A REST snapshot from a different timeline is **not** a safe merge boundary without a documented sequence protocol.
 - A new valid snapshot can reestablish present state, but cannot reconstruct which historic deltas were missed. No assumed sequence number, exchange clock, timestamp, or book hash can by itself prove losslessness.

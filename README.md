@@ -1,9 +1,47 @@
 # Read before getting started!!
 
-First, read [src/main.rs](https://github.com/voluntas-io/engineering-challenge/blob/main/src/main.rs). Then, some background on this repo:
+## Running Components 1 and 2
+
+The executable runs continuous discovery and stable per-adapter WebSocket
+subscriptions. **It is a transport-validation runner, not a recording collector:**
+the consumer checks session/message order, counts raw messages and discards them.
+Stdout stays empty; diagnostics go to stderr. Book reconstruction, financial
+decoding, periodic snapshots and SBE output are not implemented.
+See [architecture](docs/architecture.md) and [protocol evidence](docs/protocol.md).
+
+```sh
+cargo build --locked --release
+target/release/engineering-challenge --seconds 120 > /dev/null 2> transport.log
+```
+
+Omit `--seconds` to run until SIGINT. The library boundary supplies owned raw text,
+application-receive timestamps, adapter/session identity, per-session ordinals and
+ordered lifecycle/subscription-request events. Full/closed ingress fails visibly;
+shutdown allows 15 seconds to drain accepted messages. A successful run does not
+prove exchange-wide coverage, confirmed subscriptions, valid books or persistence.
+
+Options (each requires a value): `--seconds`, `--gamma-url`, `--ws-url`,
+`--assets-per-socket` (1000), `--max-sockets` (1024),
+`--queue-items` (8192), `--queue-bytes` (67108864). Socket/message/queue settings are
+collector safety budgets, **not verified exchange limits or a total RSS cap**.
+
+```sh
+cargo fmt --all -- --check
+cargo check --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo test --locked --release
+cargo test --locked --release --test ingestion_load -- --ignored --nocapture
+# Read-only live coverage gate, bounded to 120 seconds; may fail honestly:
+cargo test --locked --test discovery_http live_discovery_coverage -- --ignored --nocapture
+```
+
+The original template's schema, generated codecs and file-oriented reader/writer
+remain available for a separately authorized output component. They are not used
+by the transport-validation executable.
 
 This repo uses the [FIX SBE standard](https://fixtrading.org/packages/simple-binary-encoding-technical-specification-v2-rc2/)
-for writing binary messages. The rust code abstracts this away for you, and you can simply use the helpers, as demonstrated in `main.rs`.
+for its eventual binary output. The supplied Rust helpers abstract encoding and decoding.
 
 ### More background, in case you are curious!
 

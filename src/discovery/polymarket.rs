@@ -19,6 +19,8 @@ pub const GAMMA_MARKETS: &str = "https://gamma-api.polymarket.com/markets/keyset
 pub struct Gamma {
     client: Client,
     endpoint: Url,
+    listing_requests: usize,
+    verification_requests: usize,
 }
 
 impl Gamma {
@@ -29,11 +31,13 @@ impl Gamma {
                 .user_agent("voluntas-discovery/0.1")
                 .build()?,
             endpoint: Url::parse(endpoint)?,
+            listing_requests: 0,
+            verification_requests: 0,
         })
     }
 
     async fn page(
-        &self,
+        &mut self,
         adapter: &dyn GammaAdapter,
         cursor: Option<&str>,
         ids: &[String],
@@ -54,6 +58,11 @@ impl Gamma {
         }
         for attempt in 0..3 {
             let mut retry_after = None;
+            if ids.is_empty() {
+                self.listing_requests += 1;
+            } else {
+                self.verification_requests += 1;
+            }
             let error = match self.client.get(url.clone()).send().await {
                 Ok(mut response) if response.status().is_success() => {
                     let mut body = Vec::new();
@@ -178,6 +187,9 @@ pub struct DiscoveryReport {
     pub desired_assets: usize,
     pub uncertain_markets: usize,
     pub pending_verifications: usize,
+    /// HTTP attempts, including retries and attempts cancelled at the deadline.
+    pub listing_requests: usize,
+    pub verification_requests: usize,
     /// Cumulative run counters; expiry/overflow must not look like resolution.
     pub expired_verifications: usize,
     pub verification_overflow: usize,
@@ -241,13 +253,13 @@ impl Discovery {
         adapter: &dyn GammaAdapter,
         cursor: Option<&str>,
         ids: &[String],
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Option<Result<Vec<u8>>> {
         let request = self.gamma.page(adapter, cursor, ids);
         tokio::pin!(request);
         loop {
             tokio::select! {
-                _ = sleep_until(deadline) => { self.stopped = true; return None; }
+                _ = wait_deadline(deadline) => { self.stopped = true; return None; }
                 command = self.commands.recv(), if self.commands_open => {
                     self.commands_open = command.is_some();
                     if handle_command(&mut self.registry, command) { self.stopped = true; return None; }
@@ -257,7 +269,7 @@ impl Discovery {
         }
     }
 
-    async fn verify_one_batch(&mut self, deadline: Instant) -> bool {
+    async fn verify_one_batch(&mut self, deadline: Option<Instant>) -> bool {
         let keys = self.registry.verification_batch(Instant::now());
         let Some(first) = keys.first() else {
             return false;
@@ -313,9 +325,9 @@ impl Discovery {
         true
     }
 
-    async fn idle(&mut self, until: Instant, deadline: Instant) {
+    async fn idle(&mut self, until: Instant, deadline: Option<Instant>) {
         tokio::select! {
-            _ = sleep_until(deadline) => self.stopped = true,
+            _ = wait_deadline(deadline) => self.stopped = true,
             _ = sleep_until(until) => {},
             command = self.commands.recv(), if self.commands_open => {
                 self.commands_open = command.is_some();
@@ -325,8 +337,16 @@ impl Discovery {
     }
 
     pub async fn run_for(&mut self, duration: Duration, once: bool) -> DiscoveryReport {
+        self.run(Some(Instant::now() + duration), once).await
+    }
+
+    /// Same scheduler as bounded validation, with Stop as the lifetime boundary.
+    pub async fn run_until_stopped(&mut self) -> DiscoveryReport {
+        self.run(None, false).await
+    }
+
+    async fn run(&mut self, deadline: Option<Instant>, once: bool) -> DiscoveryReport {
         let started = Instant::now();
-        let deadline = started + duration;
         let mut first_publication_ms = None;
         let mut max_page_apply_us = 0;
         let scans = loop {
@@ -421,6 +441,8 @@ impl Discovery {
                 .filter(|m| m.uncertainty.is_some())
                 .count(),
             pending_verifications: self.registry.pending.len(),
+            listing_requests: self.gamma.listing_requests,
+            verification_requests: self.gamma.verification_requests,
             expired_verifications: self.registry.expired_verifications,
             verification_overflow: self.registry.verification_overflow,
             identity_conflicts: self.registry.identity_conflicts,
@@ -437,7 +459,14 @@ fn handle_command(registry: &mut Registry, command: Option<Command>) -> bool {
         }
         Some(Command::Hint(key)) => registry.request_verification(key),
         Some(Command::Stop) => return true,
-        None => {}
+        None => return true,
     }
     false
+}
+
+async fn wait_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }

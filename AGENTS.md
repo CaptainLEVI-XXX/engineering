@@ -18,17 +18,30 @@ Priority: **numerical accuracy → reconstructed-book correctness → honest acc
 
 Read only the relevant reference sections for the current task. Preserve existing user edits, do not add dependencies without a concrete reason, and do not create unrelated trading or metadata infrastructure. Do not use subagents unless the user explicitly changes that instruction.
 
+## Component scope and authorization
+
+The user develops this project **one component at a time**: investigate its requirements and contracts, review its implementation plan, then execute and validate the approved scope. **The currently authorized component is Component 2: subscription management and WebSocket ingestion.** The full collector mission describes the eventual system, not permission to implement every component now.
+
+- Use the user's component names and boundaries consistently. Do not substitute a different numbered implementation sequence or redefine Component 2 to mean the entire data plane.
+- Requests such as “go ahead,” “execute it,” or “complete Component 2” authorize the agreed component plan, not downstream components or extensions. Finish that component's acceptance checks, report limitations, and stop before starting another component.
+- Cross-component edits must be necessary for the current component's contract. State the dependency and why an existing interface or a small test consumer cannot satisfy it. Make only the smallest integration change; if it requires implementing another component, explain the blocker and obtain approval before expanding scope.
+- A useful future integration, fewer eventual queues, or a desire to demonstrate the entire collector is **not** sufficient justification for implementing a downstream component early. Logical ownership decisions do not authorize its implementation.
+- Validate the current boundary with deterministic fixtures and a minimal test consumer where appropriate. Do not build a production downstream subsystem merely to test the current component.
+- Existing code and historical architecture documents do not expand authorization. Flag any existing implementation that crosses the approved boundary; do not silently delete existing work or use its presence as permission to extend it.
+
 ## Current design decisions (not yet benchmark-proven)
 
 - **Control plane:** a minimal, exchange-adapter-based **instrument discovery and desired-state registry**. Use paginated Gamma REST for Polymarket, plus lifecycle hints and periodic full reconciliation. Never derive new instruments by incrementing IDs; external IDs are opaque and version-scoped.
 - **Adapter boundary:** `PolymarketV1` and `PolymarketV2` are separate adapters with shared Gamma transport, pagination, retries and common lifecycle parsing. Future `Kalshi` is a separate adapter with its own transport, not a Gamma version. The registry accepts normalized records keyed by adapter namespace plus exact native ID; keep wire fields and binary-outcome cardinality in the Polymarket adapters. Do not collapse these adapters merely because they share endpoints, or implement Kalshi prematurely.
 - **No category/tags on the critical path.** Keep only identity, protocol, market/outcome relationship and collection eligibility. An optional timestamped metadata/strategy index can join on exact IDs for category-filtered backtests later.
-- Use `HashMap` for registry lookup and temporary `HashSet` for scan reconciliation when useful. Do **not** maintain a redundant persistent `active_assets` set if the registry already expresses the desired set. Keep **desired**, **subscription-confirmed**, and **book-initialized** separate. Component 1 owns **desired state**; the WebSocket subscription manager owns **confirmed state** when implemented in stage 4 (it is not part of Component 1).
-- **Data plane baseline candidate:** multiple Tokio WebSocket workers, each initially owning and updating its assigned books locally, feeding one ordered SBE output owner. Benchmark this against separately sharded book processors before adding an extra queue/handoff. One mutable owner per source/book; no global book mutex.
+- Use `HashMap` for registry lookup and temporary `HashSet` for scan reconciliation when useful. Do **not** maintain a redundant persistent `active_assets` set if the registry already expresses the desired set. Component 1 owns **desired state**; Component 2 owns assignments and **successfully requested subscriptions for each connection session**. A successful send is not exchange confirmation. **Book initialization** belongs to the downstream book engine, not the discovery registry or transport's liveness state.
+- **Future integrated data-plane candidate, not current implementation authorization:** multiple Tokio WebSocket workers may eventually own and update assigned books locally, feeding one ordered SBE output owner. Evaluate this against separately sharded book processors when those components are authorized. One mutable owner per source/book; no global book mutex. Component 2 must first be independently testable without production book reconstruction or SBE output.
 - **Exchange-neutral does not mean exchange-identical.** Polymarket subscribes to outcome asset IDs; Kalshi generally uses market tickers. Normalize identities/lifecycle at adapter boundaries without forcing a fake universal YES/NO book API.
 - Discovery REST calls, metadata enrichment, monitoring, retry sleeps, and expensive logs must never block the market-update hot path.
 
 ## Non-negotiable data contracts
+
+These are system-wide contracts to apply when implementing the component that owns them, not permission to build that component early. Component 2 preserves raw message content and ordering for downstream validation; it does not need to reconstruct books or encode SBE to satisfy its transport contract.
 
 - A received `book` snapshot **replaces** the prior book; a `price_change` level gives an **absolute new quantity**; zero deletes. Validate an entire event before applying partial changes. A trade print is not itself a book delta.
 - Preserve **per-instrument feed order**, including snapshots and update batches. Do **not** sort by exchange timestamps or assume equal timestamps imply duplicates. Global chronological ordering across sockets is **not promised** unless a downstream contract demands it and the cost is measured.
@@ -39,16 +52,25 @@ Read only the relevant reference sections for the current task. Preserve existin
 - A bounded queue must have an explicit full-queue and failure policy. Never silently drop, overwrite, coalesce, or relabel historical order-book updates. No finite queue can preserve an infinitely stalled consumer.
 - Graceful SIGINT: stop discovery/reconnect scheduling, establish intake cutoff, close sockets, drain accepted ordered work if feasible, flush output, and join workers. Report unsuccessful drain/broken pipe; do not claim durability from flush alone.
 
-## Implementation sequence and gates
+## Component boundaries and acceptance gates
 
-**Currently focus on Component 1 only until asked to continue.** Every stage must be executable and independently validated before advancing:
+### Component 1 — Instrument discovery and registry
 
-1. **Instrument discovery:** use the documented, fixture-backed rules and explicit unresolved policies in `docs/protocol.md`; normalize opaque IDs and outcome mappings. Publish validated additions incrementally and atomically per market. Incomplete scans cannot remove subscriptions; known malformed/uncertain markets retain desired state and trigger targeted verification. Invalidate cached snapshots and notify on uncertainty/identity changes as well as additions/removals. Retirement and reactivation require fresh matching targeted evidence, not permanent tombstones. Tests: multipage, conflicting IDs, partial scans, unknown eligibility, missing fields, paused versus retired, snapshot recovery, and verified reactivation. Distinguish pagination completion from established coverage; an empty registry after failed startup is not an empty exchange. No live-WebSocket dependency for its tests. The future subscription consumer must reconcile on startup, notification and a finite periodic interval.
-2. **Exact book engine + fixture replay:** prove decimal boundaries, snapshot replacement, absolute deltas, zero deletion, multi-asset batches, and correct order. Use an independent simple reference oracle.
-3. **SBE output contract:** produce binary stdout and round-trip through the supplied reader; test 64 MiB framing, tail flush, short writes, large snapshots, side, IDs, units and timestamps. Resolve mapping before writing real data.
-4. **One live socket → multiple sockets:** capture and timestamp real messages, initialize books, account for subscriptions, add socket assignment and lifecycle reconciliation.
-5. **Recovery and optional redundancy:** explicit uninitialized/live/stale/resync/retired states; mark uncertainty intervals, reject superseded connection generations, emit snapshot on failover. Do not infer losslessness from a hash or timestamp.
-6. **Performance:** record realistic traffic; benchmark full-pipeline load and p50/p95/p99/p99.9, counts, queue age, RSS and delivery delay. Optimize only measured bottlenecks, preserving the same replay oracle.
+Own eligibility, exact version-scoped identities and authoritative desired state. Preserve validated incremental additions, atomic market updates, uncertainty reporting and safe retirement/reactivation. Incomplete scans cannot erase prior desire. Keep its tests independent of WebSockets. During Component 2 work, retain this implementation except for required integration, such as a continuous lifecycle reusing its existing scheduler and snapshot/notification interface.
+
+### Component 2 — Subscription management and WebSocket ingestion (current scope)
+
+- **Input:** Component 1's authoritative desired-state snapshots and change notifications.
+- **Ownership:** one subscription manager owns stable market-to-worker assignments; one Tokio task owns each socket, its desired/requested subscriptions and connection generation.
+- **Output boundary:** owned complete WebSocket messages, application-receive timestamps captured before parsing/queueing, per-session receive order, and ordered session-start/session-end boundaries. Keep enough assignment context for a future downstream consumer to identify the source. Do not sort by exchange timestamps or claim global chronological order.
+- **Required behavior:** initial and incremental subscription commands, multiple sockets, heartbeat/control-frame handling, bounded reconnect/backoff, latest desired state after reconnect, explicit overload/failure handling and graceful shutdown/draining of accepted messages. Preserve adapter namespaces. Sending a subscription is not proof of acceptance or book initialization.
+- **Allowed supporting work:** minimal discovery lifecycle integration, bounded transport interfaces, protocol-level control/lifecycle handling required by the approved plan, local HTTP/WebSocket test servers, and a small test consumer. Observing an initial `book` message in a fixture is not the same as reconstructing and validating a live book.
+- **Acceptance:** validate stable assignments and capacity, dynamic changes, reconnect generations, ordered accepted-message delivery, missed-notification recovery, message/queue limits, full/closed consumers, stalled I/O and shutdown. Run bounded live probes when feasible and measure transport throughput, receive-to-handoff latency and queue behavior. Report missing evidence rather than building another component to fill it.
+- **Not implicitly authorized:** production financial decoding, exact book reconstruction, periodic book snapshots, SBE serialization/stdout integration, downstream book recovery, redundant feeds, automatic rebalancing, Kalshi, or full-pipeline performance tuning. Existing implementations of these are not part of Component 2's acceptance merely because they currently run inside a socket worker.
+
+### Later components — require their own reviewed plans and authorization
+
+Preserve these eventual contracts without implementing them during Component 2 work: exact decimal parsing and book replay with an independent oracle; supplied-reader-compatible SBE output and tail flushing; book validity/recovery and visible snapshot boundaries; and representative full-pipeline performance measurement. The user defines their component numbering and scope. Basic socket reconnect and session boundaries remain Component 2 responsibilities; downstream book recovery and optional redundancy do not.
 
 ## Performance discipline
 

@@ -22,12 +22,27 @@ fn gated_server(
     replies: Vec<(Vec<&'static str>, u16, Value)>,
     gate: Option<(usize, std::sync::mpsc::Receiver<()>)>,
 ) -> (String, thread::JoinHandle<()>) {
+    encoded_server(
+        replies
+            .into_iter()
+            .map(|(query, status, body)| (query, status, body.to_string().into_bytes(), ""))
+            .collect(),
+        gate,
+    )
+}
+
+type EncodedReply = (Vec<&'static str>, u16, Vec<u8>, &'static str);
+
+fn encoded_server(
+    replies: Vec<EncodedReply>,
+    gate: Option<(usize, std::sync::mpsc::Receiver<()>)>,
+) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/markets/keyset", listener.local_addr().unwrap());
     listener.set_nonblocking(true).unwrap();
     let handle = thread::spawn(move || {
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        for (index, (query_parts, status, body)) in replies.into_iter().enumerate() {
+        for (index, (query_parts, status, body, headers)) in replies.into_iter().enumerate() {
             let mut socket = loop {
                 match listener.accept() {
                     Ok((socket, _)) => break socket,
@@ -62,11 +77,53 @@ fn gated_server(
             {
                 receiver.recv_timeout(Duration::from_secs(10)).unwrap();
             }
-            let body = body.to_string();
-            write!(socket, "HTTP/1.1 {status} response\r\nContent-Length: {}\r\nContent-Type: application/json\r\nRetry-After: 0\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            write!(socket, "HTTP/1.1 {status} response\r\nContent-Length: {}\r\nContent-Type: application/json\r\nRetry-After: 0\r\n{headers}Connection: close\r\n\r\n", body.len()).unwrap();
+            socket.write_all(&body).unwrap();
         }
     });
     (url, handle)
+}
+
+#[tokio::test]
+async fn compressed_pages_respect_the_decompressed_size_budget() {
+    // Both contain market(0); the second adds padding to 8 MiB + 1 byte.
+    // gzip fixtures were generated with mtime=0.
+    for (body, desired, accepted) in [
+        (
+            include_bytes!("fixtures/gamma-market-page.json.gz").as_slice(),
+            4,
+            true,
+        ),
+        (
+            include_bytes!("fixtures/gamma-oversized-page.json.gz").as_slice(),
+            2,
+            false,
+        ),
+    ] {
+        let (url, server) = encoded_server(
+            vec![
+                (
+                    vec!["version=v1", "accept-encoding: gzip"],
+                    200,
+                    body.to_vec(),
+                    "Content-Encoding: gzip\r\n",
+                ),
+                (
+                    vec!["version=v2"],
+                    200,
+                    serde_json::to_vec(&json!({"markets":[market(1)]})).unwrap(),
+                    "",
+                ),
+            ],
+            None,
+        );
+        let (mut discovery, _commands, _changes) = Discovery::new(Gamma::new(&url).unwrap());
+        let report = discovery.run_for(Duration::from_secs(10), true).await;
+        assert_eq!(report.desired_assets, desired);
+        assert_eq!(report.coverage_accepted(), accepted);
+        assert_eq!(report.scans[0].error.is_none(), accepted);
+        server.join().unwrap();
+    }
 }
 
 #[tokio::test]
@@ -142,6 +199,9 @@ async fn uncertain_record_triggers_closed_any_lookup_and_does_not_block_other_ma
     assert_eq!(report.pending_verifications, 0);
     assert_eq!(report.scans[0].unresolved_records, 1); // Historical scan accounting is not rewritten.
     assert!(!report.coverage_accepted());
+    let counters = serde_json::to_value(&report).unwrap();
+    assert_eq!(counters["listing_requests"], 2);
+    assert_eq!(counters["verification_requests"], 1);
     server.join().unwrap();
 }
 
@@ -241,6 +301,9 @@ async fn retryable_error_is_bounded_and_repeated_cursor_is_not_success() {
     let report = discovery.run_for(Duration::from_secs(10), true).await;
     assert_eq!(report.desired_assets, 4);
     assert!(!report.scans[0].pagination_complete);
+    let counters = serde_json::to_value(&report).unwrap();
+    assert_eq!(counters["listing_requests"], 4); // Includes the HTTP retry, not just successful pages.
+    assert_eq!(counters["verification_requests"], 0);
     server.join().unwrap();
 }
 
@@ -345,4 +408,36 @@ async fn live_discovery_coverage() {
         report.coverage_accepted(),
         "strict observed-discovery acceptance failed; see report (not proof of exchange-wide coverage)"
     );
+}
+
+#[tokio::test]
+async fn continuous_discovery_serves_snapshots_until_explicit_stop() {
+    let (url, server) = server(vec![
+        (vec!["version=v1"], 200, json!({"markets":[market(0)]})),
+        (vec!["version=v2"], 200, json!({"markets":[market(1)]})),
+    ]);
+    let (mut owner, commands, mut changed) = Discovery::new(Gamma::new(&url).unwrap());
+    let task = tokio::spawn(async move { owner.run_until_stopped().await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            changed.changed().await.unwrap();
+            let (send, receive) = oneshot::channel();
+            commands.send(Command::Snapshot(send)).await.unwrap();
+            if receive.await.unwrap().desired_assets() == 4 {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!task.is_finished());
+    commands.send(Command::Stop).await.unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(report.stopped);
+    assert_eq!(report.desired_assets, 4);
+    assert!(report.scans.iter().all(|s| s.pagination_complete));
+    server.join().unwrap();
 }

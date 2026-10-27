@@ -1,6 +1,6 @@
 # Collector architecture and decision record
 
-Status: Design hypothesis, not measured final architecture. Date: 2026-10-26. Scope: Voluntas challenge, Polymarket initially. The published challenge and actual template schema remain authoritative.
+Status: Only Component 1 (discovery/registry) and Component 2 (subscription management/raw WebSocket transport) are implemented. Book reconstruction and SBE output require separate plans and authorization. Full-universe acceptance and representative production latency remain open. Updated: 2026-10-27.
 
 ## Boundaries
 
@@ -12,17 +12,15 @@ Exchange discovery adapter            │
 Desired instrument registry           │
       ↓ reconciled desired state       │
 WebSocket subscription manager <------┘
-      ↓ confirmed socket assignments
+      ↓ desired socket assignments (not exchange acknowledgements)
 Multiple WebSocket workers (independent connection generations)
-      ↓ receive timestamp → parse → validate → apply to owned L2 book
-Bounded ordered output channel (explicit overload policy)
-      ↓
-Single SBE writer → binary stdout
-
-Optional: external point-in-time metadata index → category-based backtesting joins.
+      ↓ owned raw message + receive timestamp + session/ordinal
+Bounded ordered ingress channel (explicit overload policy)
+      ↓ current executable: diagnostic consumer, no persistence
+Future authorized components: decoding → books → SBE output
 ```
 
-Discovery is not market data: Gamma tells us which instruments to listen to, not each live order-book update. The WebSocket stream provides initial/refresh snapshots and price-level changes; the collector produces periodic local snapshots without repeatedly calling REST for them.
+Discovery is not market data: Gamma tells us which instruments to listen to, not each live order-book update. Component 2 forwards complete text messages unchanged except application PONG, which belongs to connection health. It does not parse financial events, initialize books or produce periodic book snapshots.
 
 ## Component 1: Minimal instrument discovery and desired-state registry
 
@@ -70,7 +68,7 @@ Retired identities are retained for matching verified reactivation, not permanen
 3. After each page, service one eligible targeted batch (up to 100 same-version market IDs with `closed=any`). Accumulate targeted pages before applying evidence. Missing/contradictory targeted results retain prior desire. Missing known markets are queued only after that version completes its listing traversal.
 4. Targeted eligible evidence can add a new market, clear uncertainty, or reactivate a retired market only with matching identities. Targeted closed/archived evidence can set `desired=false`. Listing records alone cannot clear existing uncertainty, retire, or reactivate. Lifecycle hints only request this verification.
 5. Every observable registry change, including uncertainty changes, invalidates the lazy cached `Arc<Snapshot>`. Notify once at each listing-page, targeted-batch, request-failure or completed-scan absence boundary, before awaiting more work. Market commits remain atomic; the final dirty batch must notify even when no next page arrives. Snapshot copies occur on consumer request after mutation, not for every addition. Old snapshots remain immutable. A full snapshot is authoritative desired state, not a historical change log.
-6. The future subscription consumer reads full state on startup/restart, change notification and a finite periodic interval independent of scan success. This repairs lost/coalesced notifications without a durable event log. The periodic consumer loop is not implemented here; restarting the registry process requires rediscovery.
+6. The subscription manager reads full state at startup, at most once per second on notification, and every five seconds regardless of notifications. This repairs lost/coalesced notifications without a durable event log. Restarting the registry process requires rediscovery; manager failure terminates the baseline collector.
 7. Requests have at most three HTTP attempts, a 15-second attempt timeout, jittered backoff and server `Retry-After` handling. A run deadline/Stop cancels HTTP or backoff. A targeted round accumulates at most 10 pages/1,000 records before applying evidence; oversize or incomplete results cannot retire anything. Sweeps resume 60 seconds after completion. Targeted work runs between pages and while waiting between sweeps. Snapshot/Hint/Stop commands remain serviceable during awaits.
 
 Verification scheduling uses one identity-keyed map, replacing the old pending set plus separate retry-time map. Unknown, never-admitted identities get at most three rounds, with 30- then 60-second minimum start-to-start gaps, within a five-minute scheduling lifetime. Duplicate hints/listings do not refresh the budget. Exhausted jobs remain until expiry to suppress duplicates; at expiry they are removed and counted, not declared resolved. There is no automatic restart after expiry; a subsequent listing/hint may start a new bounded job. This deliberately permits later recovery without permanent suppression tombstones. An already-running HTTP round may finish after the scheduling lifetime, bounded by its transport budgets and run deadline.
@@ -78,6 +76,8 @@ Verification scheduling uses one identity-keyed map, replacing the old pending s
 At most 1,024 unknown jobs are retained, including exhausted jobs. New unknown work at capacity is rejected and counted; periodic discovery can recover it later. Known entries bypass that limit and continue verification with capped 30/60/120/240/300-second backoff. Neither failure nor job expiry removes desired state. Oldest-due selection prevents newer hints from continually overtaking older work. These are collector defaults, not exchange protocol limits; validate them under sustained churn before production use. Total verification state is bounded by retained known markets plus 1,024 unknown jobs, not by 1,024 alone. Retired registry history itself remains unbounded.
 
 The command channel has capacity 64; senders await capacity rather than dropping commands. Watch notifications coalesce because consumers fetch current state. Timing/scanning counters describe the last sweep and current registry; expiry, overflow, identity-conflict and failed-verification counters accumulate over the owner lifetime. None count confirmed subscriptions. A single in-flight request may delay another version during backoff; evaluate parallelism only if measured discovery delay warrants it.
+
+`listing_requests` and `verification_requests` count HTTP attempts, including retries and attempts cancelled at the deadline. The Gamma client uses reqwest's gzip support; the 8 MiB response limit applies to decompressed bytes. Keep the original bounded-job policy: a tested 30-minute cooldown was removed because no measured retry bottleneck justified its extra state and recovery delay. Expiry remains uncertainty, not resolution, and later observations may start a fresh bounded job.
 
 Do not require category metadata, matching-engine structures, lock-free registries, advanced compiler flags or generic plugin frameworks for Component 1.
 
@@ -121,7 +121,7 @@ Use deterministic fixture → expected desired-state tests. At minimum:
 - A consumer can recover current desired state by requesting a full snapshot without replaying notifications. When the actual subscription consumer is added, test periodic repair after a missed final notification with a controlled clock.
 - Registry work stays in the control plane and does not require categories/tags or a live WebSocket to run tests.
 
-## Later stages: Ingestion baseline, not premature final design
+## Future book/output design candidates — not implemented or authorized
 
 - Start with multiple Tokio WebSocket workers, each owning its assigned instruments' L2 books, to minimize channel handoffs. Alternative: separate sharded book-owner workers. Select using controlled end-to-end benchmarks. Avoid task-per-message and global mutable book maps.
 - Timestamp after full WebSocket-message delivery, before parse, keep same timestamp for items in its batch. Route/commit per-asset changes in stream order; cross-socket global timestamp order is not guaranteed. If backtester requires global ordering, document and benchmark a specific policy, not an arbitrary sort.
@@ -129,18 +129,64 @@ Use deterministic fixture → expected desired-state tests. At minimum:
 - Feed redundancy (extension): independent book replicas; one publishing authority; a controlled snapshot boundary on failover; never combine the "fastest" deltas from two connections into one state. Use connection generation to reject stale work.
 - Failure policy: If integrity cannot be proven, mark stale and stop claiming a valid historical interval. Prefer same-connection snapshot + ordered subsequent updates. Do not blindly splice REST snapshot to concurrent WebSocket deltas via timestamps. No documented Polymarket sequence/replay means some gaps cannot be proven absent.
 
-## Output and ordering contract to resolve early
+## Component 2 transport contract — 2026-10-27
 
-The provided example's AlignedSbeWriter accepts a file path and emits zero-padded fixed chunks, while the challenge asks for binary stdout. Confirm helper framing, record limits, sentinel, flush and reader compatibility. Use a minimal sink adapter preserving the provided codec; never invent a new SBE schema or claim a reader works without round-trip proof. Low-traffic streams must not buffer indefinitely. Benchmark batching vs observable delivery delay and padding bandwidth.
+Component 2 means subscription management and raw WebSocket ingestion. Its acceptance boundary is an ordered raw-message consumer, not reconstructed books or SBE records. Discovery coverage limitations remain explicit and are not erased by a successful socket probe.
 
-Per-asset records must replay in applied order; book replacement/failover must emit a new snapshot. Across assets, the writer may interleave source workers; unless the consumer formally requires a global clock order, do not pay for speculative global reordering. Expose diagnostics/uncertain intervals outside the required SBE data stream if schema can't express them; stdout stays binary only.
+**Ownership and integration**
 
-## Capacity and failure budgets (determine empirically)
+- Keep one assignment manager and one Tokio task owning each socket. The worker moves an owned text payload to the bounded ingress channel without financial decoding. Downstream placement and possible removal of this handoff can be evaluated when those components are authorized.
+- Reuse Component 1's watch notifications and Snapshot command. Reconcile on startup, notifications and a finite periodic interval. Consume the notification before fetching state so a change during the fetch remains pending. Do not require a new change-log API. Snapshots describe current desire, not every intervening lifecycle transition or proof of continuous feed history.
+- The manager owns assignments; each worker retains its assigned set across connections and separately tracks successfully requested assets for the current session. Apply an assignment command locally before attempting its wire change. A failed Add therefore remains desired; a Remove during backoff is reflected before the next subscription. Clear requested state on reconnect. A dead command receiver is a worker failure, not successful delivery.
+- Keep existing assignments stable; initially place all outcomes of a Polymarket market together. Choose a worker with enough remaining instrument capacity for the entire market. If configured socket capacity is exhausted, report unassigned desire and fail coverage rather than overfill or silently omit assets. Do not implement automatic migrations or manager hot-restart recovery; a manager failure terminates the run in this baseline.
+- Preserve adapter identity in worker/session context; do not mix namespaces without an unambiguous wire-to-adapter mapping. Use existing exact IDs. Keep only indexes needed for reconciliation/routing, rather than automatically duplicating both market and asset ownership maps.
+- Extend the current discovery loop to support running until Stop without a duration deadline; keep run_for as the bounded validation entry point. Reuse scheduling and cancellation rather than adding a second discovery loop or an independent shutdown protocol.
+
+**Session boundaries**
+
+- Identify each session by a worker identity and a generation that is never reused while its work remains outstanding. Preserve receive order within the session. Use complete-message terminology, not frame terminology: WebSocket fragmentation is handled below this boundary.
+- A new connection clears requested state. Removing then re-adding an asset rotates the connection rather than assuming an exchange-side unsubscribe/resubscribe ordering guarantee. Whether any message initializes a usable book is exclusively a future downstream decision.
+- Successful subscription requests, raw messages and session boundaries share one ordered channel. Previously accepted messages are not discarded merely because a later command removed their asset. Late exchange messages are still forwarded unchanged; request metadata is not an exchange acknowledgement or proof that all subsequent messages concern active assignments.
+
+**Bounded work and failure**
+
+- Timestamp immediately after complete-message delivery, before queueing. Exchange timestamps remain untouched inside the raw payload; use monotonic timing for durations. Moving an owned Utf8Bytes avoids an extra String conversion, not all allocations or copies in the network stack.
+- Bound initial/dynamic subscription batches, handshake/write/close waits, message size, channel capacity and total sockets. Derive a total memory budget from queued payload bounds plus per-socket buffers and in-flight messages; channel item count alone is insufficient. Treat limits as collector choices until protocol evidence supports them.
+- An awaited send inside a select handler suspends that task's receive polling. Keep batches bounded and make shutdown interrupt connect, backoff and pending sends. A timed-out send has uncertain delivery: terminate that session instead of blindly retrying on it. Drive control ping/pong and close handling according to the pinned library; unexpected data-bearing message types must not be silently ignored.
+- Use process-level fail-closed handling for queue saturation, a lost consumer or an unrecoverable worker/manager failure initially. Distinguish a full channel from a closed one. Record the received-but-unaccepted message boundary, stop all intake/reconnect scheduling, drain accepted work within a deadline and join tasks; report unsuccessful drain and return failure. An independent shutdown signal must not cause the consumer to throw away the accepted prefix. No recovery service or unbounded emergency queue is required.
+- Ordinary connection failures may reconnect with capped exponential delay and jitter, cancellable during shutdown. Each interruption is an explicit history gap; a new snapshot restores state only. Do not present a successful reconnect as gap-free capture.
+- Separate tasks do not by themselves isolate CPU work: uncached registry snapshots synchronously clone the map. The combined validation runner uses four Tokio threads. Measure receive stalls during discovery/reconciliation before claiming isolation or adding dedicated threads.
+
+**Implementation order and acceptance**
+
+1. Run the bounded protocol probe in protocol.md. Pin a compatible WebSocket/TLS dependency version and verify its buffer, cancellation and control-frame behavior. Save observed wire fixtures separately from synthetic failure cases.
+2. Keep the acceptance boundary raw: preserve text bytes, timestamps, session identity and order without parsing financial values or requiring an initial book. Use a small diagnostic consumer, not a downstream production subsystem.
+3. Implement one socket with initial subscription, timestamping, heartbeat, session boundaries and bounded shutdown. Test fragmented/batched messages, unexpected payload types, oversize input, stalled writes and shutdown during connect/backoff/write.
+4. Integrate continuous discovery and stable assignments, then multiple sockets. Test failed Add followed by reconnect, Remove during backoff, duplicate commands, same-socket re-admission, adapter namespace isolation, startup/periodic reconciliation, unchanged assignments and capacity exhaustion.
+5. Test full/closed queues, worker failure and accepted-prefix draining at a session boundary. Replay recorded traffic with independently offered bursts and discovery churn; compare accepted/processed counts, sustained throughput, memory, queue age and latency distributions. A fast enqueue into a slow consumer is not a throughput result.
+
+Implementation ownership stays small: discovery lifecycle changes in src/discovery/polymarket.rs; socket and assignment logic in src/websocket/worker.rs and manager.rs with shared public types in mod.rs; deterministic local-server tests under tests/. Add dependencies, files and instrumentation only as their executable stage needs them. No Kalshi implementation, redundancy, automatic rebalancing, custom queues or extra compiler tuning is included.
+
+## Implemented raw ingress and validation runner
+
+`src/websocket/ingress.rs` defines `Started`, `SubscriptionsRequested`, raw `Data` and `Ended` events. Data carries `Session { worker, generation, adapter }`, per-session ordinal, application receive time and owned `Utf8Bytes`. Financially malformed or unknown text is deliberately preserved for the downstream decoder; application PONG and WebSocket control frames are handled by the worker.
+
+The existing bounded crossbeam handoff remains; no replacement queue implementation is introduced. Defaults are 8,192 queued envelopes and 64 MiB of accounted bytes. A semaphore permit stays with each envelope through consumption. Accounting includes envelope size, raw text length and control-event vector/string capacities. Utf8Bytes hides backing allocation capacity, so this is **not** an allocation/RSS bound. Registry retention, allocator overhead and per-socket buffers are additional.
+
+`src/main.rs` is explicitly a **transport-validation runner**: a small consumer checks session/ordinal order, counts and discards raw messages, and drains until senders close. Stdout stays empty; diagnostics go to stderr. Successful validation is not capture durability, financial correctness, subscription confirmation or book initialization. The supplied file-oriented SBE helpers/schema remain unchanged from the pre-Component-2 baseline and are not wired into this executable.
+
+Binary/oversized data and full/closed ingress fail the run through an independent stop signal. Accepted envelopes still drain; an unavailable final boundary remains an explicit failure, not a clean end. SIGINT stops discovery, socket intake and reconnect scheduling; shutdown joins workers and allows a shared 15-second drain deadline.
+
+Connection failures reconnect with 250 ms–30 s exponential delay plus up to 99 ms jitter. Heartbeats are text PING every 10 seconds, with a 30-second PONG timeout. Each socket allows 1,000 assets initially, sends at most 100 IDs per batch, accepts at most 2 MiB per complete message/frame, and caps writes/handshakes at 10 seconds. Up to 1,024 sockets are configured; no market is split across a socket budget. These are provisional collector budgets, not documented exchange maxima. No initial-book deadline, periodic snapshots, load-based migration or redundant feed is implemented.
+
+Per-session raw messages remain in receive order. Different workers may interleave; no global chronological ordering or exchange-wide completeness is promised.
+
+## Future full-pipeline capacity and failure budgets (not current implementation)
 
 Measure discovered eligible assets, confirmed active subscriptions, initialized books, per-socket messages/bytes/sec, per-worker CPU, full-snapshot size, memory per book, output bytes/sec, queue high-water and oldest age, burst ratio, time to reconnect and resynchronize. Scale sockets by measured work rather than blindly allocating equal symbol counts. Do not assume undocumented max assets-per-socket limits.
 
 Unbounded queue growth and silent coalescing are not acceptable. Choose finite capacity and a documented overload response (e.g. stop/declare integrity loss/reinitialize); backpressure alone cannot guarantee network capture when sinks are stalled. Output failures and partial writes must be handled without blindly duplicating partially written chunks.
 
-## Performance experiment decisions
+## Future full-pipeline performance experiments
 
 Compare (A) socket-local ownership versus separate book shards, (B) BTreeMap versus sorted Vec on recorded L2 level-count distribution, (C) typed Serde versus alternate parser, and (D) output buffering schedules. For each: same representative fixture, independent correctness oracle, same machine/release profile, sustained load and bursts, p50/p95/p99/p99.9, throughput, RSS, allocations and queue/flush latency. Prefer removal of work/copies over exotic data structures. Document a rejected optimization as well as an accepted one.
