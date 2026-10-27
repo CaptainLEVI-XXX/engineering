@@ -4,13 +4,14 @@ use crate::{
     websocket::ingress::Message,
 };
 use anyhow::{Context, Result, ensure};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 struct Instrument {
     asset: String,
     adapter: AdapterId,
     replicas: BTreeMap<u16, Replica>,
     selected: Option<Binding>,
+    snapshot_due: Option<Duration>,
 }
 struct Source {
     session: Session,
@@ -31,6 +32,7 @@ pub struct Processor {
     now: Duration,
     input: u64,
     stats: Stats,
+    snapshot_due: BTreeSet<(Duration, BookId)>,
     // Reused numeric preparation storage, each bounded by wire.entries.
     prepared: Vec<(Binding, Side, Level, usize)>,
     occupied: HashMap<(BookId, u16, Side, Price), bool>,
@@ -64,6 +66,10 @@ impl Processor {
                 && config.recovery_attempts > 0,
             "invalid recovery limits"
         );
+        ensure!(
+            config.snapshot_interval.is_none_or(|d| !d.is_zero()),
+            "zero snapshot interval"
+        );
         Ok(Self {
             config,
             by_adapter: HashMap::new(),
@@ -76,6 +82,7 @@ impl Processor {
             now: Duration::ZERO,
             input: 0,
             stats: Stats::default(),
+            snapshot_due: BTreeSet::new(),
             prepared: Vec::new(),
             occupied: HashMap::new(),
             counts: HashMap::new(),
@@ -290,6 +297,7 @@ impl Processor {
                     adapter: session.adapter,
                     replicas: BTreeMap::new(),
                     selected: None,
+                    snapshot_due: None,
                 });
                 self.by_adapter
                     .entry(session.adapter)
@@ -344,6 +352,12 @@ impl Processor {
             revision,
             session,
         };
+        let output_binding = instrument.selected.filter(|b| b.slot == slot);
+        if output_binding.is_some()
+            && let Some(due) = instrument.snapshot_due.take()
+        {
+            self.snapshot_due.remove(&(due, id));
+        }
         let old = instrument.replicas.remove(&slot);
         let (since, attempts) = match old {
             Some(old) => {
@@ -355,9 +369,10 @@ impl Processor {
                         input: self.input,
                         binding: old.binding,
                         metadata: old.last,
-                        selected_at: None,
                         kind: ObservationKind::Invalidated {
                             reason: "assignment replaced",
+                            cause: InvalidationCause::AssignmentReplaced,
+                            output_binding,
                         },
                     })?;
                 }
@@ -402,9 +417,10 @@ impl Processor {
                 input: self.input,
                 binding,
                 metadata: None,
-                selected_at: None,
                 kind: ObservationKind::Invalidated {
                     reason: "subscription removed",
+                    cause: InvalidationCause::Retired,
+                    output_binding,
                 },
             })?;
         }
@@ -464,6 +480,12 @@ impl Processor {
             replica.unavailable_since.get_or_insert(self.now);
             if replica.state != Validity::Stale {
                 replica.state = Validity::Stale;
+                let output_binding = instrument.selected.filter(|b| *b == binding);
+                if output_binding.is_some()
+                    && let Some(due) = instrument.snapshot_due.take()
+                {
+                    self.snapshot_due.remove(&(due, binding.book));
+                }
                 self.stats.invalidations += 1;
                 sink(Observation {
                     asset: &instrument.asset,
@@ -471,8 +493,15 @@ impl Processor {
                     input: self.input,
                     binding,
                     metadata: replica.last,
-                    selected_at: None,
-                    kind: ObservationKind::Invalidated { reason },
+                    kind: ObservationKind::Invalidated {
+                        reason,
+                        output_binding,
+                        cause: if recover {
+                            InvalidationCause::InvalidData
+                        } else {
+                            InvalidationCause::SourceEnded
+                        },
+                    },
                 })?;
             }
         }
@@ -591,9 +620,12 @@ impl Processor {
                         input: self.input,
                         binding,
                         metadata: replica.last,
-                        selected_at: None,
-                        kind: ObservationKind::Snapshot(&replica.book),
+                        kind: ObservationKind::Snapshot {
+                            book: &replica.book,
+                            origin: SnapshotOrigin::Exchange,
+                        },
                     })?;
+                    self.schedule_snapshot(binding.book, self.now)?;
                 }
             }
             Event::Changes {
@@ -680,7 +712,6 @@ impl Processor {
                             input: self.input,
                             binding,
                             metadata: Some(metadata),
-                            selected_at: None,
                             kind: ObservationKind::Level {
                                 side,
                                 price: level.price,
@@ -710,6 +741,7 @@ impl Processor {
         adapter: AdapterId,
         asset: &str,
         slot: u16,
+        now: Duration,
         at: DateTime<Utc>,
         sink: &mut impl FnMut(Observation<'_>) -> Result<()>,
     ) -> Result<()> {
@@ -718,7 +750,7 @@ impl Processor {
             at.timestamp_micros() >= 0,
             "selection timestamp before epoch"
         );
-        self.clock(self.now)?;
+        self.clock(now)?;
         let id = *self
             .by_adapter
             .get(&adapter)
@@ -740,12 +772,104 @@ impl Processor {
             input: self.input,
             binding: replica.binding,
             metadata: replica.last,
-            selected_at: Some(at),
-            kind: ObservationKind::Snapshot(&replica.book),
-        });
+            kind: ObservationKind::Snapshot {
+                book: &replica.book,
+                origin: SnapshotOrigin::Selection { at },
+            },
+        })
+        .and_then(|()| self.schedule_snapshot(id, now));
         if result.is_err() {
             self.failed = true;
         }
+        result
+    }
+    fn schedule_snapshot(&mut self, id: BookId, now: Duration) -> Result<()> {
+        if let Some(interval) = self.config.snapshot_interval {
+            let due = now
+                .checked_add(interval)
+                .context("snapshot deadline overflow")?;
+            if let Some(old) = self.books[id.0 as usize].snapshot_due.replace(due) {
+                self.snapshot_due.remove(&(old, id));
+            }
+            self.snapshot_due.insert((due, id));
+        }
+        Ok(())
+    }
+    pub fn next_snapshot_due(&self) -> Option<Duration> {
+        self.snapshot_due.first().map(|(due, _)| *due)
+    }
+    /// Stop generated work at intake cutoff, without backfilling from drained state.
+    pub fn stop_snapshots(&mut self, now: Duration) {
+        if self.config.snapshot_interval.take().is_some() {
+            self.stats.snapshots_due_at_cutoff = self
+                .snapshot_due
+                .iter()
+                .take_while(|(due, _)| *due <= now)
+                .count();
+            for (_, id) in &self.snapshot_due {
+                self.books[id.0 as usize].snapshot_due = None;
+            }
+            self.snapshot_due.clear();
+        }
+    }
+    /// Coherent captures only between complete input messages. The clock is
+    /// supplied explicitly so timer/control inputs can be replayed deterministically.
+    pub fn capture_due(
+        &mut self,
+        clock: &mut impl FnMut() -> (Duration, DateTime<Utc>),
+        sink: &mut impl FnMut(Observation<'_>) -> Result<()>,
+    ) -> Result<()> {
+        ensure!(!self.failed, "processor already failed");
+        let result = (|| {
+            let mut began = None;
+            let mut levels = 0;
+            for _ in 0..64 {
+                let Some(&(due, id)) = self.snapshot_due.first() else {
+                    break;
+                };
+                let (now, at) = clock();
+                ensure!(now >= self.now, "nonmonotonic snapshot clock");
+                if now < due {
+                    break;
+                }
+                let start = *began.get_or_insert(now);
+                if now - start >= Duration::from_millis(1) || levels >= 65536 {
+                    break;
+                }
+                let late = now - due;
+                ensure!(
+                    late < self.config.snapshot_interval.unwrap(),
+                    "whole snapshot interval missed"
+                );
+                ensure!(at.timestamp_micros() >= 0, "capture timestamp before epoch");
+                self.clock(now)?;
+                let instrument = &self.books[id.0 as usize];
+                let binding = instrument.selected.context("scheduled book not selected")?;
+                let replica = &instrument.replicas[&binding.slot];
+                ensure!(
+                    replica.binding == binding && replica.state == Validity::Live,
+                    "scheduled book not live"
+                );
+                levels += replica.book.len();
+                sink(Observation {
+                    asset: &instrument.asset,
+                    adapter: instrument.adapter,
+                    input: self.input,
+                    binding,
+                    metadata: replica.last,
+                    kind: ObservationKind::Snapshot {
+                        book: &replica.book,
+                        origin: SnapshotOrigin::Periodic { at, due },
+                    },
+                })?;
+                self.stats.periodic_snapshots += 1;
+                self.stats.late_snapshots += u64::from(!late.is_zero());
+                self.stats.max_snapshot_lateness = self.stats.max_snapshot_lateness.max(late);
+                self.schedule_snapshot(id, now)?;
+            }
+            Ok(())
+        })();
+        self.failed |= result.is_err();
         result
     }
     pub fn tick(&mut self, now: Duration) -> Result<()> {

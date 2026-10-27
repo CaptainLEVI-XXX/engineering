@@ -1,31 +1,65 @@
 # Read before getting started!!
 
-## Running Components 1–4
+## Running Components 1–5
 
 The executable runs continuous discovery and stable per-adapter WebSocket
-subscriptions. **It is a book-validation runner, not a recording collector:**
+subscriptions. **The default mode records selected L2 history to binary stdout:**
 one consumer validates exact Polymarket values and reconstructs source-specific
 L2 books. Invalid input marks the affected replicas unavailable and requests a
 bounded session restart. Source selection exposes snapshots before its deltas.
-Stdout stays empty; diagnostics go to stderr. C5 periodic snapshots and SBE output
-are not implemented; selected observations are consumed but not persisted.
+Every selected absolute level update (including no-ops and zero deletes),
+authoritative snapshot, and periodic selected-live snapshot is encoded through
+the supplied SBE codecs/helper. A separate, newly created JSONL integrity file
+records snapshot provenance and selected-source unavailability. Diagnostics go
+to stderr; never direct binary stdout to a terminal.
 See [architecture](docs/architecture.md) and [protocol evidence](docs/protocol.md).
 
 ```sh
 cargo build --locked --release
-target/release/engineering-challenge --seconds 120 > /dev/null 2> collector.log
+target/release/engineering-challenge --seconds 120 --integrity-path run.integrity.jsonl > run.sbe 2> collector.log
 ```
 
 Omit `--seconds` to run until SIGINT. The library boundary supplies owned raw text,
 application-receive timestamps, adapter/session identity, per-session ordinals and
 ordered lifecycle/subscription-request events. Full/closed ingress fails visibly;
-shutdown allows 15 seconds to drain accepted messages. A successful run does not
-prove full-universe coverage, confirmed subscriptions or persistence. Use
-`--transport-only true` to retain the original opaque-message validation mode.
+shutdown allows 15 seconds overall to drain accepted messages and finish output.
+Retain the exit status and both output files: successful flush does not establish
+durability, full-universe coverage or exchange-wide losslessness. Use
+`--transport-only true` to retain opaque-message validation with empty stdout and
+no required integrity file. An existing integrity path is rejected, never overwritten.
+
+The output pool reserves 16 × 4 MiB plus descriptors (~65 MiB); book, ingress,
+symbol-cache and physical-buffer memory is additional. Publication targets
+256 KiB / 5 ms; physical flush targets 5 ms. These are checked between work items,
+not hard-real-time guarantees. If all other batches are outstanding, age-only
+publication retains the last batch and appends exact records within its existing
+limits; it retries every 5 ms. Size/descriptor exhaustion still fails closed when
+no reusable batch remains. Records never cross 64 MiB logical chunks. Sparse
+chunks are padded after 60 seconds or at finish, potentially adding ~64 MiB/minute.
+The supplied reader opens completed files and ignores incomplete final chunks;
+it is not a live pipe/tailing reader. Physical visibility is not reader compatibility.
+
+Symbols are `polymarket:v1:<exact-id>` / `polymarket:v2:<exact-id>`. Timestamps use
+microseconds; generated snapshots use actual capture/selection time and the last
+applied exchange time. Replay **file order**, not sorted timestamps. A replacement
+snapshot restores state, not missed history. Each selected-live book is due 60s
+after its last authoritative snapshot; actual lateness is reported. Missing an
+additional whole interval fails recording rather than backdating a snapshot.
+
+The book consumer performs no diagnostic I/O. It returns exact invalidation
+observation counts and the first four diagnostic samples (asset/reason previews
+limited to 128 characters) after draining, or attaches them to a processing error.
+Additional per-book details are omitted explicitly; this summary is not a history
+archive or live monitoring feed. Main prints the summary after joining the consumer.
+Other control-plane/transport stderr output is still synchronous: an indefinitely
+blocked stderr can delay ordinary diagnostic delivery. A blocked output/drain
+deadline exits nonzero without logging or joining stuck threads; it cannot cancel
+an OS write or guarantee the tail. Keep stderr draining in operational runs.
 
 Options (each requires a value): `--seconds`, `--gamma-url`, `--ws-url`,
 `--assets-per-socket` (1000), `--max-sockets` (1024),
-`--queue-items` (8192), `--queue-bytes` (67108864), `--transport-only` (false). Socket/message/queue settings are
+`--queue-items` (8192), `--queue-bytes` (67108864), `--transport-only` (false),
+`--integrity-path` (required for recording). Socket/message/queue settings are
 collector safety budgets, **not verified exchange limits or a total RSS cap**.
 
 ```sh
@@ -35,17 +69,17 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo test --locked --release
 cargo test --locked --release --test ingestion_load -- --ignored --nocapture
+cargo test --locked --release --test recording_load -- --ignored --nocapture
 # Read-only live coverage gate, bounded to 120 seconds; may fail honestly:
 cargo test --locked --test discovery_http live_discovery_coverage -- --ignored --nocapture
 ```
 
-The original template's schema, generated codecs and file-oriented reader/writer
-remain available for a separately authorized output component. They are not used
-by the current validation executable. See [the C3/C4 plan](3%264.md),
+The original schema, generated codecs and reader remain unchanged. The supplied
+writer now separates physical flushing from chunk completion. See [the C5 plan](5.md),
 [protocol contracts](docs/protocol.md) and [remaining checks](docs/revision-check.md).
 
 This repo uses the [FIX SBE standard](https://fixtrading.org/packages/simple-binary-encoding-technical-specification-v2-rc2/)
-for its eventual binary output. The supplied Rust helpers abstract encoding and decoding.
+for its binary output. The supplied Rust helpers abstract encoding and decoding.
 
 ### More background, in case you are curious!
 

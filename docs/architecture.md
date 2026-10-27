@@ -1,6 +1,6 @@
 # Collector architecture and decision record
 
-Status: Only Component 1 (discovery/registry) and Component 2 (subscription management/raw WebSocket transport) are implemented. Book reconstruction and SBE output require separate plans and authorization. Full-universe acceptance and representative production latency remain open. Updated: 2026-10-27.
+Status: Components 1–5 cover discovery, raw ingestion, exact decoding, source-specific L2 books and binary recording. Automatic redundancy/health policies and connection experiments remain later extension work. Full-universe acceptance and representative production latency remain open. Updated: 2026-10-27.
 
 ## Boundaries
 
@@ -16,11 +16,43 @@ WebSocket subscription manager <------┘
 Multiple WebSocket workers (independent connection generations)
       ↓ owned raw message + receive timestamp + session/ordinal
 Bounded ordered ingress channel (explicit overload policy)
-      ↓ current executable: diagnostic consumer, no persistence
-Future authorized components: decoding → books → SBE output
+      ↓ synchronous owner: decode → source-specific books → borrowed encoding
+      ↓ fixed owned batch pool (one FIFO, no live-book borrows)
+Dedicated output owner → supplied SBE framing → binary stdout
+                       → ordered JSONL integrity sidecar
 ```
 
 Discovery is not market data: Gamma tells us which instruments to listen to, not each live order-book update. Component 2 forwards complete text messages unchanged except application PONG, which belongs to connection health. It does not parse financial events, initialize books or produce periodic book snapshots.
+
+## Component 5: Recording contract
+
+`recording::Recorder` runs on the C4 owner, formats an exact namespaced symbol
+once per BookId and directly encodes borrowed book iterators/levels with generated
+codecs. The fixed pool transfers owned bytes, not books. A single output thread
+routes SBE and integrity entries in order; no per-level channel item or symbol
+allocation is needed. Pool exhaustion and encoder/I/O errors are terminal.
+
+C4 keeps one selected-live deadline per book. Authoritative snapshots reset the
+60-second cadence; deltas and standby snapshots do not. Captures run between
+complete messages with book/level/time fairness limits. Actual lateness is counted;
+missing a whole additional interval terminates recording. C5 records snapshot
+origin, source cursor, input cutoff and the old selected binding on unavailability.
+Neither snapshots nor a successful run footer assert missing exchange history was
+recovered. Only selected-source invalidations create output gaps.
+
+The supplied writer retains 64 MiB framing but no longer allocates a whole-chunk
+buffer. Physical flush and logical chunk completion are separate. The supplied
+reader still requires complete chunks and fixes file size at open. Stdout is an
+owned descriptor clone under one explicit physical buffer; error/unwind teardown
+disarms `BufWriter` rather than implicitly retrying a partially written prefix.
+
+Startup requires a new integrity file and a successful run-start flush before
+network intake. Success requires producer completion, supervisor approval of
+intake/drain, stdout completion and sidecar flush. Files are not an atomic pair;
+keep exit status and sidecar. Shutdown uses one overall deadline, then exits
+unsuccessfully without waiting on blocked I/O. Flush does not mean durability.
+See [the low-level plan](../5.md), [run instructions](../README.md), and
+[remaining validation](revision-check.md).
 
 ## Component 1: Minimal instrument discovery and desired-state registry
 
@@ -121,9 +153,9 @@ Use deterministic fixture → expected desired-state tests. At minimum:
 - A consumer can recover current desired state by requesting a full snapshot without replaying notifications. When the actual subscription consumer is added, test periodic repair after a missed final notification with a controlled clock.
 - Registry work stays in the control plane and does not require categories/tags or a live WebSocket to run tests.
 
-## Future book/output design candidates — not implemented or authorized
+## Historical book-placement candidates — benchmark before changing ownership
 
-- Start with multiple Tokio WebSocket workers, each owning its assigned instruments' L2 books, to minimize channel handoffs. Alternative: separate sharded book-owner workers. Select using controlled end-to-end benchmarks. Avoid task-per-message and global mutable book maps.
+- The implemented baseline is one synchronous book owner behind C2 ingress. Socket-local books and separately sharded book owners remain alternatives for controlled end-to-end benchmarks. Avoid task-per-message and global mutable book maps.
 - Timestamp after full WebSocket-message delivery, before parse, keep same timestamp for items in its batch. Route/commit per-asset changes in stream order; cross-socket global timestamp order is not guaranteed. If backtester requires global ordering, document and benchmark a specific policy, not an arbitrary sort.
 - Explicit book state machine: Discovered → Subscribing → Initializing → Live → Stale/Resynchronizing → Live; retirement requires verified lifecycle evidence. Verified reactivation must initialize a fresh book, not resume stale state. Distinguish socket liveness from per-asset subscription health; inactivity may reflect a quiet market.
 - Feed redundancy (extension): independent book replicas; one publishing authority; a controlled snapshot boundary on failover; never combine the "fastest" deltas from two connections into one state. Use connection generation to reject stale work.
@@ -145,7 +177,7 @@ Component 2 means subscription management and raw WebSocket ingestion. Its accep
 **Session boundaries**
 
 - Identify each session by a worker identity and a generation that is never reused while its work remains outstanding. Preserve receive order within the session. Use complete-message terminology, not frame terminology: WebSocket fragmentation is handled below this boundary.
-- A new connection clears requested state. Removing then re-adding an asset rotates the connection rather than assuming an exchange-side unsubscribe/resubscribe ordering guarantee. Whether any message initializes a usable book is exclusively a future downstream decision.
+- A new connection clears requested state. Removing then re-adding an asset rotates the connection rather than assuming an exchange-side unsubscribe/resubscribe ordering guarantee. Whether any message initializes a usable book is exclusively C4's decision.
 - Successful subscription requests, raw messages and session boundaries share one ordered channel. Previously accepted messages are not discarded merely because a later command removed their asset. Late exchange messages are still forwarded unchanged; request metadata is not an exchange acknowledgement or proof that all subsequent messages concern active assignments.
 
 **Bounded work and failure**
@@ -167,17 +199,17 @@ Component 2 means subscription management and raw WebSocket ingestion. Its accep
 
 Implementation ownership stays small: discovery lifecycle changes in src/discovery/polymarket.rs; socket and assignment logic in src/websocket/worker.rs and manager.rs with shared public types in mod.rs; deterministic local-server tests under tests/. Add dependencies, files and instrumentation only as their executable stage needs them. No Kalshi implementation, redundancy, automatic rebalancing, custom queues or extra compiler tuning is included.
 
-## Implemented raw ingress and validation runner
+## Implemented raw ingress and transport-only mode
 
 `src/websocket/ingress.rs` defines `Started`, `SubscriptionsRequested`, raw `Data` and `Ended` events. Data carries `Session { worker, generation, adapter }`, per-session ordinal, application receive time and owned `Utf8Bytes`. Financially malformed or unknown text is deliberately preserved for the downstream decoder; application PONG and WebSocket control frames are handled by the worker.
 
 The existing bounded crossbeam handoff remains; no replacement queue implementation is introduced. Defaults are 8,192 queued envelopes and 64 MiB of accounted bytes. A semaphore permit stays with each envelope through consumption. Accounting includes envelope size, raw text length and control-event vector/string capacities. Utf8Bytes hides backing allocation capacity, so this is **not** an allocation/RSS bound. Registry retention, allocator overhead and per-socket buffers are additional.
 
-`src/main.rs` is explicitly a **transport-validation runner**: a small consumer checks session/ordinal order, counts and discards raw messages, and drains until senders close. Stdout stays empty; diagnostics go to stderr. Successful validation is not capture durability, financial correctness, subscription confirmation or book initialization. The supplied file-oriented SBE helpers/schema remain unchanged from the pre-Component-2 baseline and are not wired into this executable.
+`src/main.rs --transport-only true` retains the **transport-validation runner**: a small consumer checks session/ordinal order, counts and discards raw messages, and drains until senders close. Its stdout stays empty. Default mode instead uses C3/C4 and C5 recording as described above; the supplied schema/reader are unchanged and the writer is adapted for stdout. Successful transport-only validation is not financial correctness, subscription confirmation or book initialization.
 
 Binary/oversized data and full/closed ingress fail the run through an independent stop signal. Accepted envelopes still drain; an unavailable final boundary remains an explicit failure, not a clean end. SIGINT stops discovery, socket intake and reconnect scheduling; shutdown joins workers and allows a shared 15-second drain deadline.
 
-Connection failures reconnect with 250 ms–30 s exponential delay plus up to 99 ms jitter. Heartbeats are text PING every 10 seconds, with a 30-second PONG timeout. Each socket allows 1,000 assets initially, sends at most 100 IDs per batch, accepts at most 2 MiB per complete message/frame, and caps writes/handshakes at 10 seconds. Up to 1,024 sockets are configured; no market is split across a socket budget. These are provisional collector budgets, not documented exchange maxima. No initial-book deadline, periodic snapshots, load-based migration or redundant feed is implemented.
+Connection failures reconnect with 250 ms–30 s exponential delay plus up to 99 ms jitter. Heartbeats are text PING every 10 seconds, with a 30-second PONG timeout. Each socket allows 1,000 assets initially, sends at most 100 IDs per batch, accepts at most 2 MiB per complete message/frame, and caps writes/handshakes at 10 seconds. Up to 1,024 sockets are configured; no market is split across a socket budget. These are provisional collector budgets, not documented exchange maxima. C4 owns initialization/recovery deadlines and C5 enables periodic capture; load-based migration and redundant feed provisioning remain unimplemented.
 
 Per-session raw messages remain in receive order. Different workers may interleave; no global chronological ordering or exchange-wide completeness is promised.
 

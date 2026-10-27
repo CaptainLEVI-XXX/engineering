@@ -17,7 +17,7 @@ fn session(worker: usize) -> Session {
 }
 fn sink(observation: Observation<'_>, trace: &mut Vec<String>) -> anyhow::Result<()> {
     match observation.kind {
-        ObservationKind::Snapshot(book) => trace.push(format!(
+        ObservationKind::Snapshot { book, .. } => trace.push(format!(
             "snapshot:{}:{:?}",
             observation.asset,
             book.levels(Side::Buy)
@@ -118,6 +118,7 @@ fn replicas_replace_atomically_and_preserve_selected_intermediate_history() {
         AdapterId::PolymarketV1,
         "A",
         1,
+        Duration::ZERO,
         Utc.timestamp_opt(101, 0).unwrap(),
         &mut |o| sink(o, &mut trace),
     )

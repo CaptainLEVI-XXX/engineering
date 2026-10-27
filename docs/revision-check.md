@@ -6,7 +6,9 @@ Use this after the separately approved components form a working collector,
 before claiming production readiness or low latency. It records deferred checks,
 not permission to implement later components now. Component 1 owns discovery;
 Component 2 owns assignments and raw transport. Components 3/4 now own exact
-decoding, replica reconstruction and bounded recovery. SBE output remains C5 work.
+decoding, replica reconstruction and bounded recovery. Component 5 now owns SBE
+recording and selected-output integrity provenance; production qualification
+and later extensions remain open.
 
 Fix a demonstrated correctness failure when found; do not defer it just because
 this checklist is scheduled for integration. Optimize only after the correctness
@@ -203,6 +205,47 @@ scratch directory, run `cargo build --locked --release --example c34_mixed`, the
 gitignored. Generator SHA-256:
 `3774c4d419744d878520fc776fd41b38e13c9cac6ec2ef8003699f97cc26c523`.
 
+### Review follow-up: diagnostic drain and retirement cutoff
+
+The book consumer now performs no diagnostic I/O. It counts every invalidation
+observation and retains only the first four diagnostic samples, with asset/reason
+previews capped at 128 characters. The main thread prints its bounded report after
+joining the consumer; processing errors retain the same counters/samples as error
+context. Omitted diagnostic detail is counted explicitly. Library integrity
+observations, replica state transitions and recovery behavior are unchanged.
+This is a final diagnostic summary, not live monitoring or a persistent gap archive.
+
+- **Reproduced before the fix:** a subprocess requested 50,000 books on one source,
+  initialized a separate healthy source, then accepted a source-end burst followed
+  by a healthy-source update and shutdown. With stderr unread, the old consumer
+  stalled partway through invalidation and exceeded the 10-second test deadline.
+  Local evidence: `.amp/in/artifacts/diagnostics-before.log`.
+- **After:** the regression drains both data messages with 50,001 invalidation
+  observations, one applied/selected healthy-source change, bounded diagnostic
+  size and zero stderr writes by the book consumer. The final test also uses a
+  long Unicode reason to exercise preview bounds. It passed debug and release;
+  this is fault injection, not a throughput or latency-SLA benchmark.
+- **Retirement:** 111 valid interleavings of old-worker data, manager retirement,
+  delayed unsubscribe/end and new-worker readmission verify the exact selected
+  history and final revision. Independently injected scratch mutations that ignore
+  `Retired` or allow obsolete removes each fail this test. Logs:
+  `.amp/in/artifacts/retirement-{cutoff,revision}-mutation.log`.
+- **Real local sockets:** a manager/worker/processor test verifies retirement is
+  observed before the successful unsubscribe notification, preserves pre-cutoff
+  updates, ignores delayed retired-asset changes, and still applies a healthy peer's
+  change in the same batch without reconnecting. This proves the collector's ingress
+  cutoff, not exchange acknowledgement or universal chronological order.
+- All 56 default tests passed in debug and release; all-target check and strict
+  Clippy passed. Existing deadline/SIGINT executable tests still pass. Live probes,
+  full-universe memory/timer measurements and the mixed-load benchmark were not rerun.
+
+**Remaining limitation:** other control-plane/transport stderr writes remain
+synchronous. This change prevents book-owner I/O stalls; it does not guarantee
+process exit against a permanently blocked stderr or eliminate CPU cost of a large
+invalidation. Revisit process-wide diagnostic delivery alongside monitoring.
+Also retain the unresolved recovery-blast-radius, unknown-asset policy,
+50k/100k/500k timer-scan and repeated retirement/readmission memory measurements.
+
 ### Revisit after completing the collector and extensions
 
 - [ ] Capture genuine V1/V2 changes and event variants; replay raw fixtures through
@@ -217,8 +260,9 @@ gitignored. Generator SHA-256:
   actual TLS sockets, slow output, discovery churn, failures and recovery bursts.
   Diagnose tails and find sustainable capacity instead of raising the offered rate
   without accounting for scheduling lag or accumulating backlog.
-- [ ] Finish C5: namespaced exact external symbols, source-switch/periodic snapshots,
+- [x] Implement C5: namespaced exact external symbols, source-switch/periodic snapshots,
   timestamps, chunk framing, short writes, broken pipe, SIGINT drain and tail flush.
+  Broader performance/coverage qualification remains open below.
 - [ ] Finish Extension 1: provision independent live sources and test policy-driven
   failover. Never combine their deltas into one mutable replica.
 - [ ] Finish Extension 2: activity windows, quiet-versus-unavailable distinctions,
@@ -230,6 +274,102 @@ gitignored. Generator SHA-256:
   receive deltas are not absolute network latency.
 
 ## Correctness and coverage gates — before performance tuning
+
+### Component 5 local evidence — 2026-10-27
+
+The default executable now records SBE stdout plus a mandatory create-new JSONL
+sidecar. Local HTTP/WebSocket tests replay overlapping V1/V2 IDs, initialization,
+repeated updates/deletes, deadline shutdown and SIGINT through the supplied reader.
+They also exercise broken/unread stdout with unread stderr and require a bounded
+nonzero exit without a successful footer. Library tests cover selected versus
+standby gaps, selection/periodic provenance, timestamp regression, fixed-pool
+exhaustion, temporary writer pauses, encoding failure, partial writes, WriteZero,
+sidecar errors and output panic. Exact-clock C4 tests cover deadline fairness,
+replacement/retirement cancellation, whole-interval failure and cutoff accounting.
+Schema, generated codecs and supplied reader are unchanged.
+
+**A long run found a real batching weakness.** The initial 120-second replay
+failed closed at 60.12s when the age policy exhausted batch count around minute
+chunk completion. A deterministic two-batch test reproduced the capacity waste
+with three tiny records and a paused writer. The revised age policy retains the
+last batch while all others are outstanding, appending exact records within the
+same memory/descriptor limits. Size limits still force publication/fail closed;
+the 5ms age target is not guaranteed while output is behind. No memory budget was
+raised and no update was dropped/coalesced to make the benchmark pass.
+
+Release results on Apple M2 / aarch64 macOS 25.6.0, Rust
+`1.93.0-nightly (cc3eee7fb 2025-11-28)`, locked dependencies:
+
+| Synthetic path | Direct ingress → file | Local unencrypted WS → file |
+|---|---:|---:|
+| Offered duration + warmup | 120s + 2s | 120s + 2s |
+| Offered rate | 1,000 messages/s | 1,000 messages/s |
+| Received / exact records compared | 122,100 / 854,312 | 122,100 / 854,312 |
+| Periodic snapshots | 184 | 184 |
+| Ingress age p99 / p99.9 | 1.447 / 10.362 ms | 0.318 / 9.815 ms |
+| Decode/book/encode p99 / p99.9 | 63.500 / 264.708 µs | 62.875 / 180.416 µs |
+| Encode callback p99.9 | 4.625 µs | 4.542 µs |
+| Maximum snapshot lateness | 0.894 ms | 1.385 ms |
+| Maximum batch creation → dequeue | 82.436 ms | 117.695 ms |
+| Maximum generator scheduling lag | 60.456 ms | 35.485 ms |
+| Physical output / complete chunks | 192 MiB / 3 | 192 MiB / 3 |
+
+Both runs matched **every** output record in order against an independent linear
+book oracle, not just the final state. Workload: 100 books, unequal initial depths,
+1/4/16-entry updates, deletes/no-ops, eight-snapshot replacement bursts and minute
+captures. Post-warmup samples: 120,000 ingress ages, 120,001 processing durations
+and 840,130 encoding callbacks per run. The oracle/generator and sampling impose
+additional work; processing excludes oracle construction but includes callback
+instrumentation. Archive timestamps were not changed for instrumentation.
+
+Reproduce with `cargo test --locked --release --test recording_load -- --ignored
+--nocapture`; set `C5_MODE=socket` for local WebSockets. Raw logs are in
+`.amp/in/artifacts/c5-{ingress,socket}-120s-revised.log`; the initial failed run is
+preserved as `c5-ingress-120s.log`. The older logs call creation-to-dequeue age
+`max_queue_age_us`; this has been renamed `max_batch_age_us` to avoid implying a
+pure queue-wait measurement. Pool capacity is 68,157,440 bytes (payload plus
+descriptors); it is not RSS. `/usr/bin/time -l` around Cargo includes compilation
+and test/reference readers, so its peak is not a collector-only memory result.
+
+Additional output-consumer checks used the same independent record oracle:
+
+- Draining pipe (`C5_SECONDS=3 C5_OUTPUT=pipe`, plus 2s warmup): 5,100 messages,
+  35,102 matching records, one complete 64 MiB chunk. This short run tests routing
+  and drain, not minute cadence or sustained capacity.
+- Throttled pipe (`C5_RATE=100 C5_OUTPUT=throttled`, 120s plus 2s warmup):
+  12,300 messages, 85,685 matching records, 184 periodic snapshots and three
+  complete chunks. Processing p99/p99.9 was 91.833/745.875 µs; ingress age
+  p99/p99.9 was 1.294/9.686 ms. Maximum snapshot lateness was 8.823 ms and
+  maximum batch creation-to-dequeue age was **1.530 seconds**. Correct output
+  under this consumer does not establish low-latency delivery. Post-warmup
+  samples: 12,000 ingress ages, 12,001 processing durations, 84,103 encode
+  callbacks. Generator lag reached 41.713 ms. Measured process peak RSS was
+  142,000,128 bytes, including the test/oracle/readers, not collector-only memory.
+
+Logs: `.amp/in/artifacts/c5-pipe-short.log` and `c5-throttled-120s.log`.
+These runs predate only the subsequent failure-accounting correction: an
+upstream-only error now marks `input_complete=false` without inventing a C5
+`failure_input` from the last successful observation. That failure path has its
+own regression test; the successful encoding/output path is unchanged.
+
+Final local verification after that correction: `cargo fmt --all -- --check`,
+`cargo check --locked --all-targets`, `cargo test --locked`,
+`cargo test --locked --release`, and
+`cargo clippy --locked --all-targets -- -D warnings` all passed. Each default
+test suite passed 73 tests with zero failures; five opt-in tests remain ignored
+by those commands. Recording benchmarks were run separately as described above.
+Full test logs are `c5-debug-tests-final.log` and `c5-release-tests-final.log`
+under `.amp/in/artifacts/`. This is local verification, not CI or deployment.
+
+**Still open:** representative live TLS/full-universe recording; direct-output
+versus dedicated-writer comparison; repeated saturation curves; actual consumer
+visibility percentiles (successful writes are not acknowledgements); allocation
+counts and multi-day retained-memory behavior. Short local runs do not certify
+full-universe capacity, complete exchange history, or sub-millisecond delivery.
+Use `C5_OUTPUT=pipe` for a draining `cat` subprocess; `C5_OUTPUT=throttled` requires
+Python 3 and sleeps 1ms after each ≤64KiB pipe read. These are synthetic consumers,
+not disk-durability tests. Preserve failed overload trials rather than raising
+budgets or calling an unsustained offered rate achieved throughput.
 
 | Status | Revisit | Required evidence / exit condition |
 |---|---|---|

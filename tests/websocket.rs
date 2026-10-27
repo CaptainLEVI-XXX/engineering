@@ -704,6 +704,167 @@ async fn manager_repairs_a_missed_notification_without_migrating_existing_assets
 }
 
 #[tokio::test]
+async fn manager_retirement_precedes_unsubscribe_and_excludes_late_book_updates() {
+    use engineering_challenge::{
+        discovery::polymarket::Command,
+        orderbook::{self, ObservationKind, Processor, Validity},
+        websocket::run_manager,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = config(format!("ws://{}", listener.local_addr().unwrap()));
+    let (discovery, mut requests) = mpsc::channel(8);
+    let (notify, changes) = watch::channel(());
+    let (retire, retiring) = watch::channel(false);
+    let (output, received) = output::channel(64, 1 << 20).unwrap();
+    let (stop, _) = watch::channel(false);
+    let owner = tokio::spawn(async move {
+        while let Some(Command::Snapshot(reply)) = requests.recv().await {
+            let mut state = Snapshot::default();
+            market(&mut state, "N", AdapterId::PolymarketV1, &["B"]);
+            if !*retiring.borrow() {
+                market(&mut state, "M", AdapterId::PolymarketV1, &["A"]);
+            }
+            let _ = reply.send(Arc::new(state));
+        }
+    });
+    let manager = tokio::spawn(run_manager(
+        discovery,
+        changes,
+        output,
+        config,
+        stop.clone(),
+        mpsc::channel(1).1,
+    ));
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(socket).await.unwrap();
+        let initial = ws.next().await.unwrap().unwrap().into_text().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&initial).unwrap()["assets_ids"],
+            json!(["A", "B"])
+        );
+        ws.send(Message::Text(
+            format!("[{},{}]", snapshot("A"), snapshot("B")).into(),
+        ))
+        .await
+        .unwrap();
+        ws.send(Message::Text(
+            json!({"event_type":"price_change","timestamp":"42","price_changes":[
+                {"asset_id":"A","side":"BUY","price":"0.2","size":"21"}
+            ]})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        while let Some(Ok(message)) = ws.next().await {
+            match message {
+                Message::Text(t) if t == "PING" => {
+                    ws.send(Message::Text("PONG".into())).await.unwrap()
+                }
+                Message::Text(t) => {
+                    let request: Value = serde_json::from_str(&t).unwrap();
+                    assert_eq!(request["operation"], "unsubscribe");
+                    assert_eq!(request["assets_ids"], json!(["A"]));
+                    // Valid delayed data is still possible after a request send;
+                    // receipt of unsubscribe is not an exchange acknowledgement.
+                    ws.send(Message::Text(
+                        json!({"event_type":"price_change","timestamp":"41","price_changes":[
+                            {"asset_id":"A","side":"BUY","price":"0.2","size":"99"},
+                            {"asset_id":"B","side":"BUY","price":"0.2","size":"23"}
+                        ]})
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                }
+                Message::Close(_) => {
+                    let _ = ws.flush().await;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+    let mut p = Processor::new(orderbook::Config::default()).unwrap();
+    let mut levels = vec![];
+    let mut retired = false;
+    let mut unsubscribed = false;
+    timeout(Duration::from_secs(4), async {
+        loop {
+            while let Ok(envelope) = received.try_recv() {
+                match &envelope.message {
+                    OutputMessage::Retired { assets, .. } => {
+                        assert_eq!(assets, &["A"]);
+                        retired = true;
+                    }
+                    OutputMessage::SubscriptionsRequested { remove, .. } if !remove.is_empty() => {
+                        assert!(
+                            retired,
+                            "worker unsubscribe notification overtook manager retirement"
+                        );
+                        assert_eq!(remove, &["A"]);
+                        unsubscribed = true;
+                    }
+                    _ => {}
+                }
+                p.process(&envelope.message, Duration::ZERO, &mut |o| {
+                    if let ObservationKind::Level { quantity, .. } = o.kind {
+                        levels.push((o.asset.to_owned(), quantity.value()));
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                if matches!(envelope.message, OutputMessage::Data { ordinal: 2, .. }) {
+                    assert_eq!(levels, vec![("A".to_owned(), 21_000_000)]);
+                    retire.send_replace(true);
+                    notify.send_replace(());
+                }
+                if matches!(envelope.message, OutputMessage::Data { ordinal: 3, .. }) {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(retired && unsubscribed);
+    assert_eq!(
+        levels,
+        vec![("A".to_owned(), 21_000_000), ("B".to_owned(), 23_000_000)]
+    );
+    assert_eq!(
+        p.replica(AdapterId::PolymarketV1, "A", 0).unwrap().state,
+        Validity::Inactive
+    );
+    assert_eq!(
+        p.replica(AdapterId::PolymarketV1, "B", 0).unwrap().state,
+        Validity::Live
+    );
+    assert_eq!(p.stats().rejected, 0);
+    assert!(p.take_recovery().is_empty());
+    stop.send_replace(true);
+    let reports = timeout(Duration::from_secs(2), manager)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(reports[0].sessions, 1);
+    for envelope in received.try_iter() {
+        p.process(&envelope.message, Duration::ZERO, &mut |_| Ok(()))
+            .unwrap();
+    }
+    p.finish().unwrap();
+    timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+    owner.await.unwrap();
+}
+
+#[tokio::test]
 async fn processor_recovery_rotates_only_the_target_generation() {
     use engineering_challenge::{
         discovery::polymarket::Command,

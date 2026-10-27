@@ -16,11 +16,57 @@ use tokio::{
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+#[test]
+fn recording_rejects_missing_existing_and_uncreatable_integrity_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    let existing = directory.path().join("existing.jsonl");
+    std::fs::write(&existing, b"preserve existing history\n").unwrap();
+    for path in [
+        None,
+        Some(existing.clone()),
+        Some(directory.path().join("absent/sidecar.jsonl")),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_engineering-challenge"));
+        command.args([
+            "--seconds",
+            "1",
+            "--gamma-url",
+            "http://127.0.0.1:9/markets",
+            "--ws-url",
+            "ws://127.0.0.1:9",
+        ]);
+        if let Some(path) = path {
+            command.arg("--integrity-path").arg(path);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("integrity")
+        );
+    }
+    assert_eq!(
+        std::fs::read(&existing).unwrap(),
+        b"preserve existing history\n"
+    );
+}
+
 #[tokio::test]
-async fn transport_runner_drains_on_deadline_and_sigint_without_writing_stdout() {
-    for mode in ["deadline", "sigint", "books", "books-sigint"] {
+async fn collector_records_or_validates_and_bounds_stalled_output_shutdown() {
+    for mode in [
+        "deadline",
+        "sigint",
+        "books",
+        "books-sigint",
+        "books-blocked",
+        "books-broken",
+    ] {
         let books = mode.starts_with("books");
         let interrupt = mode.ends_with("sigint");
+        let blocked = mode.ends_with("blocked");
+        let broken = mode.ends_with("broken");
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gamma_url = format!("http://{}/markets/keyset", http.local_addr().unwrap());
@@ -101,7 +147,11 @@ async fn transport_runner_drains_on_deadline_and_sigint_without_writing_stdout()
                 result.unwrap();
             }
         });
-        let mut child = Command::new(env!("CARGO_BIN_EXE_engineering-challenge"))
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("archive.sbe");
+        let integrity = directory.path().join("integrity.jsonl");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_engineering-challenge"));
+        command
             .args([
                 "--gamma-url",
                 &gamma_url,
@@ -114,10 +164,19 @@ async fn transport_runner_drains_on_deadline_and_sigint_without_writing_stdout()
                 "--seconds",
                 if interrupt { "30" } else { "3" },
             ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stdout(if books && !blocked && !broken {
+                Stdio::from(std::fs::File::create(&archive).unwrap())
+            } else {
+                Stdio::piped()
+            })
+            .stderr(Stdio::piped());
+        if books {
+            command.arg("--integrity-path").arg(&integrity);
+        }
+        let mut child = command.spawn().unwrap();
+        if broken {
+            drop(child.stdout.take());
+        }
         let started = Instant::now();
         let mut interrupted = false;
         let status = loop {
@@ -146,6 +205,18 @@ async fn transport_runner_drains_on_deadline_and_sigint_without_writing_stdout()
         };
         let output = child.wait_with_output().unwrap();
         let diagnostics = String::from_utf8(output.stderr).unwrap();
+        if blocked || broken {
+            assert!(!status.success(), "{mode}: stalled/broken output succeeded");
+            assert!(started.elapsed() < Duration::from_secs(23));
+            let lines = std::fs::read_to_string(&integrity).unwrap();
+            assert!(!lines.lines().any(|l| {
+                let v: Value = serde_json::from_str(l).unwrap();
+                v["kind"] == "run_end" && v["success"] == true
+            }));
+            http_task.abort();
+            ws_task.abort();
+            continue;
+        }
         timeout(Duration::from_secs(2), http_task)
             .await
             .unwrap()
@@ -158,6 +229,41 @@ async fn transport_runner_drains_on_deadline_and_sigint_without_writing_stdout()
         assert!(!interrupt || interrupted);
         assert!(output.stdout.is_empty());
         if books {
+            use engineering_challenge::util::{
+                AlignedSbeReader, OrderbookSchema, dtos::challenge_orderbook::*,
+            };
+            let mut reader = AlignedSbeReader::<OrderbookSchema>::open(&archive).unwrap();
+            let mut traces = std::collections::BTreeMap::<String, Vec<i64>>::new();
+            while let Some(record) = reader.read_msg().unwrap() {
+                match record {
+                    AnyMessage::Snapshot(s) => {
+                        let s = SnapshotDomain::try_from_decoder(s).unwrap();
+                        traces
+                            .entry(s.symbol)
+                            .or_default()
+                            .push(s.bids.first().map_or(-1, |l| l.quantity));
+                    }
+                    AnyMessage::PriceLevelUpdate(l) => {
+                        let l = PriceLevelUpdateDomain::try_from_decoder(l).unwrap();
+                        assert_eq!(l.price_level, 200_000);
+                        traces.entry(l.symbol).or_default().push(l.quantity);
+                    }
+                    _ => panic!("unexpected SBE template"),
+                }
+            }
+            assert_eq!(traces.len(), 4);
+            for version in ["v1", "v2"] {
+                assert_eq!(
+                    traces[&format!("polymarket:{version}:00123")],
+                    [3_000_000, 5_000_000, 0]
+                );
+                assert_eq!(traces[&format!("polymarket:{version}:00456")], [-1]);
+            }
+            let text = std::fs::read_to_string(&integrity).unwrap();
+            let last: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+            assert_eq!(last["kind"], "run_end");
+            assert_eq!(last["success"], true);
+            assert_eq!(last["output"]["records_confirmed"], 8);
             assert!(
                 diagnostics.contains("snapshots: 4, changes: 4, selected_changes: 4, rejected: 0"),
                 "{diagnostics}"

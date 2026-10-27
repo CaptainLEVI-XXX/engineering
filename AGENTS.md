@@ -20,7 +20,7 @@ Read only the relevant reference sections for the current task. Preserve existin
 
 ## Component scope and authorization
 
-The user develops this project **one component at a time**: investigate its requirements and contracts, review its implementation plan, then execute and validate the approved scope. **Currently authorized: Components 3 and 4 under `3&4.md`: exact decoding and source-specific L2 reconstruction, plus necessary C2 integration.** The complete challenge and all four extensions are the eventual target, not permission to implement their later delivery stages now.
+The user develops this project **one component at a time**: investigate its requirements and contracts, review its implementation plan, then execute and validate the approved scope. **Currently authorized: Component 5 under `5.md`: binary recording, integrity provenance, owner-side minute snapshots and necessary executable/shutdown integration.** Preserve Components 1–4. The complete challenge and all four extensions are the eventual target, not permission to implement their later delivery stages now.
 
 - Use the user's component names and boundaries consistently. Do not substitute a different numbered implementation sequence or redefine Component 2 to mean the entire data plane.
 - Requests such as “go ahead,” “execute it,” or “complete Component 2” authorize the agreed component plan, not downstream components or extensions. Finish that component's acceptance checks, report limitations, and stop before starting another component.
@@ -68,9 +68,9 @@ Own eligibility, exact version-scoped identities and authoritative desired state
 - **Acceptance:** validate stable assignments and capacity, dynamic changes, reconnect generations, ordered accepted-message delivery, missed-notification recovery, message/queue limits, full/closed consumers, stalled I/O and shutdown. Run bounded live probes when feasible and measure transport throughput, receive-to-handoff latency and queue behavior. Report missing evidence rather than building another component to fill it.
 - **Not implicitly authorized:** production financial decoding, exact book reconstruction, periodic book snapshots, SBE serialization/stdout integration, downstream book recovery, redundant feeds, automatic rebalancing, Kalshi, or full-pipeline performance tuning. Existing implementations of these are not part of Component 2's acceptance merely because they currently run inside a socket worker.
 
-### Components 3/4 — Decoding and source-specific books (current scope)
+### Components 3/4 — Decoding and source-specific books
 
-Use the approved `3&4.md` contracts: exact scaled values, bounded typed parsing,
+Preserve the established contracts: exact scaled values, bounded typed parsing,
 whole-event prevalidation, independent source replicas, assignment revisions,
 session validity, deterministic selection snapshots and bounded recovery.
 Retain one synchronous processing owner behind existing C2 ingress. C2 changes
@@ -79,13 +79,20 @@ disconnected), and session-checked restart controls. Preserve transport-only tes
 Validate state and intermediate observations against an independent oracle;
 separate genuine fixtures from synthetic cases and report missing live evidence.
 
-### Later components — require their own reviewed plans and authorization
+### Component 5 — Recording (current scope)
 
-C5 owns supplied-reader-compatible binary stdout, minute snapshots, buffering and
-tail flushing. Later extension work owns redundant socket provisioning, automatic
-health-based failover, monitoring/rotation policies and connection experiments.
-Do not implement those or Kalshi during C3/C4 work. Independent replicas and an
-explicit selection API are current C4 contracts, not live redundancy delivery.
+C5 owns supplied-reader-compatible binary stdout, borrowed encoding, a fixed
+batch pool, separate physical flushing and 64 MiB chunk completion, mandatory
+create-new integrity sidecar, and bounded failure/drain supervision. C4 owns
+selected-live snapshot deadlines and coherent capture; C5 never owns another book
+or selected-source map. Preserve exact source metadata and file order, including
+regressing timestamps. Encoding, exhausted output capacity and I/O failures are
+terminal; never retry a partially written buffer or fabricate a repair snapshot.
+
+Later extension work still requires its own reviewed plan and authorization:
+redundant socket provisioning, automatic health-based failover, monitoring/rotation
+policies and connection experiments. Do not implement those or Kalshi during C5.
+Independent replicas and an explicit selection API do not imply live redundancy.
 
 ## Performance discipline
 

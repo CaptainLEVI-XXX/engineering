@@ -2,13 +2,17 @@ use anyhow::{Context, Result, ensure};
 use engineering_challenge::{
     discovery::polymarket::{Command, Discovery, GAMMA_MARKETS, Gamma},
     orderbook::{self, ObservationKind, Processor},
+    recording,
     websocket::{
         Config,
         ingress::{self, Message, Session},
         run_manager,
     },
 };
-use std::{collections::HashMap, process::ExitCode, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, io::IsTerminal, os::fd::AsFd, process::ExitCode, sync::Arc,
+    time::Duration,
+};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     time::{Instant, timeout_at},
@@ -28,7 +32,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("transport_validation_failed: {error:#}");
+            eprintln!("collector_failed: {error:#}");
             ExitCode::FAILURE
         }
     }
@@ -41,6 +45,7 @@ async fn run() -> Result<()> {
     let mut queue_items = 8192;
     let mut queue_bytes = 64 << 20;
     let mut transport_only = false;
+    let mut integrity_path = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let value=args.next().context("options require a value: --seconds N --gamma-url URL --ws-url URL --assets-per-socket N --max-sockets N --queue-items N --queue-bytes N")?;
@@ -53,6 +58,7 @@ async fn run() -> Result<()> {
             "--queue-items" => queue_items = value.parse()?,
             "--queue-bytes" => queue_bytes = value.parse()?,
             "--transport-only" => transport_only = value.parse()?,
+            "--integrity-path" => integrity_path = Some(value),
             _ => anyhow::bail!("unknown option {arg}"),
         }
     }
@@ -63,8 +69,13 @@ async fn run() -> Result<()> {
             "transport validation only: raw messages are counted and discarded; stdout remains empty"
         );
     } else {
-        eprintln!(
-            "C3/C4 validation: exact decoding and source-specific books; observations are not persisted; stdout remains empty until C5"
+        ensure!(
+            integrity_path.is_some(),
+            "recording requires --integrity-path PATH (new file)"
+        );
+        ensure!(
+            !std::io::stdout().is_terminal(),
+            "binary stdout must be redirected"
         );
     }
     let config = Arc::new(config);
@@ -75,20 +86,68 @@ async fn run() -> Result<()> {
     let consumer_stop = stop.subscribe();
     let book_config = orderbook::Config {
         sessions: config.max_sockets,
+        snapshot_interval: (!transport_only).then_some(Duration::from_secs(60)),
         wire: engineering_challenge::market_data::Limits {
             message_bytes: config.max_message_bytes,
             ..Default::default()
         },
         ..Default::default()
     };
+    let (approval_send, approval) = crossbeam::channel::bounded(1);
+    let (writer_send, mut writer_receive) = oneshot::channel();
+    let mut writer_thread = None;
+    let recorder = if transport_only {
+        drop(writer_send);
+        None
+    } else {
+        let label = integrity_path.unwrap();
+        let sidecar = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&label)
+            .context("create integrity sidecar")?;
+        let stdout = std::fs::File::from(std::io::stdout().as_fd().try_clone_to_owned()?);
+        let (recorder, output) = recording::channel(recording::Config::default(), &book_config)?;
+        let (ready_send, ready) = oneshot::channel();
+        writer_thread = Some(
+            std::thread::Builder::new()
+                .name("sbe-output".into())
+                .spawn(move || {
+                    let report = output.run(
+                        stdout,
+                        sidecar,
+                        &label,
+                        || {
+                            let _ = ready_send.send(());
+                        },
+                        approval,
+                    );
+                    let _ = writer_send.send(report);
+                })?,
+        );
+        match tokio::time::timeout(config.shutdown_timeout, ready).await {
+            Ok(result) => result.context("output startup failed")?,
+            Err(_) => std::process::exit(1), // blocked output: no locks or thread joins
+        }
+        Some(recorder)
+    };
     let (consumer_send, mut consumer_receive) = oneshot::channel();
     let consumer = std::thread::Builder::new()
         .name("market-data".into())
         .spawn(move || {
             let result = if transport_only {
-                validate_transport(receiver)
+                validate_transport(receiver).map(|messages| ConsumerReport {
+                    messages,
+                    diagnostics: String::new(),
+                })
             } else {
-                process_books(receiver, book_config, recovery_send, consumer_stop)
+                process_books(
+                    receiver,
+                    book_config,
+                    recovery_send,
+                    consumer_stop,
+                    recorder,
+                )
             };
             let _ = consumer_send.send(result);
         })?;
@@ -104,7 +163,9 @@ async fn run() -> Result<()> {
     let mut manager_result = None;
     let mut discovery_result = None;
     let mut consumer_result = None;
+    let mut writer_result = None;
     let mut errors = vec![];
+    let mut summaries = vec![];
     let mut failure = stop.subscribe();
     tokio::select! {
         _ = failure.wait_for(|stopped| *stopped) => {},
@@ -114,6 +175,10 @@ async fn run() -> Result<()> {
             errors.push("discovery exited unexpectedly".to_owned());
         },
         result = &mut consumer_receive => consumer_result = Some(result),
+        result = &mut writer_receive, if !transport_only => {
+            writer_result = Some(result);
+            errors.push("output ended before intake shutdown".into());
+        },
         signal = async {
             tokio::select! {
                 signal = tokio::signal::ctrl_c() => signal.context("SIGINT handler failed"),
@@ -134,26 +199,26 @@ async fn run() -> Result<()> {
         .await
         .is_err()
     {
-        errors.push("discovery Stop timed out".into());
+        std::process::exit(1);
     }
     if manager_result.is_none() {
         match timeout_at(deadline, &mut manager).await {
             Ok(result) => manager_result = Some(result),
             Err(_) => {
                 manager.abort();
-                errors.push("worker shutdown timed out; drain incomplete".into());
+                std::process::exit(1);
             }
         }
     }
     if let Some(result) = manager_result {
         match result {
-            Ok(Ok(reports)) => eprintln!(
+            Ok(Ok(reports)) => summaries.push(format!(
                 "ingestion workers={} sessions={} received_messages={} requested_at_cutoff={}; requested is not confirmed or book-initialized",
                 reports.len(),
                 reports.iter().map(|r| r.sessions).sum::<u64>(),
                 reports.iter().map(|r| r.messages).sum::<u64>(),
                 reports.iter().map(|r| r.requested_at_cutoff).sum::<usize>(),
-            ),
+            )),
             result => errors.push(format!("ingestion: {result:?}")),
         }
     }
@@ -162,35 +227,66 @@ async fn run() -> Result<()> {
             Ok(result) => discovery_result = Some(result),
             Err(_) => {
                 discovery_task.abort();
-                errors.push("discovery shutdown timed out".into());
+                std::process::exit(1);
             }
         }
     }
     if let Some(result) = discovery_result {
         match result {
-            Ok(report) => eprintln!("discovery {}", serde_json::to_string(&report)?),
+            Ok(report) => summaries.push(format!("discovery {}", serde_json::to_string(&report)?)),
             Err(error) => errors.push(format!("discovery: {error}")),
         }
     }
     if consumer_result.is_none() {
         match timeout_at(deadline, &mut consumer_receive).await {
             Ok(result) => consumer_result = Some(result),
-            Err(_) => errors.push("ingress drain timed out; accepted tail not validated".into()),
+            Err(_) => std::process::exit(1),
         }
     }
     if let Some(result) = consumer_result {
+        if consumer.join().is_err() {
+            errors.push("transport consumer panicked".into());
+        }
         match result {
-            Ok(Ok(messages)) => {
-                eprintln!("drained_messages={messages}; observations not persisted");
-                if messages == 0 {
+            Ok(Ok(report)) => {
+                // Book diagnostics are bounded and reported only after the owner exits.
+                // Stderr is not part of accepted-message processing or its drain.
+                if !report.diagnostics.is_empty() {
+                    summaries.push(report.diagnostics);
+                }
+                summaries.push(format!("drained_messages={}", report.messages));
+                if report.messages == 0 {
                     errors.push("no raw messages received".into());
                 }
             }
             result => errors.push(format!("transport validation: {result:?}")),
         }
-        if consumer.join().is_err() {
-            errors.push("transport consumer panicked".into());
+    }
+    if !transport_only {
+        let _ = approval_send.send(errors.is_empty());
+        if writer_result.is_none() {
+            writer_result = Some(match timeout_at(deadline, &mut writer_receive).await {
+                Ok(result) => result,
+                Err(_) => std::process::exit(1),
+            });
         }
+        if writer_thread.unwrap().join().is_err() {
+            errors.push("output worker panicked".into());
+        }
+        match writer_result.unwrap() {
+            Ok(report) => {
+                if let Some(error) = &report.error {
+                    errors.push(format!("output: {error}"));
+                }
+                summaries.push(format!(
+                    "recording {report:?}; flush does not imply durability"
+                ));
+            }
+            Err(error) => errors.push(format!("output worker lost: {error}")),
+        }
+    }
+    for summary in summaries {
+        eprintln!("{summary}");
     }
     ensure!(errors.is_empty(), "{}", errors.join("; "));
     Ok(())
@@ -256,58 +352,216 @@ fn validate_transport(receiver: crossbeam::channel::Receiver<ingress::Envelope>)
     Ok(messages)
 }
 
+#[derive(Debug)]
+struct ConsumerReport {
+    messages: u64,
+    diagnostics: String,
+}
+
 fn process_books(
     receiver: crossbeam::channel::Receiver<ingress::Envelope>,
     config: orderbook::Config,
     recovery: mpsc::Sender<Session>,
     stop: watch::Receiver<bool>,
-) -> Result<u64> {
+    mut recorder: Option<recording::Recorder>,
+) -> Result<ConsumerReport> {
     let mut processor = Processor::new(config)?;
     let start = std::time::Instant::now();
     let mut next_tick = Duration::ZERO;
-    let mut sink = |observation: orderbook::Observation<'_>| {
-        if let ObservationKind::Invalidated { reason } = observation.kind {
-            eprintln!(
-                "book_unavailable input={} binding={:?} asset={} reason={reason}; replacement cannot recover missed history",
-                observation.input, observation.binding, observation.asset
-            );
-        }
-        Ok(())
-    };
-    loop {
-        match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(envelope) => processor
-                .process(&envelope.message, start.elapsed(), &mut sink)
-                .context("C3/C4 processing failed; accepted tail incomplete")?,
-            Err(crossbeam::channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
-        }
-        if !*stop.borrow() {
-            let now = start.elapsed();
-            if now >= next_tick {
-                processor.tick(now)?;
-                next_tick = now + Duration::from_millis(100);
+    let mut invalidations = 0u64;
+    let mut samples = Vec::new();
+    let result: Result<()> = (|| {
+        loop {
+            if *stop.borrow() {
+                processor.stop_snapshots(start.elapsed());
             }
-            for session in processor.take_recovery() {
-                if let Err(error) = recovery.try_send(session)
-                    && !*stop.borrow()
-                {
-                    return Err(error).context("book recovery channel full or closed; coverage and accepted tail incomplete");
+            let mut wait = Duration::from_millis(100);
+            if let Some(recorder) = &recorder {
+                recorder.check_output()?;
+                if let Some(at) = recorder.next_publish_at() {
+                    wait = wait.min(at.saturating_duration_since(std::time::Instant::now()));
                 }
             }
+            if !*stop.borrow() {
+                wait = wait.min(next_tick.saturating_sub(start.elapsed()));
+                if let Some(due) = processor.next_snapshot_due() {
+                    wait = wait.min(due.saturating_sub(start.elapsed()));
+                }
+            }
+            let mut sink = |observation: orderbook::Observation<'_>| {
+                if let ObservationKind::Invalidated { reason, .. } = observation.kind {
+                    invalidations += 1;
+                    if samples.len() < 4 {
+                        samples.push(format!(
+                            "input={} binding={:?} asset={:.128} reason={:.128}",
+                            observation.input, observation.binding, observation.asset, reason
+                        ));
+                    }
+                }
+                if let Some(recorder) = &mut recorder {
+                    recorder.observe(observation)?;
+                }
+                Ok(())
+            };
+            match receiver.recv_timeout(wait) {
+                Ok(envelope) => processor
+                    .process(&envelope.message, start.elapsed(), &mut sink)
+                    .context("C3/C4 processing failed; accepted tail incomplete")?,
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
+            }
+            if !*stop.borrow() {
+                processor.capture_due(&mut || (start.elapsed(), chrono::Utc::now()), &mut sink)?;
+                let now = start.elapsed();
+                if now >= next_tick {
+                    processor.tick(now)?;
+                    next_tick = now + Duration::from_millis(100);
+                }
+                for session in processor.take_recovery() {
+                    if let Err(error) = recovery.try_send(session)
+                        && !*stop.borrow()
+                    {
+                        return Err(error).context("book recovery channel full or closed; coverage and accepted tail incomplete");
+                    }
+                }
+            }
+            if let Some(recorder) = &mut recorder {
+                recorder.publish_due(std::time::Instant::now())?;
+            }
         }
-    }
-    processor.finish()?;
-    eprintln!(
-        "books {:?}; initialization counts are observations, not full-universe coverage",
-        processor.stats()
+        processor.finish()
+    })();
+    let result = if let Some(mut recorder) = recorder {
+        recorder.snapshot_stats(processor.stats());
+        recorder.finish(result)
+    } else {
+        result
+    };
+    let diagnostics = format!(
+        "books {:?}; invalidation_observations={invalidations} omitted_invalidation_details={} first_samples={samples:?}; asset/reason previews capped at 128 characters; initialization counts are observations, not full-universe coverage; replacement cannot recover missed history",
+        processor.stats(),
+        invalidations - samples.len() as u64
     );
-    Ok(processor.stats().messages)
+    if let Err(error) = result {
+        return Err(error).context(diagnostics);
+    }
+    Ok(ConsumerReport {
+        messages: processor.stats().messages,
+        diagnostics,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalidation_burst_drains_without_stderr_progress() {
+        const CHILD: &str = "COLLECTOR_TEST_UNREAD_STDERR";
+        if std::env::var_os(CHILD).is_some() {
+            let (send, receive) = ingress::channel(16, 64 << 20).unwrap();
+            let sessions = [0, 1].map(|worker| Session {
+                worker,
+                generation: 1,
+                adapter: engineering_challenge::discovery::AdapterId::PolymarketV1,
+            });
+            for (session, assets) in [
+                (sessions[0], (0..50_000).map(|i| format!("A{i}")).collect()),
+                (sessions[1], vec!["healthy".into()]),
+            ] {
+                send.send(Message::Started(session)).unwrap();
+                send.send(Message::SubscriptionsRequested {
+                    session,
+                    source_slot: 0,
+                    revisions: vec![1; assets.len()],
+                    add: assets,
+                    remove: vec![],
+                })
+                .unwrap();
+            }
+            send.send(Message::Data {
+                session: sessions[1], ordinal: 1, received_at: chrono::Utc::now(),
+                payload: r#"{"event_type":"book","asset_id":"healthy","timestamp":"1","bids":[],"asks":[]}"#.into(),
+            }).unwrap();
+            send.send(Message::Ended {
+                session: sessions[0],
+                reason: "large source disconnect λ".repeat(1_000),
+            })
+            .unwrap();
+            // Already accepted work for an independent source must survive the burst.
+            send.send(Message::Data {
+                session: sessions[1], ordinal: 2, received_at: chrono::Utc::now(),
+                payload: r#"{"event_type":"price_change","timestamp":"2","price_changes":[{"asset_id":"healthy","side":"BUY","price":"0.4","size":"7"}]}"#.into(),
+            }).unwrap();
+            send.send(Message::Ended {
+                session: sessions[1],
+                reason: "shutdown".into(),
+            })
+            .unwrap();
+            drop(send);
+            let (_stop, stopped) = watch::channel(true);
+            let (recovery, _requests) = mpsc::channel(1);
+            let report = process_books(
+                receive,
+                orderbook::Config::default(),
+                recovery,
+                stopped,
+                None,
+            )
+            .unwrap();
+            assert_eq!(report.messages, 2);
+            assert!(
+                report
+                    .diagnostics
+                    .contains("changes: 1, selected_changes: 1")
+            );
+            assert!(
+                report
+                    .diagnostics
+                    .contains("invalidation_observations=50001")
+            );
+            assert!(
+                report
+                    .diagnostics
+                    .contains("omitted_invalidation_details=49997")
+            );
+            assert!(report.diagnostics.len() < 8192);
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::invalidation_burst_drains_without_stderr_progress",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if started.elapsed() > Duration::from_secs(10) {
+                child.kill().unwrap();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "invalidation burst failed to drain without stderr progress: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "book consumer performed diagnostic I/O"
+        );
+    }
+
     #[test]
     fn failed_recovery_delivery_is_explicit_but_shutdown_drains_without_scheduling() {
         for mode in ["full", "closed", "shutdown"] {
@@ -341,12 +595,24 @@ mod tests {
                 requests.close();
             }
             let (_stop, stopped) = watch::channel(mode == "shutdown");
-            let result = process_books(receive, orderbook::Config::default(), recovery, stopped);
+            let result = process_books(
+                receive,
+                orderbook::Config::default(),
+                recovery,
+                stopped,
+                None,
+            );
             if mode == "shutdown" {
-                assert_eq!(result.unwrap(), 1);
+                assert_eq!(result.unwrap().messages, 1);
                 assert!(requests.try_recv().is_err());
             } else {
-                assert!(result.unwrap_err().to_string().contains("recovery channel"));
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("expected recovery failure"),
+                };
+                let diagnostic = format!("{error:#}");
+                assert!(diagnostic.contains("recovery channel"));
+                assert!(diagnostic.contains("invalidation_observations=1"));
             }
         }
     }

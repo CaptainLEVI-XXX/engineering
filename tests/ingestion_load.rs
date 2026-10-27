@@ -184,7 +184,7 @@ fn paced_replica_replay_preserves_selected_history() {
                     );
                     levels += 1;
                 }
-                ObservationKind::Snapshot(book) => {
+                ObservationKind::Snapshot { book, .. } => {
                     let asset = o.asset[1..].parse::<usize>().unwrap();
                     assert_eq!(book.len(), asset % 16 + 1);
                     assert_eq!(
