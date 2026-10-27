@@ -14,6 +14,205 @@ Fix a demonstrated correctness failure when found; do not defer it just because
 this checklist is scheduled for integration. Optimize only after the correctness
 gates pass and the actual bottleneck is measured.
 
+## R1–R8 integration ledger (implementation-first continuation)
+
+The user requested implementation before the final test pass, then correctness
+and latency on small data before optimization. All rows below distinguish code
+from executed evidence; the earlier R0 checks do **not** validate these changes.
+No additional universe campaign or live latency treatment is authorized here.
+
+| Requirement | Implementation | Final local evidence | Live/capacity acceptance |
+|---|---|---|---|
+| R1 protocol seams | Neutral discovery commands, wire protocol and session decoder ownership, adapter-owned namespace | Combined debug/release pass; actual alternate-protocol local worker fixture | Existing Polymarket fixtures only |
+| Extension 1 / R2–R3 | Independent slots, physical packing cap, desired fences, sticky snapshot-before-delta selection, bounded degraded recovery | Dual-slot executable deadline/SIGINT, lifecycle interleavings, failure/selection replay and SBE tests passed | Not qualified for observed universe; 1,116 projected sockets exceed 1,024 cap |
+| Extension 2 / R4 | Fixed accepted-activity windows, indexed examinations, health suspicion, peer reservations, bounded planned renewal and shared connection leases | Logical-clock activity/policy tests and local connection-budget tests passed | Revisit/initialization/renewal service rates unqualified at universe scale; small results will not qualify 500k+ assets |
+| R5 discovery hints | Optional payload flag, exact Gamma ID, two-namespace verification fallback, bounded dedup and coalesced reconciliation | Decoder, bounded hint and collector fixtures passed | Global notification delivery scope unobserved |
+| Extension 3 / R6 | Exact signed-relative normalized operations, venue price bounds, optional timestamps, synthetic alternate protocol/sequence fixtures | Alternate worker→decoder→recorder→supplied reader replay passed, including sequence gap and new generation | No production Kalshi or second-live-exchange claim |
+| Extension 4 / R7 | Bounded paired-feed probe, conservative canonical matching, renewal/port cohorts, uncertainty reporting; local stage attribution | All 15 matcher/output/CLI fixtures passed in debug and release | Approved live trials not run; no measured network-arrival improvement |
+| R8 integrated acceptance | Existing failure campaign extended with fences, replicas, standby provenance and automatic policy | 160 default tests passed in each profile; fmt/check/strict Clippy passed; 100-cycle churn fixture passed | Full-universe two reconciliations + 30min steady interval, full-target health load and 30min soak deferred |
+
+Executed `cargo test --locked` and `cargo test --locked --release`: each passed
+160 tests, with nine opt-in tests ignored. `cargo check --locked --all-targets`,
+`cargo clippy --locked --all-targets -- -D warnings`, and
+`cargo fmt --all -- --check` also passed. These are local orb results, not CI.
+The first debug run found duplicate invalidation after a global retirement fence
+and late physical unsubscribe. The owner now ignores obsolete removal revisions;
+the existing interleaving oracle passed without relaxing its expected history.
+Strict Clippy found one collapsible conditional, fixed by Clippy and formatted.
+Logs under `.amp/in/artifacts/`: `r1-r8-debug.log` (retained failure),
+`r1-r8-debug-2.log`, `r1-r8-release-checks.log` (release pass and first lint failure),
+`r1-r8-clippy-fix.log`, and `r1-r8-small-smoke-2.log` (clean static checks).
+
+The first benchmark uses 100 varied-depth books and explicitly labeled synthetic
+offered traffic. Local queue/owner/encoding/write-call timing is not network
+latency, consumer visibility, durability or evidence of exchange-wide losslessness.
+No optimization is accepted without repeated same-input measurements and the
+same financial oracle. Larger load and live campaigns require a separate budget.
+
+Remaining design limitation: generation-only all-ready acknowledgments become
+ambiguous if assignments change after the worker marker. The worker conservatively
+retains its lease until expiry/end. Marker-token acknowledgment can improve this
+case later; it must not be presented as already measured full-ready throughput.
+Two sockets in one process do not protect against process death. Independent
+collectors/hosts and their separate archives remain optional, separately approved
+hardening, not silently combined writers.
+
+### Small-data results; longer trials stopped on request
+
+On the same Linux orb/Rust 1.93.0 host, four release recording trials completed:
+100 varied-depth books, 100 initialization messages, 2,000 warmup messages and
+120,000 measured messages at 1,000/s for 120 seconds. Every trial compared all
+854,312 decoded SBE records against the independent oracle, including 184 minute
+snapshots, with zero mismatches and successful drain. These trials use one source
+and default monitoring-off behavior; they do not measure dual-feed health cost.
+
+| Path / trial | Achieved offered messages/s | Queue p99 (µs) | Processing including recorder p99 (µs) |
+|---|---:|---:|---:|
+| Direct ingress / 1 | 1,000.001 | 126.72 | 37.15 |
+| Direct ingress / 2 | 999.997 | 129.52 | 38.19 |
+| Direct ingress / 3 | 1,000.000 | 127.48 | 37.20 |
+| Local WebSocket / 1 | 1,000.003 | 136.23 | 43.10 |
+
+Commands: `C5_SECONDS=120 C5_RATE=1000 C5_MODE=ingress C5_OUTPUT=file cargo test
+--locked --release --test recording_load mixed_recording_matches_every_oracle_record
+-- --exact --ignored --nocapture`; repeat with `C5_MODE=socket`. Logs are
+`.amp/in/artifacts/r1-r8-latency-{ingress-1,ingress-2,ingress-3,socket-1}.log`.
+They retain p50/p95/p99/p99.9/max, sample counts, stage boundaries, output calls,
+offer lag, drain and `/usr/bin/time -v` data. No builds or heavy agents ran during
+these trials. Reference checking and timing instrumentation remain workload costs.
+This is a diagnostic baseline, not an optimization comparison or maximum capacity.
+
+The user then stopped the time-consuming work. Socket trial 2 was interrupted
+and has **no accepted result**; trial 3 never ran. Its partial log remains as
+`r1-r8-latency-socket-2.log`. No full-universe or live latency campaign started.
+
+The separate accelerated-clock health test passed with 100 instruments / 200
+replicas, 16,000 accepted entries and 8,000 independently checked selected entries.
+Health state measured 288 bytes/replica; maximum revisit was 10s and scheduling
+lateness 100ms. The first harness skipped all startup ticks for one logical second
+and reported 1.1s lateness. Servicing startup at the same declared 100ms cadence
+as steady state removed that artificial stall; the test now also asserts the 1s
+lateness limit. No production scheduler change was made. This is not a constant-
+ingress or universe-scale qualification. Final command:
+`cargo test --locked --release --test health_load -- --ignored --nocapture`.
+Log `r1-r8-final-small-check.log` also records final fmt and strict Clippy success.
+
+## R0 orb baseline (2026-10-27)
+
+Checkout: `component-2-ingestion`, starting at
+`b76a70f0d6013daa9cff392a0ce895e783378f26`, not either repository's main.
+The transferred `6.md` governs stages R0–R8; its original contents and the
+user's deletion of `3&4.md` are preserved. This is R0 evidence work, not
+redundant-feed enablement or challenge sign-off.
+
+Host: Linux x86_64 orb, eight vCPUs, approximately 16 GiB RAM and 60 GiB disk;
+Intel Xeon 2.60 GHz. `.agents/setup` installs stable Rust 1.93.0 and the locked
+dependencies. No nightly features, custom allocator or compiler flags were
+added. Mac measurements below are historical, not comparative speedups.
+
+The unchanged Linux baseline passed all 73 release tests but failed one debug
+test: elapsed silence did not establish that an unsubscribe write was pending.
+The correction is test-only. Real WebSockets over an eight-byte duplex transport
+now explicitly reach `Poll::Pending` before shutdown, peer-drain and timeout
+controls. Removing the cancellation branch in a temporary copy failed the
+250 ms shutdown assertion; both controls still passed. The loopback test retains
+accepted-prefix, session, timeout and drain assertions, accepting either exact
+ordinary-shutdown or interrupted-unsubscribe-shutdown reason. Production worker
+behavior was not changed.
+
+Combined verification passed **84 tests in each of debug and release**, plus
+formatting, locked all-target check and strict all-target Clippy. Ignored live
+and performance tests are not included in that count. Logs:
+`.amp/in/artifacts/r0-baseline.log` and `r0-local-checks.log`.
+
+| R0 contract | Local evidence | Limits |
+|---|---|---|
+| Identity-level coverage | `tests/collector.rs` distinguishes desired A/B/C, requested A/B/X and live A/X; identifies missing C/unexpected X, retirement of B and 29/30-second initialization deadline boundary | Independently sampled owner views are not an atomic full-universe ledger; R2 supplies the ordered desired fence |
+| Existing owner state | Borrowed `Assignments::current`, `Processor::requested` and `Processor::coverage` expose exact identities, admission revisions, input cutoffs and initialization status without cloning books | A successful request is not acknowledgement; selected affinity alone is not live eligibility |
+| Recording replay | Existing recording oracle now compares complete selected records and unavailable boundaries through source loss, recovery, manual selection, deletion and retirement | Automatic failover remains R3; synthetic replay does not recover missing exchange history |
+| Discovery evidence | Capped create-new journal retains decisions, exact failed/expired/overflow identities, all sweep reports and final desired/pending state; short-write, cap and flush faults are tested | Evidence completion and coverage acceptance are separate; expiry does not resolve an identity |
+| Benchmark accounting | Initialization, warmup, measured offered messages and drain are separate; sample membership follows trace ordinals | No synchronous-versus-dedicated topology qualification or speedup claim |
+| Physical visibility | Separate pipe consumer timestamps record-end and complete-chunk byte offsets; supplied reader round-trips the snapshot | Consumer-local timing, not receive-to-output latency; one diagnostic sample |
+
+### Current discovery fails strict coverage; two copies exceed the socket cap
+
+The bounded public run completed in 556,365 ms: V1 2,754 pages / 275,308
+records, V2 33 pages / 3,277 records. It observed **556,974 desired assets**
+(550,420 V1; 6,554 V2), not the historical 484,704. Both traversals completed
+without listing errors or conflicts. Strict exit status was **1** because 44 V1
+markets lacked token IDs. All 44 exact identities/reasons remain in
+`.amp/in/artifacts/r0-discovery-run/unresolved.json` and the original journal.
+The six targeted requests did not resolve them; all 44 jobs expired. Final
+pending=0 therefore does **not** mean no unresolved identities. No anonymous
+errors, overflow, failed verification batches or known-market uncertainty were
+observed. Stdout was zero bytes; the complete journal was 242,095,659 bytes.
+
+Command: `target/release/discovery --seconds 1770 --once --strict --evidence
+NEW_FILE --evidence-max-bytes 536870912`, under an outer 1,800-second watchdog.
+The evidence file has a terminal completion marker and successful evidence
+status, while discovery coverage remains unaccepted. Pagination is not an
+atomic exchange snapshot and says nothing about unobserved historical updates.
+
+The offline `project_current_universe_capacity` test feeds that final snapshot
+through the actual initial assignment algorithm. At 1,000 assets/socket:
+
+| Adapter | Assets | Workers per slot | Final worker load | Two-slot workers |
+|---|---:|---:|---:|---:|
+| V1 | 550,420 | 551 | 420 | 1,102 |
+| V2 | 6,554 | 7 | 554 | 14 |
+| Total | 556,974 | 558 | — | **1,116** |
+
+Two independent copies would require **1,113,948 replicas** and exceed the
+configured 1,024 physical-socket cap by 92. The 10,000,000-level aggregate
+budget permits only **8.98 levels/replica before replacement construction**.
+The initial-packing projection does not include later churn/fragmentation.
+No full-universe redundancy was enabled or approved.
+
+Resource worksheet, not an admission certificate:
+
+- Replica structs alone: 294,082,272 bytes, excluding heap books, identities,
+  maps, retained tombstones and allocator overhead. Full-universe depth and
+  replacement-burst distributions remain unmeasured.
+- Each socket permits a 2 MiB reassembled message and a 256 KiB write buffer;
+  multiplication by 1,116 is a potential envelope, not resident/preallocated
+  memory. TCP/TLS/read buffers and tasks add further memory.
+- Existing ingress accounting: 64 MiB; fixed C5 pool: 68,157,440 bytes, plus
+  output buffers and symbol retention. Health state is not implemented yet.
+- This orb had approximately 56 GiB disk free before probes. No universe-scale
+  RSS, all-book-ready latency, backlog age, sustainable service rate or minute
+  snapshot completion time has been established. Raising caps alone would not
+  qualify this host.
+
+### Synthetic output baseline, not topology qualification
+
+Sequential release runs used 100 books, 100 initialization messages, 2,000
+warmup messages and 120,000 measured messages over 120 seconds at 1,000/s.
+Each compared **854,312 complete decoded records**, including 184 generated
+minute snapshots; both output reports had no error and drained successfully.
+
+| Mode / destination | Measured offered/s | Ingress age p50 / p99 / p99.9 (µs) | Processing p50 / p99 / p99.9 (µs) | Drain (ms) | Peak RSS (KiB) |
+|---|---:|---|---|---:|---:|
+| Direct ingress / file | 999.999 | 58.5 / 154.8 / 266.2 | 12.5 / 46.2 / 73.8 | 39.6 | 134,680 |
+| Loopback socket / draining pipe | 1,000.006 | 62.5 / 155.5 / 295.2 | 12.9 / 43.4 / 78.9 | 63.8 | 135,224 |
+
+Both wrote three 64 MiB chunks (201,326,592 physical bytes). User+system CPU
+was 24.80 s and 31.45 s respectively; maximum snapshot lateness was 1,160 µs
+and 1,121 µs. Processing includes encoding and test instrumentation; producer
+lag reached 7,287/8,749 µs. No builds, other benchmarks or CPU-heavy agents ran
+concurrently; the public discovery service was active, so these are diagnostic
+shared-host runs, not isolated comparative latency trials. Logs:
+`r0-recording-ingress.log`, `r0-recording-socket.log` under `.amp/in/artifacts/`.
+
+The separate-consumer visibility probe observed the 84-byte snapshot record at
+4.083 ms and the complete 64 MiB chunk at 260.913 ms from consumer startup,
+using a diagnostic 200 ms chunk-age setting. The supplied reader recovered
+exactly one snapshot. These timestamps are not producer-to-consumer latency.
+Log: `r0-visibility.log`.
+
+The three-trial synchronous-versus-dedicated comparison, throttled/paused/stalled
+matrix and representative population/depth measurements remain open. These
+baseline trials neither select a topology nor authorize full-universe capture.
+
 ## Component 2 evidence and limits (historical baseline)
 
 - Unsubscribe work now returns to the receive/control loop after each bounded

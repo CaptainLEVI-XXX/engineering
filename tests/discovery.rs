@@ -410,7 +410,10 @@ fn unknown_verification_has_backoff_attempt_and_age_limits_without_resetting_on_
 fn unknown_capacity_does_not_block_known_verification_or_expire_desire() {
     use std::time::Duration;
     use tokio::time::Instant;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("overflow.jsonl");
     let mut registry = Registry::default();
+    registry.enable_evidence(&path, 1024 * 1024).unwrap();
     for i in 0..1100 {
         registry.request_verification(key(Version::V2, &format!("unknown-{i}")));
     }
@@ -433,6 +436,115 @@ fn unknown_capacity_does_not_block_known_verification_or_expire_desire() {
         assert!(registry.snapshot().markets[&known].uncertainty.is_some());
     }
     assert_eq!(registry.pending_checks().len(), 1);
+    assert!(registry.finish_evidence().unwrap().complete);
+    let rows: Vec<Value> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let overflow: Vec<_> = rows
+        .iter()
+        .map(|row| &row["event"])
+        .filter(|event| event["kind"] == "verification_overflow")
+        .collect();
+    assert_eq!(overflow.len(), 76);
+    assert_eq!(
+        overflow[0]["key"],
+        json!({"adapter":"polymarket_v2", "id":"unknown-1024"})
+    );
+    assert_eq!(
+        overflow[75]["key"],
+        json!({"adapter":"polymarket_v2", "id":"unknown-1099"})
+    );
+}
+
+#[test]
+fn evidence_retains_expired_unknown_and_anonymous_errors_without_retaining_jobs() {
+    use std::time::Duration;
+    use tokio::time::Instant;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("expired.jsonl");
+    let mut registry = Registry::default();
+    registry.enable_evidence(&path, 1024 * 1024).unwrap();
+    let mut unknown = fixtures()[5].clone();
+    unknown["id"] = json!("000-expiring-native-id");
+    let mut anonymous = unknown.clone();
+    anonymous["id"] = Value::Null;
+    registry
+        .apply_listing(Version::V1, &page(vec![unknown, anonymous]))
+        .unwrap();
+    assert_eq!(registry.pending_checks().len(), 1);
+    assert!(
+        registry
+            .verification_batch(Instant::now() + Duration::from_secs(301))
+            .is_empty()
+    );
+    assert!(registry.pending_checks().is_empty());
+    assert!(registry.snapshot().markets.is_empty());
+    assert!(registry.finish_evidence().unwrap().complete);
+    let rows: Vec<Value> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let events: Vec<_> = rows.iter().map(|row| &row["event"]).collect();
+    assert!(events.iter().any(|e| e["kind"] == "verification_expired"
+        && e["key"] == json!({"adapter":"polymarket_v1", "id":"000-expiring-native-id"})));
+    assert!(events.iter().any(|e| e["kind"] == "record"
+        && e["resolved"] == false
+        && e["record"]["Err"]["market_id"] == "000-expiring-native-id"
+        && e["record"]["Err"]["reason"] == "missing token IDs"));
+    assert!(events.iter().any(|e| e["kind"] == "record"
+        && e["resolved"] == false
+        && e["record"]["Err"].is_object()
+        && e["record"]["Err"]["market_id"].is_null()));
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["kind"] == "pending" || e["kind"] == "desired")
+    );
+}
+
+#[test]
+fn evidence_snapshot_excludes_verified_retirement_and_preserves_pending_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot.jsonl");
+    let mut registry = Registry::default();
+    registry.enable_evidence(&path, 1024 * 1024).unwrap();
+    let mut open = fixtures()[0].clone();
+    open["id"] = json!("retire-me");
+    open["clobTokenIds"] = json!("[\"123\",\"456\"]");
+    registry
+        .apply_listing(Version::V1, &page(vec![open.clone()]))
+        .unwrap();
+    let mut closed = open;
+    closed["closed"] = json!(true);
+    closed["acceptingOrders"] = json!(false);
+    registry
+        .apply_verification(Version::V1, &["retire-me".into()], &page(vec![closed]))
+        .unwrap();
+    registry.request_verification(key(Version::V1, "still-unknown"));
+    registry.request_verification(key(Version::V2, "still-unknown"));
+    assert!(registry.finish_evidence().unwrap().complete);
+    let rows: Vec<Value> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!rows.iter().any(|row| row["event"]["kind"] == "desired"));
+    let mut pending: Vec<_> = rows
+        .iter()
+        .filter(|row| row["event"]["kind"] == "pending")
+        .map(|row| row["event"]["key"].clone())
+        .collect();
+    pending.sort_by_key(|key| key["adapter"].as_str().unwrap().to_owned());
+    assert_eq!(
+        pending,
+        vec![
+            json!({"adapter":"polymarket_v1", "id":"still-unknown"}),
+            json!({"adapter":"polymarket_v2", "id":"still-unknown"}),
+        ]
+    );
 }
 
 #[test]

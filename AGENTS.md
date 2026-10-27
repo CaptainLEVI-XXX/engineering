@@ -16,11 +16,11 @@ Priority: **numerical accuracy → reconstructed-book correctness → honest acc
 3. `docs/architecture.md`, `docs/protocol.md`, `docs/engineering-reference.md`, and `docs/research.md` for tested decisions, operational rules, and optimization hypotheses.
 4. Benchmark results on the actual workload; never assume an optimization wins because a blog calls it “HFT.”
 
-Read only the relevant reference sections for the current task. Preserve existing user edits, do not add dependencies without a concrete reason, and do not create unrelated trading or metadata infrastructure. Do not use subagents unless the user explicitly changes that instruction.
+Read only the relevant reference sections for the current task. Preserve existing user edits, do not add dependencies without a concrete reason, and do not create unrelated trading or metadata infrastructure. The user has authorized bounded subagent assistance for the orb continuation: one main agent owns integration; delegate independent research, review, or non-overlapping implementation with explicit file ownership. Do not duplicate delegated work or parallelize dependent stages. Run latency benchmarks without concurrent builds, benchmarks or CPU-heavy subagent work.
 
 ## Component scope and authorization
 
-The user develops this project **one component at a time**: investigate its requirements and contracts, review its implementation plan, then execute and validate the approved scope. **Currently authorized: Component 5 under `5.md`: binary recording, integrity provenance, owner-side minute snapshots and necessary executable/shutdown integration.** Preserve Components 1–4. The complete challenge and all four extensions are the eventual target, not permission to implement their later delivery stages now.
+The user develops this project **one component at a time**: investigate its requirements and contracts, review its implementation plan, then execute and validate the approved scope. **Currently authorized: continue the remaining challenge and extensions in an orb using revised `6.md`, beginning with R0 coverage/capacity evidence.** Preserve Components 1–5. Finish and report each stage's evidence before advancing; failed gates block dependent rollout. Full-universe live runs need the plan's explicit resource-budget approval; production Kalshi, deployment and optional production hardening remain outside scope.
 
 - Use the user's component names and boundaries consistently. Do not substitute a different numbered implementation sequence or redefine Component 2 to mean the entire data plane.
 - Requests such as “go ahead,” “execute it,” or “complete Component 2” authorize the agreed component plan, not downstream components or extensions. Finish that component's acceptance checks, report limitations, and stop before starting another component.
@@ -79,7 +79,7 @@ disconnected), and session-checked restart controls. Preserve transport-only tes
 Validate state and intermediate observations against an independent oracle;
 separate genuine fixtures from synthetic cases and report missing live evidence.
 
-### Component 5 — Recording (current scope)
+### Component 5 — Recording (preserve established contracts)
 
 C5 owns supplied-reader-compatible binary stdout, borrowed encoding, a fixed
 batch pool, separate physical flushing and 64 MiB chunk completion, mandatory
@@ -89,10 +89,11 @@ or selected-source map. Preserve exact source metadata and file order, including
 regressing timestamps. Encoding, exhausted output capacity and I/O failures are
 terminal; never retry a partially written buffer or fabricate a repair snapshot.
 
-Later extension work still requires its own reviewed plan and authorization:
-redundant socket provisioning, automatic health-based failover, monitoring/rotation
-policies and connection experiments. Do not implement those or Kalshi during C5.
-Independent replicas and an explicit selection API do not imply live redundancy.
+Extension work now follows the reviewed `6.md` stages: redundant provisioning,
+guarded failover, monitoring/rotation, generic protocol conformance and controlled
+connection experiments. Start with R0; do not treat it as permission to build all
+stages concurrently. Independent replicas and an explicit selection API do not
+imply live redundancy. Kalshi production support remains outside scope.
 
 ## Performance discipline
 

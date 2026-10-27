@@ -25,7 +25,10 @@ async fn offered_bursts_preserve_every_raw_message_in_order() {
         let mut ended = false;
         for envelope in receive {
             match &envelope.message {
-                ingress::Message::Retired { .. } => panic!("unexpected retirement"),
+                ingress::Message::ReconcileBegin { .. }
+                | ingress::Message::DesiredChunk { .. }
+                | ingress::Message::ReconcileComplete { .. } => panic!("unexpected reconciliation"),
+                ingress::Message::RequestsComplete { .. } => {}
                 ingress::Message::Started(session) => {
                     assert!(!started);
                     assert_eq!(session.generation, 1);
@@ -170,7 +173,7 @@ fn paced_replica_replay_preserves_selected_history() {
                     let m = o.metadata.unwrap();
                     let i = (m.cursor.ordinal as usize - 1) * 2 + m.cursor.session.worker;
                     let entry = m.cursor.entry.unwrap();
-                    assert_eq!(o.binding.slot, 0);
+                    assert_eq!(o.binding.session.slot, 0);
                     assert_eq!(o.asset, format!("A{}", (i / 2) % ASSETS));
                     assert_eq!(price.value(), 500000);
                     assert_eq!(quantity.value(), ((i + entry) % 13) as i64 * 1_000_000);
@@ -193,7 +196,7 @@ fn paced_replica_replay_preserves_selected_history() {
                     );
                     snapshots += 1;
                 }
-                ObservationKind::Invalidated { .. } => {}
+                ObservationKind::Invalidated { .. } | ObservationKind::StandbyBaseline => {}
             }
             Ok(())
         };
@@ -249,12 +252,12 @@ fn paced_replica_replay_preserves_selected_history() {
         worker,
         generation: 1,
         adapter: AdapterId::PolymarketV2,
+        slot: worker as u16,
     });
     for s in sessions {
         send.send(ingress::Message::Started(s)).unwrap();
         send.send(ingress::Message::SubscriptionsRequested {
             session: s,
-            source_slot: s.worker as u16,
             revisions: vec![1; ASSETS],
             add: (0..ASSETS).map(|i| format!("A{i}")).collect(),
             remove: vec![],
@@ -283,6 +286,7 @@ fn paced_replica_replay_preserves_selected_history() {
             session: sessions[i % 2],
             ordinal: (i / 2 + 1) as u64,
             received_at: Utc::now(),
+            received_mono: std::time::Instant::now(),
             payload: payload.clone().into(),
         })
         .unwrap();

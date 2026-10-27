@@ -7,38 +7,51 @@ use std::{mem::size_of, sync::Arc, time::Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::Utf8Bytes;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct Session {
     pub worker: usize,
     pub generation: u64,
     pub adapter: AdapterId,
+    pub slot: u16,
 }
 
 #[derive(Debug)]
 pub enum Message {
     Started(Session),
-    /// Authoritative assignment cutoff, even if the worker is disconnected.
-    /// This is NOT a successfully sent unsubscribe request.
-    Retired {
-        worker: usize,
+    ReconcileBegin {
+        revision: u64,
+        chunks: u32,
+    },
+    /// Global ownership fence, not a successfully sent subscription request.
+    DesiredChunk {
         adapter: AdapterId,
         revision: u64,
-        assets: Vec<String>,
+        index: u32,
+        add: Vec<String>,
+        remove: Vec<String>,
+    },
+    ReconcileComplete {
+        revision: u64,
     },
     /// Successfully sent requests, NOT exchange acknowledgements. Initial and
     /// incremental requests precede subsequent data in this session's stream.
     SubscriptionsRequested {
         session: Session,
-        source_slot: u16,
         /// One assignment revision per ID, in add-then-remove order.
         revisions: Vec<u64>,
         add: Vec<String>,
         remove: Vec<String>,
     },
+    /// All currently desired requests and their controls have been written.
+    /// This is not book initialization; only the book owner can confirm that.
+    RequestsComplete {
+        session: Session,
+    },
     Data {
         session: Session,
         ordinal: u64,
         received_at: DateTime<Utc>,
+        received_mono: Instant,
         payload: Utf8Bytes,
     },
     Ended {
@@ -57,6 +70,7 @@ pub struct Envelope {
 pub struct Sender {
     queue: QueueSender<Envelope>,
     budget: Arc<Semaphore>,
+    bytes: usize,
 }
 
 /// Bounds outstanding envelopes and accounted bytes, not total RSS. Text uses
@@ -72,39 +86,68 @@ pub fn channel(items: usize, bytes: usize) -> Result<(Sender, Receiver<Envelope>
         Sender {
             queue,
             budget: Arc::new(Semaphore::new(bytes)),
+            bytes,
         },
         receiver,
     ))
 }
 
+impl Message {
+    pub(crate) fn accounted_bytes(&self) -> Result<usize> {
+        fn strings(values: &Vec<String>) -> Result<usize> {
+            let initial = values
+                .capacity()
+                .checked_mul(size_of::<String>())
+                .context("ingress vector accounting overflow")?;
+            values.iter().try_fold(initial, |bytes, value| {
+                bytes
+                    .checked_add(value.capacity())
+                    .context("ingress string accounting overflow")
+            })
+        }
+        let dynamic = match self {
+            Message::Data { payload, .. } => payload.len(),
+            Message::DesiredChunk { add, remove, .. } => strings(add)?
+                .checked_add(strings(remove)?)
+                .context("ingress desired accounting overflow")?,
+            Message::SubscriptionsRequested {
+                add,
+                remove,
+                revisions,
+                ..
+            } => {
+                let ids = strings(add)?
+                    .checked_add(strings(remove)?)
+                    .context("ingress request ID accounting overflow")?;
+                revisions
+                    .capacity()
+                    .checked_mul(size_of::<u64>())
+                    .and_then(|bytes| bytes.checked_add(ids))
+                    .context("ingress request accounting overflow")?
+            }
+            Message::Ended { reason, .. } => reason.capacity(),
+            Message::Started(_)
+            | Message::RequestsComplete { .. }
+            | Message::ReconcileBegin { .. }
+            | Message::ReconcileComplete { .. } => 0,
+        };
+        size_of::<Envelope>()
+            .checked_add(dynamic)
+            .context("ingress envelope accounting overflow")
+    }
+}
+
 impl Sender {
+    /// Total configured budget, not currently available credit. Used only for
+    /// control-plane preflight; runtime exhaustion remains terminal.
+    pub(crate) fn byte_limit(&self) -> usize {
+        self.bytes
+    }
+
     /// Never blocks the socket owner. Failure is fatal to the transport run;
     /// workers signal shutdown independently of this potentially full queue.
     pub fn send(&self, message: Message) -> Result<()> {
-        let bytes = size_of::<Envelope>()
-            + match &message {
-                Message::Data { payload, .. } => payload.len(),
-                Message::Retired { assets, .. } => {
-                    assets.capacity() * size_of::<String>()
-                        + assets.iter().map(String::capacity).sum::<usize>()
-                }
-                Message::SubscriptionsRequested {
-                    add,
-                    remove,
-                    revisions,
-                    ..
-                } => {
-                    revisions.capacity() * size_of::<u64>()
-                        + (add.capacity() + remove.capacity()) * size_of::<String>()
-                        + add
-                            .iter()
-                            .chain(remove)
-                            .map(String::capacity)
-                            .sum::<usize>()
-                }
-                Message::Ended { reason, .. } => reason.capacity(),
-                Message::Started(_) => 0,
-            };
+        let bytes = message.accounted_bytes()?;
         let permit = self
             .budget
             .clone()

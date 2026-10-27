@@ -1,15 +1,17 @@
 //! Gamma transport and paginated discovery driver.
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use reqwest::{Client, StatusCode, Url};
 use serde::Serialize;
-use tokio::sync::{mpsc, oneshot, watch};
+use serde_json::json;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, sleep, sleep_until};
 
-use super::{AdapterId, MarketKey, Registry, Snapshot};
+pub use super::Command;
+use super::{AdapterId, EvidenceStatus, MarketKey, Registry};
 
 mod adapters;
 pub use adapters::{GammaAdapter, PolymarketV1, PolymarketV2, Version, adapter};
@@ -127,12 +129,6 @@ impl Gamma {
     }
 }
 
-pub enum Command {
-    Snapshot(oneshot::Sender<Arc<Snapshot>>),
-    Hint(MarketKey),
-    Stop,
-}
-
 #[derive(Debug, Serialize)]
 pub struct ScanReport {
     pub adapter: AdapterId,
@@ -196,6 +192,9 @@ pub struct DiscoveryReport {
     pub identity_conflicts: usize,
     pub failed_verification_batches: usize,
     pub stopped: bool,
+    /// Independent of discovery acceptance. None when reporting is not enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<EvidenceStatus>,
 }
 
 impl DiscoveryReport {
@@ -248,6 +247,29 @@ impl Discovery {
         )
     }
 
+    /// Optional diagnostic evidence, finalized before run_for/run_until_stopped
+    /// returns (including strict discovery failure or cancellation). The path
+    /// must not exist. Use one evidence file per discovery owner/run.
+    pub fn enable_evidence(&mut self, path: impl AsRef<Path>, max_bytes: u64) -> Result<()> {
+        self.registry
+            .enable_evidence(path, max_bytes)
+            .context("cannot enable discovery evidence")
+    }
+
+    fn evidence_failed(&mut self) -> bool {
+        if self
+            .registry
+            .evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.failed())
+        {
+            self.stopped = true;
+            true
+        } else {
+            false
+        }
+    }
+
     async fn request(
         &mut self,
         adapter: &dyn GammaAdapter,
@@ -255,6 +277,9 @@ impl Discovery {
         ids: &[String],
         deadline: Option<Instant>,
     ) -> Option<Result<Vec<u8>>> {
+        if self.evidence_failed() {
+            return None;
+        }
         let request = self.gamma.page(adapter, cursor, ids);
         tokio::pin!(request);
         loop {
@@ -263,6 +288,10 @@ impl Discovery {
                 command = self.commands.recv(), if self.commands_open => {
                     self.commands_open = command.is_some();
                     if handle_command(&mut self.registry, command) { self.stopped = true; return None; }
+                    if self.registry.evidence.as_ref().is_some_and(|evidence| evidence.failed()) {
+                        self.stopped = true;
+                        return None;
+                    }
                 }
                 response = &mut request => return Some(response),
             }
@@ -276,6 +305,9 @@ impl Discovery {
         };
         let adapter = adapter(first.adapter);
         let ids: Vec<_> = keys.iter().map(|k| k.id.clone()).collect();
+        if let Some(evidence) = &mut self.registry.evidence {
+            evidence.emit(&json!({"kind":"verification_begin", "adapter":adapter.id(), "ids":ids}));
+        }
         let mut records = Vec::new();
         let mut cursor = None;
         let mut seen = HashSet::new();
@@ -285,6 +317,12 @@ impl Discovery {
                 .request(adapter, cursor.as_deref(), &ids, deadline)
                 .await
             else {
+                if let Some(evidence) = &mut self.registry.evidence {
+                    evidence.emit(
+                        &json!({"kind":"verification_interrupted", "adapter":adapter.id(),
+                        "ids":ids, "cursor":cursor}),
+                    );
+                }
                 return true;
             };
             let result = result.and_then(|bytes| adapter.decode_page(&bytes));
@@ -317,6 +355,12 @@ impl Discovery {
         if let Some(error) = failure {
             self.failed_checks += 1;
             eprintln!("verification failed: {error}");
+            if let Some(evidence) = &mut self.registry.evidence {
+                evidence.emit(
+                    &json!({"kind":"verification_failed", "adapter":adapter.id(),
+                    "ids":ids, "error":error}),
+                );
+            }
             for key in &keys {
                 self.registry.uncertain(key, "targeted request failed");
             }
@@ -349,7 +393,15 @@ impl Discovery {
         let started = Instant::now();
         let mut first_publication_ms = None;
         let mut max_page_apply_us = 0;
+        let mut sweep = 0_u64;
         let scans = loop {
+            sweep += 1;
+            let sweep_started_ms = started.elapsed().as_millis();
+            if let Some(evidence) = &mut self.registry.evidence {
+                evidence.emit(&json!({"kind":"sweep_begin", "sweep":sweep,
+                    "endpoint":self.gamma.endpoint.as_str(), "closed":"false", "limit":100,
+                    "versions":["v1","v2"]}));
+            }
             let mut scans = [
                 Scan::new(PolymarketV1.id(), &self.registry),
                 Scan::new(PolymarketV2.id(), &self.registry),
@@ -372,6 +424,12 @@ impl Discovery {
                     let apply_started = Instant::now();
                     match result.and_then(|bytes| adapter.decode_page(&bytes)) {
                         Ok(page) => {
+                            if let Some(evidence) = &mut self.registry.evidence {
+                                evidence.emit(&json!({"kind":"listing_page", "sweep":sweep,
+                                    "adapter":adapter.id(), "page":scan.report.pages + 1,
+                                    "cursor":scan.cursor, "records":page.markets.len(),
+                                    "next_cursor":page.next_cursor}));
+                            }
                             let page = self.registry.apply_page(adapter.id(), page);
                             scan.report.pages += 1;
                             scan.report.records += page.records;
@@ -410,12 +468,28 @@ impl Discovery {
                 }
             }
             while !self.stopped && self.verify_one_batch(deadline).await {}
+            self.evidence_failed();
+            if let Some(evidence) = &mut self.registry.evidence {
+                for scan in &scans {
+                    evidence.emit(&json!({"kind":"scan", "sweep":sweep,
+                        "sweep_started_ms":sweep_started_ms, "sweep_ended_ms":started.elapsed().as_millis(),
+                        "stopped":self.stopped, "report":scan.report}));
+                }
+                evidence.flush();
+            }
+            self.evidence_failed();
             if once || self.stopped {
                 break scans;
             }
             let resume = Instant::now() + Duration::from_secs(60);
             while !self.stopped && Instant::now() < resume {
+                if std::mem::take(&mut self.registry.reconcile_requested) {
+                    break;
+                }
                 if !self.verify_one_batch(deadline).await {
+                    if self.evidence_failed() {
+                        break;
+                    }
                     let wake = self
                         .registry
                         .next_verification()
@@ -429,7 +503,7 @@ impl Discovery {
             }
         };
         let snapshot = self.registry.snapshot();
-        DiscoveryReport {
+        let mut report = DiscoveryReport {
             scans: scans.map(|s| s.report),
             elapsed_ms: started.elapsed().as_millis(),
             first_publication_ms,
@@ -448,7 +522,16 @@ impl Discovery {
             identity_conflicts: self.registry.identity_conflicts,
             failed_verification_batches: self.failed_checks,
             stopped: self.stopped,
+            evidence: None,
+        };
+        if let Some(evidence) = &mut self.registry.evidence {
+            evidence.emit(
+                &json!({"kind":"report", "coverage_accepted":report.coverage_accepted(),
+                "report":report}),
+            );
         }
+        report.evidence = self.registry.finish_evidence();
+        report
     }
 }
 
@@ -458,6 +541,7 @@ fn handle_command(registry: &mut Registry, command: Option<Command>) -> bool {
             let _ = reply.send(registry.snapshot());
         }
         Some(Command::Hint(key)) => registry.request_verification(key),
+        Some(Command::Reconcile) => registry.reconcile_requested = true,
         Some(Command::Stop) => return true,
         None => return true,
     }

@@ -76,12 +76,7 @@ impl de::Visitor<'_> for Decimal {
 }
 impl<'de> Deserialize<'de> for Price {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let value = d.deserialize_str(Decimal)?;
-        // This deserializer is Polymarket-specific; storage constructors are not.
-        if value > 1_000_000 {
-            return Err(de::Error::custom("price outside probability range"));
-        }
-        Ok(Self(value))
+        d.deserialize_str(Decimal).map(Self)
     }
 }
 impl<'de> Deserialize<'de> for Quantity {

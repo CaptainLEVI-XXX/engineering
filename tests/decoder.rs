@@ -56,7 +56,7 @@ fn decoding_preserves_exact_values_and_isolates_bad_event_scope() {
             asks,
         } => {
             assert_eq!(asset, "001");
-            assert_eq!(exchange_us, 1001000);
+            assert_eq!(exchange_us, Some(1001000));
             assert_eq!(
                 (bids[0].price.value(), bids[0].quantity.value()),
                 (400000, 3000001)
@@ -106,7 +106,7 @@ fn retained_live_snapshots_match_independent_fixture_expectations() {
         else {
             panic!("snapshot")
         };
-        assert_eq!(exchange_us, 1_793_090_283_325_000);
+        assert_eq!(exchange_us, Some(1_793_090_283_325_000));
         assert_eq!(
             (bids.len(), asks.len()),
             if index == 0 { (0, 72) } else { (72, 0) }
@@ -142,17 +142,20 @@ fn generated_decimal_boundaries_and_unknown_semantics_are_not_silently_accepted(
         }
     }
     let limits = Limits::default();
-    for kind in [
-        "last_trade_price",
-        "best_bid_ask",
-        "new_market",
-        "market_resolved",
-    ] {
+    for kind in ["last_trade_price", "best_bid_ask"] {
         let text = format!(r#"{{"event_type":"{kind}"}}"#);
         assert!(matches!(
             decode(envelope(&text, &limits).unwrap()[0], &limits).unwrap(),
             Event::NonBook
         ));
+    }
+    for kind in ["new_market", "market_resolved"] {
+        let text =
+            format!(r#"{{"event_type":"{kind}","id":"0007","market":"condition-not-gamma"}}"#);
+        assert!(
+            matches!(decode(envelope(&text,&limits).unwrap()[0],&limits).unwrap(),
+            Event::Lifecycle { market_id:Some(id), adapter:None, .. } if id == "0007")
+        );
     }
     for text in [
         r#"{"event_type":"unknown"}"#,

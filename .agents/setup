@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Stable Rust for reproducible Linux baselines; no nightly features are required.
+if [[ ! -x "$HOME/.cargo/bin/rustup" ]]; then
+  installer=$(mktemp)
+  trap 'rm -f "$installer"' EXIT
+  curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o "$installer"
+  sh "$installer" -y --profile minimal --default-toolchain none
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+rustup toolchain install 1.93.0 --profile minimal --component rustfmt --component clippy
+rustup default 1.93.0
+cargo fetch --locked

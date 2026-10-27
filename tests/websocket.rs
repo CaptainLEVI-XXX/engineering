@@ -1,7 +1,7 @@
 use engineering_challenge::{
     discovery::{AdapterId, Instrument, MarketEntry, MarketKey, Snapshot},
     websocket::{
-        Assignments, Config, WorkerCommand,
+        Assignments, Config, RecoveryRequest, WorkerCommand,
         ingress::{self as output, Message as OutputMessage},
         run_worker,
     },
@@ -72,6 +72,60 @@ fn assignments_are_stable_atomic_version_scoped_and_capacity_checked() {
         &["E", "F", "G"],
     );
     assert!(a.reconcile(&state).is_err());
+}
+
+#[test]
+fn replicated_assignments_are_version_scoped_stable_and_physically_bounded() {
+    use std::collections::BTreeMap;
+    let mut state = Snapshot::default();
+    for adapter in [AdapterId::PolymarketV1, AdapterId::PolymarketV2] {
+        market(&mut state, "M", adapter, &["A", "B"]);
+        market(&mut state, "N", adapter, &["C"]);
+    }
+    let mut assignments = Assignments::with_replicas(3, 5, 2);
+    assignments.reconcile(&state).unwrap();
+    let rows = |a: &Assignments| -> BTreeMap<_, _> {
+        a.current()
+            .map(|row| {
+                (
+                    (row.market.adapter, row.market.id.clone(), row.slot),
+                    (row.worker, row.revision, row.assets.to_vec()),
+                )
+            })
+            .collect()
+    };
+    let before = rows(&assignments);
+    assert_eq!(before.len(), 8);
+    assert_eq!(assignments.assigned_assets(), 12);
+    for adapter in [AdapterId::PolymarketV1, AdapterId::PolymarketV2] {
+        assert_ne!(
+            before[&(adapter, "M".into(), 0)].0,
+            before[&(adapter, "M".into(), 1)].0
+        );
+        for slot in [0, 1] {
+            assert_eq!(
+                before[&(adapter, "M".into(), slot)].0,
+                before[&(adapter, "N".into(), slot)].0
+            );
+            assert_ne!(
+                before[&(AdapterId::PolymarketV1, "M".into(), slot)].0,
+                before[&(AdapterId::PolymarketV2, "M".into(), slot)].0
+            );
+        }
+    }
+    assert!(assignments.reconcile(&state).unwrap().is_empty());
+    assert_eq!(rows(&assignments), before);
+    // Four workers are full. One physical slot remains, but the new market
+    // needs two: failure must not admit its first replica or disturb old ones.
+    market(&mut state, "blocked", AdapterId::PolymarketV1, &["D"]);
+    let error = assignments
+        .reconcile(&state)
+        .err()
+        .expect("last slot must not allow a one-replica fallback")
+        .to_string();
+    assert!(error.contains("blocked") && error.contains("D"));
+    assert_eq!(rows(&assignments), before);
+    assert_eq!(assignments.assigned_assets(), 12);
 }
 
 fn config(endpoint: String) -> Arc<Config> {
@@ -181,7 +235,11 @@ async fn worker_preserves_history_across_dynamic_add_and_reconnect() {
     let mut requests = vec![];
     for message in messages {
         match message {
-            OutputMessage::Retired { .. } => panic!("worker cannot retire assignments"),
+            OutputMessage::ReconcileBegin { .. }
+            | OutputMessage::DesiredChunk { .. }
+            | OutputMessage::ReconcileComplete { .. } => {
+                panic!("worker cannot publish global desired fences")
+            }
             OutputMessage::Started(s) => {
                 assert!(ended);
                 assert_eq!(s.generation, generation + 1);
@@ -212,6 +270,11 @@ async fn worker_preserves_history_across_dynamic_add_and_reconnect() {
                 assert!(remove.is_empty());
                 requests.push((generation, add));
             }
+            OutputMessage::RequestsComplete { session } => {
+                assert!(!ended);
+                assert_eq!(session.generation, generation);
+                assert_eq!(session.slot, 0);
+            }
             OutputMessage::Ended { session, .. } => {
                 assert_eq!(session.generation, generation);
                 ended = true;
@@ -233,7 +296,7 @@ async fn full_output_fails_the_run_and_preserves_the_accepted_prefix() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let config = config(format!("ws://{}", listener.local_addr().unwrap()));
     let (_tx, commands) = mpsc::channel(8);
-    let (output, received) = output::channel(3, 1 << 20).unwrap();
+    let (output, received) = output::channel(4, 1 << 20).unwrap();
     let (stop, _) = watch::channel(false);
     let worker = tokio::spawn(run_worker(
         0,
@@ -260,14 +323,18 @@ async fn full_output_fails_the_run_and_preserves_the_accepted_prefix() {
     );
     assert!(*stop.borrow());
     let prefix: Vec<_> = received.try_iter().collect();
-    assert_eq!(prefix.len(), 3);
+    assert_eq!(prefix.len(), 4);
     assert!(matches!(prefix[0].message, OutputMessage::Started(_)));
     assert!(matches!(
         prefix[1].message,
         OutputMessage::SubscriptionsRequested { .. }
     ));
+    assert!(matches!(
+        prefix[2].message,
+        OutputMessage::RequestsComplete { .. }
+    ));
     assert!(
-        matches!(&prefix[2].message, OutputMessage::Data { ordinal: 1, payload, .. } if payload == &snapshot("A"))
+        matches!(&prefix[3].message, OutputMessage::Data { ordinal: 1, payload, .. } if payload == &snapshot("A"))
     );
 }
 
@@ -386,6 +453,7 @@ async fn transport_forwards_text_without_financial_decoding() {
         r#"{"event_type":"price_change","price_changes":[{"price":"invalid"}]}"#,
     ];
     let before = chrono::Utc::now();
+    let before_mono = std::time::Instant::now();
     for payload in payloads {
         ws.send(Message::Text(payload.into())).await.unwrap();
     }
@@ -414,6 +482,7 @@ async fn transport_forwards_text_without_financial_decoding() {
         .unwrap();
     peer.await.unwrap();
     let after = chrono::Utc::now();
+    let after_mono = std::time::Instant::now();
     let data: Vec<_> = received
         .try_iter()
         .filter_map(|e| match e.message {
@@ -421,17 +490,20 @@ async fn transport_forwards_text_without_financial_decoding() {
                 payload,
                 ordinal,
                 received_at,
+                received_mono,
                 ..
-            } => Some((payload, ordinal, received_at)),
+            } => Some((payload, ordinal, received_at, received_mono)),
             _ => None,
         })
         .collect();
     assert_eq!(data.len(), 2);
-    for (i, (payload, ordinal, received_at)) in data.iter().enumerate() {
+    for (i, (payload, ordinal, received_at, received_mono)) in data.iter().enumerate() {
         assert_eq!(payload.as_bytes(), payloads[i].as_bytes());
         assert_eq!(*ordinal, i as u64 + 1);
         assert!(*received_at >= before && *received_at <= after);
+        assert!(*received_mono >= before_mono && *received_mono <= after_mono);
     }
+    assert!(data.windows(2).all(|pair| pair[0].3 <= pair[1].3));
 }
 
 #[test]
@@ -440,6 +512,7 @@ fn byte_budget_and_closed_consumer_are_distinct_failures() {
         worker: 0,
         generation: 1,
         adapter: AdapterId::PolymarketV1,
+        slot: 0,
     };
     let (send, _receive) = output::channel(8, 1).unwrap();
     assert!(
@@ -462,6 +535,7 @@ fn byte_budget_and_closed_consumer_are_distinct_failures() {
         session,
         ordinal: 1,
         received_at: chrono::Utc::now(),
+        received_mono: std::time::Instant::now(),
         payload: "x".repeat(1500).into(),
     };
     send.send(frame()).unwrap();
@@ -795,8 +869,8 @@ async fn manager_retirement_precedes_unsubscribe_and_excludes_late_book_updates(
         loop {
             while let Ok(envelope) = received.try_recv() {
                 match &envelope.message {
-                    OutputMessage::Retired { assets, .. } => {
-                        assert_eq!(assets, &["A"]);
+                    OutputMessage::DesiredChunk { remove, .. } if !remove.is_empty() => {
+                        assert_eq!(remove, &["A"]);
                         retired = true;
                     }
                     OutputMessage::SubscriptionsRequested { remove, .. } if !remove.is_empty() => {
@@ -933,14 +1007,23 @@ async fn processor_recovery_rotates_only_the_target_generation() {
                     .process(&envelope.message, start.elapsed(), &mut |_| Ok(()))
                     .unwrap();
                 for session in processor.take_recovery() {
-                    recovery.try_send(session).unwrap();
+                    recovery
+                        .try_send(RecoveryRequest::Restart {
+                            session,
+                            planned: false,
+                        })
+                        .unwrap();
                 }
                 if processor.stats().snapshots == 2 && !obsolete_sent {
                     recovery
-                        .try_send(output::Session {
-                            worker: 0,
-                            generation: 1,
-                            adapter: AdapterId::PolymarketV1,
+                        .try_send(RecoveryRequest::Restart {
+                            session: output::Session {
+                                worker: 0,
+                                generation: 1,
+                                adapter: AdapterId::PolymarketV1,
+                                slot: 0,
+                            },
+                            planned: false,
                         })
                         .unwrap();
                     obsolete_sent = true;
@@ -1108,7 +1191,13 @@ async fn unsubscribe_batches_allow_incoming_messages_to_progress() {
         let report = worker.await.unwrap().unwrap();
         assert_eq!(report.sessions, 1);
         assert_eq!(report.messages, 3);
-        let tail: Vec<_> = received.try_iter().map(|e| e.message).collect();
+        let tail: Vec<_> = received.try_iter().filter_map(|e| match e.message {
+            OutputMessage::RequestsComplete { session } => {
+                assert_eq!(session.generation, 1);
+                None
+            }
+            message => Some(message),
+        }).collect();
         assert!(matches!(&tail[..], [OutputMessage::SubscriptionsRequested { remove, .. }, OutputMessage::Ended { reason, .. }]
             if remove == &vec![assets[511].clone()] && reason == "no assignments"));
     }).await.unwrap();
@@ -1184,6 +1273,9 @@ async fn stalled_unsubscribe_writes_end_on_timeout_or_shutdown() {
                             removed += remove.len();
                             last_progress = std::time::Instant::now();
                         }
+                        OutputMessage::RequestsComplete { session } => {
+                            assert_eq!(session.generation, 1);
+                        }
                         OutputMessage::Ended { session, reason } => {
                             assert_eq!(session.generation, 1);
                             break 'peer reason;
@@ -1199,11 +1291,13 @@ async fn stalled_unsubscribe_writes_end_on_timeout_or_shutdown() {
             };
             assert!(removed < 32767, "test failed to create backpressure");
             assert!(sent > accepted, "test failed to expose unread incoming traffic");
-            assert!(reason.contains("unsubscribe uncertain"), "{reason}");
             if shutdown {
-                assert!(reason.contains("shutdown"), "{reason}");
+                // Quiet TCP progress does not prove a send is pending: shutdown
+                // may land between batches. The io unit tests force a pending send.
+                assert!(matches!(reason.as_str(), "shutdown" | "unsubscribe uncertain: shutdown"), "{reason}");
                 assert!(cutoff.unwrap().elapsed() < Duration::from_secs(2));
             } else {
+                assert!(reason.contains("unsubscribe uncertain"), "{reason}");
                 assert!(reason.contains("socket write timeout"), "{reason}");
                 assert!(started.elapsed() < Duration::from_secs(3));
                 stop.send_replace(true);

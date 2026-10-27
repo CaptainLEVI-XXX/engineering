@@ -4,6 +4,34 @@
 
 ## Discovery and market identity
 
+### Optional lifecycle routing and replica evidence
+
+The extension path opts into `custom_feature_enabled` only with
+`--lifecycle-hints true`; its default is false. `new_market` and `market_resolved`
+are verification hints, never direct desired-state edits. Preserve the Gamma
+`id`; `market` is a condition ID and cannot substitute for it. Explicit `v1`/`v2`
+version evidence narrows verification; absent or unknown version requests both
+namespaces. The owner retains at most 1,024 deduplicated pending keys, counts
+overflow and requests a coalesced full reconciliation. Discovery keeps its own
+existing attempt/age limits. This bounds memory, not market-notification loss.
+Missing/malformed hint IDs do not invalidate financial books. BBO/trades/PONG do
+not refresh accepted L2 health activity. Global notification scope and added live
+traffic are still unmeasured.
+
+The local control ledger distinguishes reconciliation Begin/chunks/Complete,
+desired identities, successful subscription requests, selected snapshots,
+standby baselines, replica losses and selected unavailable intervals. Every row
+is tied to an owner input cutoff; Complete certifies accepted fences and command
+delivery only. Source-local removal is not global retirement. Same-generation
+remove/re-add remains unsafe; repairs fence intake, unsubscribe best-effort and
+establish fresh-generation baselines. No sequence or replay guarantee is inferred
+from a hash, equal quantity, recent arrival or exchange timestamp.
+
+The optional paired-feed latency probe lives outside production collection.
+[Its protocol](latency-research.md) describes bounded evidence, heuristic matching,
+ambiguous/censored windows and the approvals needed before actual treatments.
+No live result is supplied by local fixture tests.
+
 - Official discovery: https://docs.polymarket.com/market-data/discover-markets and https://docs.polymarket.com/concepts/markets-events
 - An **event** groups one or more **markets**; a binary market has two outcome positions, whose display labels need not be YES/NO (they can be team names). Preserve the API's outcome-to-ID mapping rather than inferring identity from labels. An event with many outcomes can group several binary markets. Do not confuse event ID, Gamma market ID, condition ID, and per-outcome WebSocket asset ID.
 - `GET /markets/keyset` supports cursor/keyset pagination; pass `next_cursor` as `after_cursor` while preserving *all* filters. Check page integrity, repeated cursors, errors, and version coverage. Explicitly request `version=v1` and `version=v2` if supported by the current API; omission may default to v1.
@@ -57,6 +85,42 @@ The ignored live probe and `--strict` require clean completed V1/V2 traversals, 
 
 Unknown verification is bounded to three rounds within five minutes and 1,024 retained jobs. Repeated observations do not extend a job; after expiry a new observation may create a fresh bounded job. Known desired subscriptions never expire merely because verification fails. See [architecture.md](architecture.md#discovery-and-reconciliation-protocol) for capacity, backoff, publication and overload contracts.
 
+### R0 discovery evidence format
+
+The optional `discovery --evidence NEW_FILE --evidence-max-bytes 536870912`
+journal records exact normalized identities without changing eligibility,
+retry budgets or strict acceptance. The path must not exist. Each JSONL row has
+`sequence`, `elapsed_us`, `observed_unix_us`, and an `event` object. Event kinds
+include listing `record` decisions, `verification_record` responses,
+`verification_result`, `verification_expired`, `verification_overflow`, every
+sweep's `scan` reports, and a final `report`. Final `snapshot_begin`, `desired`,
+`pending`, and `snapshot_end` rows export the owner's state before `complete`.
+Adapter namespaces and native strings are preserved, including leading zeros.
+
+Fold record decisions and later resolution outcomes to obtain the
+**latest-observed unresolved identities**, retaining historical errors separately.
+Expiry and overflow are not resolution. Final pending jobs alone omit expired
+unknown identities; anonymous records remain identifiable by stream sequence.
+This history does not certify exchange state at exit or atomic pagination.
+
+The journal uses a 64 KiB buffer and a hard byte cap; page/sweep boundaries and
+completion flush it. A partial row, missing terminal completion, or unsuccessful
+returned evidence status means incomplete evidence. Cap/write/flush errors stop
+the diagnostic intake and make the CLI fail. Evidence is exported before strict
+acceptance, so expected strict failures still retain their identities. A complete
+journal may describe failed discovery coverage. Flush is not durability.
+Synchronous filesystem stalls need an outer process watchdog; an interrupted
+export never certifies completion. This is discovery-only control-plane I/O,
+not market-update hot-path logging.
+
+The 2026-10-27 orb probe uses `--seconds 1770 --once --strict`, both explicit
+versions and no category filter, with a 1,800-second outer watchdog and 512 MiB
+evidence cap. It opens no WebSockets. `--once` completes initial scans and
+currently due verification, not all future retries. Live results and capacity
+limits are tracked in [revision-check.md](revision-check.md#r0-orb-baseline-2026-10-27).
+
+### Historical discovery measurements
+
 Validation on 2026-10-26: a 120-second release-mode strict live test **failed acceptance**, honestly: V1 read 279 pages / 27,900 records without reaching the end; V2 completed 2 pages / 132 records. The registry desired 55,868 assets, with 44 unresolved records / pending identities, no known-market uncertainty, identity conflicts, overflow or failed verification batches. This is observed progress, not complete market coverage. The disabled-market regression fails on the original implementation; deterministic tests also cover retry/age/capacity boundaries, duplicate hints, known-state preservation and final notifications. Deliberately weakening attempt/capacity limits or suppressing notifications makes the regressions fail.
 
 Control-plane measurement before the adapter-boundary refactor on this macOS ARM64 host, Rust `1.93.0-nightly (cc3eee7fb 2025-11-28)`, release profile: seven samples of 50,000 synthetic markets / 100,000 unique 77-digit asset IDs, pages of 100, same workload and expected count before/after the verification/publication fixes. Median total page ingestion: 124,133 → 125,174 µs; first full snapshot: 9,198 → 11,425 µs; cached snapshot requests: approximately 3 → 4 ns per call averaged over 10,000 requests. **No demonstrated throughput gain.** These runs do not establish a snapshot bottleneck under actual consumer demand. No persistent-map optimization is justified yet.
@@ -68,6 +132,57 @@ Later on 2026-10-26, a gzip-enabled release run completed both traversals in 694
 Gzip reduced one sampled response from 549,216 to 46,907 transferred bytes (about 91.5%). Identity/lifecycle fields and cursor matched; volatile metadata differed, so this is not a controlled latency benchmark. The retained gzip fixtures wrap the first reduced market fixture, with the oversized variant padded to 8 MiB + 1 decompressed byte; both use mtime=0. Local HTTP tests verify admission and rejection against the decompressed size limit.
 
 First publication measures process-local discovery time, not exchange listing-to-subscription delay; page-apply maximum is not a latency percentile. Completed pagination has been observed, but full coverage and low latency remain unproven. Preserve the original bounded retries and explicit upstream identity gaps; do not manufacture IDs or relax the strict coverage report.
+
+## R0 public delta fixture (2026-10-27 orb)
+
+The ignored `tests/live_collector.rs::bounded_public_fixture_probe` sampled
+the first two validated eligible markets in each version's fresh first page,
+at most four assets/version, one socket at a time, 90 seconds/version. It used
+the existing production worker and processor, an 8 MiB ingress budget, 32 MiB
+raw-data/20,000-message cap per version, no reconnect within the trial and a
+250-second outer watchdog. This is explicitly not a universe capture or a live
+SBE recording run. Final targeted Gamma reads bracket the sample using the
+registry's existing verification rules. Differences or failed reads make that
+sampling interval uncertain; unchanged endpoints cannot exclude intervening churn.
+
+- V1 markets `559651`, `559652`: 60 data messages, four initial snapshots,
+  118 applied changes, zero rejections. All four books were live/selected at
+  owner cutoff 62; final depths were 190, 190, 191 and 191 levels. No sampled
+  desired-state change or missing initialization was observed.
+- V2 markets `6182072`, `6182073`: one data message containing four empty
+  snapshots, no changes and zero rejections. All four books were initialized
+  at cutoff 3. **V2 delta evidence is still missing**; quiet empty books are
+  neither a decoder failure nor proof of fresh/live exchange activity.
+- The combined probe exited 101 because it requires genuine changes for both
+  versions. Preserve this failure; do not weaken the assertion or label empty
+  snapshots as delta coverage. Raw evidence and bracket reports are in
+  `.amp/in/artifacts/r0-fixtures-run/`.
+
+`tests/fixtures/polymarket-v1-trace.json` retains the first **32 contiguous data
+messages**, preserving original text, receive timestamps and ordinals. Its
+four snapshots and 62 level updates include ten zero deletions. It also retains
+independently generated expected records and final books: Python `Decimal`
+with precision 100, exact multiplication by 1,000,000, integer/range assertions,
+dictionary-based replacement/absolute assignment/zero deletion, bids descending
+and asks ascending. Exchange milliseconds become integer microseconds; receive
+nanoseconds truncate to the supplied format's microseconds. No production
+parser, book or encoder supplies expected financial values.
+
+The default `tests/recording.rs` regression replays the prefix through C3/C4/C5,
+compares every supplied-reader-decoded record (including identity, order, side,
+amounts and both timestamps) and all final levels. Start/request/end controls
+are synthetic replay scaffolding; the end marks the retained prefix cutoff,
+not an observed exchange outage. Existing synthetic tests cover unavailable
+intervals and selection separately. Replay does not establish live binary
+delivery or missing-history recovery.
+
+SHA-256 provenance:
+
+| File | SHA-256 |
+|---|---|
+| Full V1 raw journal | `43b607bbfae3826f4f74a35a9102ed7194b0ca157aeb8799950c1de58ef6b039` |
+| Full V2 raw journal | `3fc59a9600a0165001aeef987354cdf5b521589d7f1e7756aabc780488da4ebd` |
+| Retained V1 trace and independent expectations | `9fa48830ff8cad808f701671ad309c33c0fa3fff0892f508ea35d691813c1b7f` |
 
 ## Market WebSocket semantics
 

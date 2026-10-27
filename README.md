@@ -59,8 +59,34 @@ an OS write or guarantee the tail. Keep stderr draining in operational runs.
 Options (each requires a value): `--seconds`, `--gamma-url`, `--ws-url`,
 `--assets-per-socket` (1000), `--max-sockets` (1024),
 `--queue-items` (8192), `--queue-bytes` (67108864), `--transport-only` (false),
+`--replicas-per-market` (1 or 2, default 1), `--monitoring` (false),
+`--lifecycle-hints` (false),
 `--integrity-path` (required for recording). Socket/message/queue settings are
 collector safety budgets, **not verified exchange limits or a total RSS cap**.
+
+### Opt-in extensions and acceptance limits
+
+Two-replica mode uses independent worker generations and automatic, sticky source
+selection. A failover publishes a replacement snapshot before that source's
+deltas. The sidecar preserves desired reconciliation cutoffs, successful requests,
+standby initialization/loss, selected gaps and selection freshness evidence.
+Neither a replacement nor a recently received message proves missing history was
+recovered. The default remains one replica; monitoring and lifecycle hints are
+separate opt-ins. Monitoring uses accepted L2 activity, not PONG or trade counts.
+Guarded periodic renewal requires a usable peer and defers in single-source mode.
+
+**Do not enable full-universe redundancy from these defaults alone.** R0 observed
+556,974 desired assets, requiring 1,116 packed two-replica sockets, above the
+configured 1,024 limit. Discovery also retained 44 unresolved V1 identities.
+Capacity rejection names unadmitted identities rather than silently sampling.
+Current validation prioritizes small deterministic workloads; full-universe
+capacity, 30-minute live coverage and live latency research remain separate gates.
+See [the requirement/evidence ledger](docs/revision-check.md).
+
+`latency_probe` is an isolated, bounded two-feed research executable, not an
+automatic source-selection optimization. It requires explicit live approval and
+a fixed sample. See [the research protocol](docs/latency-research.md); no live
+performance improvement is claimed merely because the probe is implemented.
 
 ```sh
 cargo fmt --all -- --check

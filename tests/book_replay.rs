@@ -6,13 +6,14 @@ use engineering_challenge::{
     websocket::ingress::{Message, Session},
 };
 use serde_json::json;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn session(worker: usize) -> Session {
     Session {
         worker,
         generation: 1,
         adapter: AdapterId::PolymarketV1,
+        slot: u16::try_from(worker).unwrap(),
     }
 }
 fn sink(observation: Observation<'_>, trace: &mut Vec<String>) -> anyhow::Result<()> {
@@ -35,6 +36,7 @@ fn sink(observation: Observation<'_>, trace: &mut Vec<String>) -> anyhow::Result
             quantity.value()
         )),
         ObservationKind::Invalidated { .. } => trace.push(format!("invalid:{}", observation.asset)),
+        ObservationKind::StandbyBaseline => {}
     }
     Ok(())
 }
@@ -43,12 +45,12 @@ fn send(p: &mut Processor, m: Message, trace: &mut Vec<String>) {
         .unwrap();
 }
 fn subscribe(p: &mut Processor, s: Session, slot: u16, revision: u64, trace: &mut Vec<String>) {
+    assert_eq!(s.slot, slot);
     send(p, Message::Started(s), trace);
     send(
         p,
         Message::SubscriptionsRequested {
             session: s,
-            source_slot: slot,
             revisions: vec![revision, revision],
             add: vec!["A".into(), "B".into()],
             remove: vec![],
@@ -61,6 +63,7 @@ fn data(s: Session, n: u64, text: serde_json::Value) -> Message {
         session: s,
         ordinal: n,
         received_at: Utc.timestamp_opt(100, 0).unwrap(),
+        received_mono: Instant::now(),
         payload: text.to_string().into(),
     }
 }
@@ -326,7 +329,6 @@ fn invalid_snapshot_and_inactive_peer_have_different_failure_scopes() {
         &mut p,
         Message::SubscriptionsRequested {
             session: s,
-            source_slot: 0,
             revisions: vec![2],
             add: vec![],
             remove: vec!["B".into()],
@@ -403,5 +405,77 @@ fn replacement_budget_includes_old_and_new_books() {
             result.unwrap();
             assert_eq!(levels, vec![(300000, 7000000), (200000, 3000000)]);
         }
+    }
+}
+
+#[test]
+fn polymarket_normalization_remains_absolute_and_probability_scoped() {
+    use engineering_challenge::market_data::{self, Event, Limits, Price, QuantityChange};
+    let limits = Limits::default();
+    let raw = serde_json::value::RawValue::from_string(
+        json!({
+            "event_type":"price_change","timestamp":"42",
+            "price_changes":[change("A","0.4","5"),change("A","0.4","8")]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let Event::Changes {
+        exchange_us,
+        changes,
+    } = market_data::decode(&raw, &limits).unwrap()
+    else {
+        panic!("expected normalized changes")
+    };
+    assert_eq!(exchange_us, Some(42_000));
+    let absolute: Vec<_> = changes
+        .iter()
+        .map(|change| match change.quantity {
+            QuantityChange::Set(quantity) => quantity.value(),
+            QuantityChange::Add(_) => panic!("Polymarket absolute size became relative"),
+        })
+        .collect();
+    assert_eq!(absolute, vec![5_000_000, 8_000_000]);
+    assert_eq!(Price::new(2_000_000).unwrap().value(), 2_000_000);
+    assert!(Price::new(-1).is_err());
+    for invalid in [
+        book("A", json!([{"price":"1.000001","size":"7"}])),
+        json!({"event_type":"price_change","timestamp":"42","price_changes":[change("A","1.000001","7")]}),
+    ] {
+        let raw = serde_json::value::RawValue::from_string(invalid.to_string()).unwrap();
+        assert!(market_data::decode(&raw, &limits).is_err());
+    }
+}
+
+#[test]
+fn signed_polymarket_size_rejects_the_whole_event_without_partial_mutation() {
+    for signed in ["-2", "+3"] {
+        let mut p = Processor::new(Config::default()).unwrap();
+        let s = session(0);
+        let mut trace = vec![];
+        subscribe(&mut p, s, 0, 1, &mut trace);
+        send(
+            &mut p,
+            data(s, 1, book("A", json!([{"price":"0.4","size":"7"}]))),
+            &mut trace,
+        );
+        trace.clear();
+        send(
+            &mut p,
+            data(
+                s,
+                2,
+                json!({
+                    "event_type":"price_change","timestamp":"42",
+                    "price_changes":[change("A","0.4","5"),change("A","0.4",signed),change("A","0.4","8")]
+                }),
+            ),
+            &mut trace,
+        );
+        assert_eq!(trace, vec!["invalid:A"]);
+        let replica = p.replica(s.adapter, "A", 0).unwrap();
+        assert_eq!(replica.state, Validity::Stale);
+        assert_eq!(replica.book.best(Side::Buy).unwrap().1.value(), 7_000_000);
+        assert_eq!(p.stats().rejected, 1);
     }
 }

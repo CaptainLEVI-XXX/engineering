@@ -13,8 +13,124 @@ use engineering_challenge::{
 };
 use std::{
     io::{self, Write},
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+#[test]
+fn retained_public_deltas_round_trip_against_independent_decimal_expectations() {
+    use engineering_challenge::recording;
+    use serde_json::{Value, json};
+    // Raw contiguous message prefixes, with expectations calculated separately
+    // using Python Decimal, not the production decoder/book/encoder.
+    let adapter = AdapterId::PolymarketV1;
+    let fixture = include_str!("fixtures/polymarket-v1-trace.json");
+    let fixture: Value = serde_json::from_str(fixture).unwrap();
+    let session = Session {
+        adapter,
+        worker: 0,
+        generation: 1,
+        slot: 0,
+    };
+    let config = Config::default();
+    let (mut recorder, output) = recording::channel(recording::Config::default(), &config).unwrap();
+    let mut processor = Processor::new(config).unwrap();
+    let assets: Vec<String> = serde_json::from_value(fixture["assets"].clone()).unwrap();
+    for message in [
+        Message::Started(session),
+        Message::SubscriptionsRequested {
+            session,
+            revisions: vec![1; assets.len()],
+            add: assets,
+            remove: vec![],
+        },
+    ] {
+        processor
+            .process(&message, Duration::ZERO, &mut |o| recorder.observe(o))
+            .unwrap();
+    }
+    for row in fixture["messages"].as_array().unwrap() {
+        processor
+            .process(
+                &Message::Data {
+                    session,
+                    ordinal: row["ordinal"].as_u64().unwrap(),
+                    received_at: row["received_at"].as_str().unwrap().parse().unwrap(),
+                    received_mono: Instant::now(),
+                    payload: row["text"].as_str().unwrap().to_owned().into(),
+                },
+                Duration::from_micros(row["capture_elapsed_us"].as_u64().unwrap()),
+                &mut |o| recorder.observe(o),
+            )
+            .unwrap();
+    }
+    assert_eq!(processor.stats().rejected, 0);
+    for (asset, expected) in fixture["final_books"].as_object().unwrap() {
+        let replica = processor.replica(adapter, asset, 0).unwrap();
+        assert_eq!(
+            replica.state,
+            engineering_challenge::orderbook::Validity::Live
+        );
+        let levels = |side| {
+            replica
+                .book
+                .levels(side)
+                .map(|(p, q)| [p.value(), q.value()])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            json!({"bids":levels(Side::Buy),"asks":levels(Side::Sell)}),
+            *expected
+        );
+    }
+    let cutoff = fixture["messages"].as_array().unwrap().last().unwrap()["capture_elapsed_us"]
+        .as_u64()
+        .unwrap();
+    processor
+        .process(
+            &Message::Ended {
+                session,
+                reason: "fixture prefix cutoff".into(),
+            },
+            Duration::from_micros(cutoff),
+            &mut |o| recorder.observe(o),
+        )
+        .unwrap();
+    recorder.finish(processor.finish()).unwrap();
+    let archive = tempfile::NamedTempFile::new().unwrap();
+    let sidecar = tempfile::NamedTempFile::new().unwrap();
+    let (approve, approval) = crossbeam::channel::bounded(1);
+    approve.send(true).unwrap();
+    let report = output.run(
+        archive.reopen().unwrap(),
+        sidecar.reopen().unwrap(),
+        "public fixture",
+        || {},
+        approval,
+    );
+    assert!(report.error.is_none(), "{report:?}");
+    let mut reader = AlignedSbeReader::<OrderbookSchema>::open(archive.path()).unwrap();
+    let mut actual = vec![];
+    while let Some(message) = reader.read_msg().unwrap() {
+        actual.push(match message {
+                AnyMessage::Snapshot(s) => {
+                    let s = SnapshotDomain::try_from_decoder(s).unwrap();
+                    json!({"kind":"snapshot","symbol":s.symbol,"received_us":s.received_at.timestamp_micros(),
+                        "exchange_us":s.exchange_timestamp.timestamp_micros(),
+                        "bids":s.bids.iter().map(|l| [l.price_level,l.quantity]).collect::<Vec<_>>(),
+                        "asks":s.asks.iter().map(|l| [l.price_level,l.quantity]).collect::<Vec<_>>()})
+                }
+                AnyMessage::PriceLevelUpdate(l) => {
+                    let l = PriceLevelUpdateDomain::try_from_decoder(l).unwrap();
+                    json!({"kind":"level","symbol":l.symbol,"received_us":l.backtest_timestamp.timestamp_micros(),
+                        "exchange_us":l.exchange_timestamp.timestamp_micros(),"side":if l.side==Side::Buy {"BUY"} else {"SELL"},
+                        "price":l.price_level,"quantity":l.quantity})
+                }
+                _ => panic!("unexpected record"),
+            });
+    }
+    assert_eq!(json!(actual), fixture["expected"]);
+    assert_eq!(report.records_confirmed, actual.len() as u64);
+}
 
 #[test]
 fn borrowed_records_preserve_exact_fields_and_generated_wire_layout() {
@@ -24,13 +140,13 @@ fn borrowed_records_preserve_exact_fields_and_generated_wire_layout() {
         worker: 0,
         generation: 1,
         adapter: AdapterId::PolymarketV1,
+        slot: 0,
     };
     let mut p = Processor::new(Config::default()).unwrap();
     for message in [
         Message::Started(session),
         Message::SubscriptionsRequested {
             session,
-            source_slot: 0,
             revisions: vec![1],
             add: vec!["00123".into()],
             remove: vec![],
@@ -59,7 +175,7 @@ fn borrowed_records_preserve_exact_fields_and_generated_wire_layout() {
         }],
     };
     let mut bytes = vec![];
-    p.process(&Message::Data { session, ordinal: 1, received_at: received,
+    p.process(&Message::Data { session, ordinal: 1, received_at: received, received_mono: Instant::now(),
         payload: r#"{"event_type":"book","asset_id":"00123","timestamp":"42000","bids":[{"price":"0.1","size":"7"},{"price":"0.2","size":"3"}],"asks":[{"price":"0.8","size":"11"}]}"#.into(),
     }, Duration::ZERO, &mut |o| {
         if let ObservationKind::Snapshot { book, .. } = o.kind {
@@ -225,13 +341,14 @@ fn recorder_preserves_record_order_and_sidecar_provenance() {
         worker: 0,
         generation: 1,
         adapter: AdapterId::PolymarketV1,
+        slot: 0,
     };
     let mut processor = Processor::new(book_config).unwrap();
     for message in [
         Message::Started(session),
-        Message::SubscriptionsRequested { session, source_slot: 0, revisions: vec![1], add: vec!["00123".into()], remove: vec![] },
-        Message::Data { session, ordinal: 1, received_at: Utc.timestamp_opt(100, 0).unwrap(), payload: r#"{"event_type":"book","asset_id":"00123","timestamp":"42000","bids":[{"price":"0.2","size":"3"}],"asks":[]}"#.into() },
-        Message::Data { session, ordinal: 2, received_at: Utc.timestamp_opt(101, 0).unwrap(), payload: r#"{"event_type":"price_change","timestamp":"41000","price_changes":[{"asset_id":"00123","side":"BUY","price":"0.2","size":"3"},{"asset_id":"00123","side":"BUY","price":"0.2","size":"0"}]}"#.into() },
+        Message::SubscriptionsRequested { session, revisions: vec![1], add: vec!["00123".into()], remove: vec![] },
+        Message::Data { session, ordinal: 1, received_at: Utc.timestamp_opt(100, 0).unwrap(), received_mono: Instant::now(), payload: r#"{"event_type":"book","asset_id":"00123","timestamp":"42000","bids":[{"price":"0.2","size":"3"}],"asks":[]}"#.into() },
+        Message::Data { session, ordinal: 2, received_at: Utc.timestamp_opt(101, 0).unwrap(), received_mono: Instant::now(), payload: r#"{"event_type":"price_change","timestamp":"41000","price_changes":[{"asset_id":"00123","side":"BUY","price":"0.2","size":"3"},{"asset_id":"00123","side":"BUY","price":"0.2","size":"0"}]}"#.into() },
         Message::Ended { session, reason: "shutdown".into() },
     ] {
         processor.process(&message, Duration::ZERO, &mut |o| recorder.observe(o)).unwrap();
@@ -279,6 +396,7 @@ fn observed_level(quantity: i64) -> engineering_challenge::orderbook::Observatio
         worker: 0,
         generation: 1,
         adapter: AdapterId::PolymarketV1,
+        slot: 0,
     };
     Observation {
         asset: "00123",
@@ -286,7 +404,6 @@ fn observed_level(quantity: i64) -> engineering_challenge::orderbook::Observatio
         input: quantity as u64,
         binding: Binding {
             book: BookId(0),
-            slot: 0,
             revision: 1,
             session,
         },
@@ -476,11 +593,16 @@ fn selected_replicas_and_generated_snapshots_preserve_provenance_and_file_order(
         worker: 0,
         generation: 1,
         adapter: AdapterId::PolymarketV1,
+        slot: 0,
     };
-    let b = Session { worker: 1, ..a };
+    let b = Session {
+        worker: 1,
+        slot: 1,
+        ..a
+    };
     let received = Utc.timestamp_opt(100, 0).unwrap();
-    for (session, slot, q) in [(a, 0, 3), (b, 1, 8)] {
-        for m in [Message::Started(session), Message::SubscriptionsRequested {session, source_slot:slot, revisions:vec![1], add:vec!["A".into()],remove:vec![]}, Message::Data {session,ordinal:1,received_at:received,payload:format!(r#"{{"event_type":"book","asset_id":"A","timestamp":"42000","bids":[{{"price":"0.2","size":"{q}"}}],"asks":[]}}"#).into()}] {
+    for (session, q) in [(a, 3), (b, 8)] {
+        for m in [Message::Started(session), Message::SubscriptionsRequested {session, revisions:vec![1], add:vec!["A".into()],remove:vec![]}, Message::Data {session,ordinal:1,received_at:received,received_mono:Instant::now(),payload:format!(r#"{{"event_type":"book","asset_id":"A","timestamp":"42000","bids":[{{"price":"0.2","size":"{q}"}}],"asks":[]}}"#).into()}] {
             processor.process(&m,Duration::ZERO,&mut |o| recorder.observe(o)).unwrap();
         }
     }
@@ -504,7 +626,7 @@ fn selected_replicas_and_generated_snapshots_preserve_provenance_and_file_order(
             &mut |o| recorder.observe(o),
         )
         .unwrap();
-    processor.process(&Message::Data { session:b,ordinal:2,received_at:Utc.timestamp_opt(150,0).unwrap(),payload:r#"{"event_type":"price_change","timestamp":"41000","price_changes":[{"asset_id":"A","side":"BUY","price":"0.2","size":"9"}]}"#.into() }, Duration::from_secs(3), &mut |o| recorder.observe(o)).unwrap();
+    processor.process(&Message::Data { session:b,ordinal:2,received_at:Utc.timestamp_opt(150,0).unwrap(),received_mono:Instant::now(),payload:r#"{"event_type":"price_change","timestamp":"41000","price_changes":[{"asset_id":"A","side":"BUY","price":"0.2","size":"9"}]}"#.into() }, Duration::from_secs(3), &mut |o| recorder.observe(o)).unwrap();
     processor
         .capture_due(
             &mut || (Duration::from_secs(61), Utc.timestamp_opt(300, 0).unwrap()),
@@ -520,6 +642,38 @@ fn selected_replicas_and_generated_snapshots_preserve_provenance_and_file_order(
             Duration::from_secs(62),
             &mut |o| recorder.observe(o),
         )
+        .unwrap();
+    // Recovery restores state, not the missing interval. A pre-baseline delta
+    // and a post-retirement delta must produce no record or minute snapshot.
+    let recovered = Session { generation: 2, ..a };
+    for message in [
+        Message::Started(recovered),
+        Message::SubscriptionsRequested { session: recovered,
+            revisions: vec![1], add: vec!["A".into()], remove: vec![] },
+        Message::Data { session: recovered, ordinal: 1, received_at: received, received_mono: Instant::now(),
+            payload: r#"{"event_type":"price_change","timestamp":"40000","price_changes":[{"asset_id":"A","side":"BUY","price":"0.2","size":"99"}]}"#.into() },
+        Message::Data { session: recovered, ordinal: 2, received_at: received, received_mono: Instant::now(),
+            payload: r#"{"event_type":"book","asset_id":"A","timestamp":"40000","bids":[{"price":"0.2","size":"2"}],"asks":[]}"#.into() },
+        Message::Data { session: recovered, ordinal: 3, received_at: received, received_mono: Instant::now(),
+            payload: r#"{"event_type":"price_change","timestamp":"40000","price_changes":[{"asset_id":"A","side":"BUY","price":"0.2","size":"0"}]}"#.into() },
+        Message::ReconcileBegin { revision: 2, chunks: 1 },
+        Message::DesiredChunk { adapter: a.adapter, revision: 2, index: 0, add: vec![], remove: vec!["A".into()] },
+        Message::ReconcileComplete { revision: 2 },
+        Message::Data { session: recovered, ordinal: 4, received_at: received, received_mono: Instant::now(),
+            payload: r#"{"event_type":"price_change","timestamp":"40000","price_changes":[{"asset_id":"A","side":"BUY","price":"0.2","size":"333"}]}"#.into() },
+        Message::Ended { session: recovered, reason: "retired".into() },
+    ] {
+        processor.process(&message, Duration::from_secs(63), &mut |o| recorder.observe(o)).unwrap();
+        if matches!(message, Message::Data { ordinal: 2, .. }) {
+            // Existing policy is manual after switching slots; automatic
+            // candidate choice belongs to R3, not this baseline replay.
+            processor.select(a.adapter, "A", 0, Duration::from_secs(63), received, &mut |o| recorder.observe(o)).unwrap();
+        }
+    }
+    processor
+        .capture_due(&mut || (Duration::from_secs(124), received), &mut |o| {
+            recorder.observe(o)
+        })
         .unwrap();
     recorder.finish(processor.finish()).unwrap();
     let file = tempfile::NamedTempFile::new().unwrap();
@@ -540,30 +694,40 @@ fn selected_replicas_and_generated_snapshots_preserve_provenance_and_file_order(
         ("snapshot", 200, 42, 8_000_000),
         ("level", 150, 41, 9_000_000),
         ("snapshot", 300, 41, 9_000_000),
+        ("snapshot", 100, 40, 2_000_000),
+        ("level", 100, 40, 0),
     ] {
         match reader.read_msg().unwrap().unwrap() {
             AnyMessage::Snapshot(s) => {
                 assert_eq!(kind, "snapshot");
                 let s = SnapshotDomain::try_from_decoder(s).unwrap();
                 assert_eq!(
-                    (
-                        s.received_at.timestamp(),
-                        s.exchange_timestamp.timestamp(),
-                        s.bids[0].quantity
-                    ),
-                    (time, exchange, q)
+                    s,
+                    SnapshotDomain {
+                        symbol: "polymarket:v1:A".into(),
+                        received_at: Utc.timestamp_opt(time, 0).unwrap(),
+                        exchange_timestamp: Utc.timestamp_opt(exchange, 0).unwrap(),
+                        bids: vec![SnapshotBidsEntryDomain {
+                            price_level: 200_000,
+                            quantity: q
+                        }],
+                        asks: vec![],
+                    }
                 );
             }
             AnyMessage::PriceLevelUpdate(l) => {
                 assert_eq!(kind, "level");
                 let l = PriceLevelUpdateDomain::try_from_decoder(l).unwrap();
                 assert_eq!(
-                    (
-                        l.backtest_timestamp.timestamp(),
-                        l.exchange_timestamp.timestamp(),
-                        l.quantity
-                    ),
-                    (time, exchange, q)
+                    l,
+                    PriceLevelUpdateDomain {
+                        symbol: "polymarket:v1:A".into(),
+                        backtest_timestamp: Utc.timestamp_opt(time, 0).unwrap(),
+                        exchange_timestamp: Utc.timestamp_opt(exchange, 0).unwrap(),
+                        side: Side::Buy,
+                        price_level: 200_000,
+                        quantity: q,
+                    }
                 );
             }
             _ => panic!("wrong template"),
@@ -579,11 +743,30 @@ fn selected_replicas_and_generated_snapshots_preserve_provenance_and_file_order(
         .iter()
         .filter(|e| e["kind"] == "unavailable")
         .collect();
-    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps.len(), 2);
     assert_eq!(gaps[0]["binding"]["worker"], 1);
     assert_eq!(gaps[0]["next_ordinal"], 4);
-    assert_eq!(entries[3]["origin"], "periodic");
-    assert_eq!(entries[3]["due_us"], 61_000_000);
+    assert_eq!(gaps[1]["binding"]["worker"], 0);
+    assert_eq!(gaps[1]["binding"]["generation"], 2);
+    assert_eq!(gaps[1]["next_ordinal"], 6);
+    assert_eq!(gaps[1]["cause"], "retired");
+    let periodic: Vec<_> = entries
+        .iter()
+        .filter(|e| e["origin"] == "periodic")
+        .collect();
+    assert_eq!(periodic.len(), 1);
+    assert_eq!(periodic[0]["due_us"], 61_000_000);
+    let standby: Vec<_> = entries
+        .iter()
+        .filter(|e| e["kind"] == "standby_baseline")
+        .collect();
+    assert_eq!(standby.len(), 2);
+    assert_eq!(standby[0]["binding"]["worker"], 1);
+    assert_eq!(standby[1]["binding"]["generation"], 2);
+    assert!(entries.iter().any(|e| e["kind"] == "replica_unavailable"
+        && e["binding"]["worker"] == 0
+        && e["binding"]["generation"] == 1
+        && e["cause"] == "source_ended"));
 }
 
 #[test]

@@ -4,7 +4,7 @@ use engineering_challenge::{
     orderbook::{self, ObservationKind, Processor},
     recording,
     websocket::{
-        Config,
+        Config, RecoveryRequest,
         ingress::{self, Message, Session},
         run_manager,
     },
@@ -45,6 +45,7 @@ async fn run() -> Result<()> {
     let mut queue_items = 8192;
     let mut queue_bytes = 64 << 20;
     let mut transport_only = false;
+    let mut monitoring = false;
     let mut integrity_path = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -55,6 +56,9 @@ async fn run() -> Result<()> {
             "--ws-url" => config.endpoint = value,
             "--assets-per-socket" => config.assets_per_socket = value.parse()?,
             "--max-sockets" => config.max_sockets = value.parse()?,
+            "--replicas-per-market" => config.replicas_per_market = value.parse()?,
+            "--lifecycle-hints" => config.lifecycle_hints = value.parse()?,
+            "--monitoring" => monitoring = value.parse()?,
             "--queue-items" => queue_items = value.parse()?,
             "--queue-bytes" => queue_bytes = value.parse()?,
             "--transport-only" => transport_only = value.parse()?,
@@ -86,6 +90,12 @@ async fn run() -> Result<()> {
     let consumer_stop = stop.subscribe();
     let book_config = orderbook::Config {
         sessions: config.max_sockets,
+        selection: if config.replicas_per_market == 2 || monitoring {
+            orderbook::SelectionPolicy::Automatic
+        } else {
+            orderbook::SelectionPolicy::Manual
+        },
+        monitoring,
         snapshot_interval: (!transport_only).then_some(Duration::from_secs(60)),
         wire: engineering_challenge::market_data::Limits {
             message_bytes: config.max_message_bytes,
@@ -132,6 +142,8 @@ async fn run() -> Result<()> {
         Some(recorder)
     };
     let (consumer_send, mut consumer_receive) = oneshot::channel();
+    let hint_commands = config.lifecycle_hints.then(|| commands.clone());
+    let receive_origin = std::time::Instant::now();
     let consumer = std::thread::Builder::new()
         .name("market-data".into())
         .spawn(move || {
@@ -147,6 +159,8 @@ async fn run() -> Result<()> {
                     recovery_send,
                     consumer_stop,
                     recorder,
+                    hint_commands,
+                    receive_origin,
                 )
             };
             let _ = consumer_send.send(result);
@@ -299,7 +313,9 @@ fn validate_transport(receiver: crossbeam::channel::Receiver<ingress::Envelope>)
     let mut messages = 0;
     for envelope in receiver {
         match &envelope.message {
-            Message::Retired { .. } => {}
+            Message::ReconcileBegin { .. }
+            | Message::DesiredChunk { .. }
+            | Message::ReconcileComplete { .. } => {}
             Message::Started(session) => {
                 if let Some((previous, _, active)) = sessions.get(&session.worker) {
                     ensure!(
@@ -324,7 +340,8 @@ fn validate_transport(receiver: crossbeam::channel::Receiver<ingress::Envelope>)
                 *sequence = *ordinal;
                 messages += 1;
             }
-            Message::SubscriptionsRequested { session, .. } => {
+            Message::SubscriptionsRequested { session, .. }
+            | Message::RequestsComplete { session } => {
                 ensure!(
                     sessions
                         .get(&session.worker)
@@ -361,12 +378,25 @@ struct ConsumerReport {
 fn process_books(
     receiver: crossbeam::channel::Receiver<ingress::Envelope>,
     config: orderbook::Config,
-    recovery: mpsc::Sender<Session>,
+    recovery: mpsc::Sender<RecoveryRequest>,
     stop: watch::Receiver<bool>,
     mut recorder: Option<recording::Recorder>,
+    discovery: Option<mpsc::Sender<Command>>,
+    start: std::time::Instant,
 ) -> Result<ConsumerReport> {
-    let mut processor = Processor::new(config)?;
-    let start = std::time::Instant::now();
+    if let Some(recorder) = &mut recorder {
+        recorder.control(
+            0,
+            &serde_json::json!({"kind":"policy","selection":format!("{:?}",config.selection),
+            "monitoring":config.monitoring,"renewal_seconds":config.renewal_interval.as_secs(),
+            "health_revisit_seconds":10,"ingress_lag_budget_seconds":1,
+            "relative_zero_peer_min":5,"relative_rate_peer_min":20,"relative_percent":10,
+            "confirmation_seconds":10,"absolute_baseline_minutes":3,"absolute_low_minutes":2,
+            "initialization_seconds":config.initialization_timeout.as_secs(),
+            "coverage_escalation_seconds":config.recovery_timeout.as_secs()}),
+        )?;
+    }
+    let mut processor = Processor::with_receive_clock(config, start)?;
     let mut next_tick = Duration::ZERO;
     let mut invalidations = 0u64;
     let mut samples = Vec::new();
@@ -388,7 +418,8 @@ fn process_books(
                     wait = wait.min(due.saturating_sub(start.elapsed()));
                 }
             }
-            let mut sink = |observation: orderbook::Observation<'_>| {
+            let mut sink = |observation: orderbook::Observation<'_>,
+                            recorder: &mut Option<recording::Recorder>| {
                 if let ObservationKind::Invalidated { reason, .. } = observation.kind {
                     invalidations += 1;
                     if samples.len() < 4 {
@@ -398,30 +429,80 @@ fn process_books(
                         ));
                     }
                 }
-                if let Some(recorder) = &mut recorder {
+                if let Some(recorder) = recorder {
                     recorder.observe(observation)?;
                 }
                 Ok(())
             };
-            match receiver.recv_timeout(wait) {
-                Ok(envelope) => processor
-                    .process(&envelope.message, start.elapsed(), &mut sink)
-                    .context("C3/C4 processing failed; accepted tail incomplete")?,
-                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {}
+            let envelope = match receiver.recv_timeout(wait) {
+                Ok(envelope) => {
+                    processor
+                        .process(&envelope.message, start.elapsed(), &mut |o| {
+                            sink(o, &mut recorder)
+                        })
+                        .context("C3/C4 processing failed; accepted tail incomplete")?;
+                    Some(envelope)
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => None,
                 Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
+            };
+            if let Some(envelope) = envelope
+                && let Some(recorder) = &mut recorder
+            {
+                record_control(recorder, processor.input_cutoff(), &envelope.message)?;
             }
             if !*stop.borrow() {
-                processor.capture_due(&mut || (start.elapsed(), chrono::Utc::now()), &mut sink)?;
                 let now = start.elapsed();
                 if now >= next_tick {
                     processor.tick(now)?;
                     next_tick = now + Duration::from_millis(100);
                 }
-                for session in processor.take_recovery() {
-                    if let Err(error) = recovery.try_send(session)
-                        && !*stop.borrow()
-                    {
-                        return Err(error).context("book recovery channel full or closed; coverage and accepted tail incomplete");
+                processor.maintain(
+                    start.elapsed(),
+                    chrono::Utc::now(),
+                    receiver.is_empty(),
+                    &mut |o| sink(o, &mut recorder),
+                )?;
+                processor.capture_due(&mut || (start.elapsed(), chrono::Utc::now()), &mut |o| {
+                    sink(o, &mut recorder)
+                })?;
+                while let Some((session, planned)) = processor.pending_recovery() {
+                    match recovery.try_send(RecoveryRequest::Restart { session, planned }) {
+                        Ok(()) => processor.recovery_delivered(session),
+                        Err(mpsc::error::TrySendError::Full(_)) => break,
+                        Err(error) => return Err(error).context("book recovery channel closed"),
+                    }
+                }
+                let ready: Vec<_> = processor.initialized_sessions().collect();
+                for session in ready {
+                    match recovery.try_send(RecoveryRequest::Initialized(session)) {
+                        Ok(()) => processor.initialization_delivered(session),
+                        Err(mpsc::error::TrySendError::Full(_)) => break,
+                        Err(error) => return Err(error).context("book readiness channel closed"),
+                    }
+                }
+                if let Some(commands) = &discovery {
+                    for _ in 0..64 {
+                        let Some(key) = processor.pending_hint().cloned() else {
+                            break;
+                        };
+                        match commands.try_send(Command::Hint(key.clone())) {
+                            Ok(()) => processor.hint_delivered(&key),
+                            Err(mpsc::error::TrySendError::Full(_)) => break,
+                            Err(error) => {
+                                return Err(error).context("discovery hint channel closed");
+                            }
+                        }
+                    }
+                    if processor.reconciliation_hint() {
+                        match commands.try_send(Command::Reconcile) {
+                            Ok(()) => processor.reconciliation_hint_delivered(),
+                            Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(error) => {
+                                return Err(error)
+                                    .context("discovery reconciliation channel closed");
+                            }
+                        }
                     }
                 }
             }
@@ -433,7 +514,13 @@ fn process_books(
     })();
     let result = if let Some(mut recorder) = recorder {
         recorder.snapshot_stats(processor.stats());
-        recorder.finish(result)
+        let evidence = recorder.control(
+            processor.input_cutoff(),
+            &serde_json::json!({"kind":"owner_summary",
+            "stats":processor.stats(),"reconciliation":processor.reconciliation(),
+            "coverage_counts":"rolling owner samples, not full-universe acceptance"}),
+        );
+        recorder.finish(result.and(evidence))
     } else {
         result
     };
@@ -451,6 +538,36 @@ fn process_books(
     })
 }
 
+fn record_control(recorder: &mut recording::Recorder, input: u64, message: &Message) -> Result<()> {
+    use serde_json::json;
+    let session = |s: &Session| json!({"worker":s.worker,"slot":s.slot,"generation":s.generation,"adapter":s.adapter});
+    match message {
+        Message::Data {..} => {},
+        Message::DesiredChunk {adapter,revision,index,add,remove} => {
+            recorder.control(input,&json!({"kind":"desired_chunk","adapter":adapter,"revision":revision,
+                "chunk":index,"add_count":add.len(),"remove_count":remove.len()}))?;
+            for (action,ids) in [("add",add),("remove",remove)] {
+                for asset in ids {
+                    recorder.control(input,&json!({"kind":"desired","adapter":adapter,"revision":revision,
+                        "chunk":index,"action":action,"asset":asset}))?;
+                }
+            }
+        },
+        Message::SubscriptionsRequested {session:s,revisions,add,remove} => {
+            for (i,asset) in add.iter().chain(remove).enumerate() {
+                recorder.control(input,&json!({"kind":"requested","session":session(s),"revision":revisions[i],
+                    "action":if i<add.len() {"add"} else {"remove"},"asset":asset}))?;
+            }
+        },
+        Message::ReconcileBegin {revision,chunks} => recorder.control(input,&json!({"kind":"reconcile_begin","revision":revision,"chunks":chunks}))?,
+        Message::ReconcileComplete {revision} => recorder.control(input,&json!({"kind":"reconcile_complete","revision":revision}))?,
+        Message::Started(s) => recorder.control(input,&json!({"kind":"started","session":session(s)}))?,
+        Message::RequestsComplete {session:s} => recorder.control(input,&json!({"kind":"requests_complete","session":session(s)}))?,
+        Message::Ended {session:s,reason} => recorder.control(input,&json!({"kind":"ended","session":session(s),"reason":reason.chars().take(256).collect::<String>()}))?,
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,6 +581,7 @@ mod tests {
                 worker,
                 generation: 1,
                 adapter: engineering_challenge::discovery::AdapterId::PolymarketV1,
+                slot: 0,
             });
             for (session, assets) in [
                 (sessions[0], (0..50_000).map(|i| format!("A{i}")).collect()),
@@ -472,7 +590,6 @@ mod tests {
                 send.send(Message::Started(session)).unwrap();
                 send.send(Message::SubscriptionsRequested {
                     session,
-                    source_slot: 0,
                     revisions: vec![1; assets.len()],
                     add: assets,
                     remove: vec![],
@@ -481,6 +598,7 @@ mod tests {
             }
             send.send(Message::Data {
                 session: sessions[1], ordinal: 1, received_at: chrono::Utc::now(),
+                received_mono: std::time::Instant::now(),
                 payload: r#"{"event_type":"book","asset_id":"healthy","timestamp":"1","bids":[],"asks":[]}"#.into(),
             }).unwrap();
             send.send(Message::Ended {
@@ -491,6 +609,7 @@ mod tests {
             // Already accepted work for an independent source must survive the burst.
             send.send(Message::Data {
                 session: sessions[1], ordinal: 2, received_at: chrono::Utc::now(),
+                received_mono: std::time::Instant::now(),
                 payload: r#"{"event_type":"price_change","timestamp":"2","price_changes":[{"asset_id":"healthy","side":"BUY","price":"0.4","size":"7"}]}"#.into(),
             }).unwrap();
             send.send(Message::Ended {
@@ -507,6 +626,8 @@ mod tests {
                 recovery,
                 stopped,
                 None,
+                None,
+                std::time::Instant::now(),
             )
             .unwrap();
             assert_eq!(report.messages, 2);
@@ -569,18 +690,18 @@ mod tests {
                 worker: 0,
                 generation: 1,
                 adapter: engineering_challenge::discovery::AdapterId::PolymarketV1,
+                slot: 0,
             };
             let (send, receive) = ingress::channel(8, 1 << 20).unwrap();
             send.send(Message::Started(session)).unwrap();
             send.send(Message::SubscriptionsRequested {
                 session,
-                source_slot: 0,
                 revisions: vec![1],
                 add: vec!["A".into()],
                 remove: vec![],
             })
             .unwrap();
-            send.send(Message::Data {session,ordinal:1,received_at:chrono::Utc::now(),payload:r#"{"event_type":"book","asset_id":"A","timestamp":"1","bids":[{"price":"0.3","size":"bad"}],"asks":[]}"#.into()}).unwrap();
+            send.send(Message::Data {session,ordinal:1,received_at:chrono::Utc::now(),received_mono:std::time::Instant::now(),payload:r#"{"event_type":"book","asset_id":"A","timestamp":"1","bids":[{"price":"0.3","size":"bad"}],"asks":[]}"#.into()}).unwrap();
             send.send(Message::Ended {
                 session,
                 reason: "shutdown".into(),
@@ -589,7 +710,12 @@ mod tests {
             drop(send);
             let (recovery, mut requests) = mpsc::channel(1);
             if mode == "full" {
-                recovery.try_send(session).unwrap();
+                recovery
+                    .try_send(RecoveryRequest::Restart {
+                        session,
+                        planned: false,
+                    })
+                    .unwrap();
             }
             if mode == "closed" {
                 requests.close();
@@ -601,10 +727,14 @@ mod tests {
                 recovery,
                 stopped,
                 None,
+                None,
+                std::time::Instant::now(),
             );
-            if mode == "shutdown" {
+            if mode == "shutdown" || mode == "full" {
                 assert_eq!(result.unwrap().messages, 1);
-                assert!(requests.try_recv().is_err());
+                if mode == "shutdown" {
+                    assert!(requests.try_recv().is_err());
+                }
             } else {
                 let error = match result {
                     Err(error) => error,

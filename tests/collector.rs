@@ -17,6 +17,196 @@ use tokio::{
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 #[test]
+fn coverage_compares_exact_identities_at_owner_cutoffs_not_equal_totals() {
+    use engineering_challenge::{
+        discovery::{AdapterId, Instrument, MarketEntry, MarketKey, Snapshot},
+        orderbook::{self, Processor, Validity},
+        websocket::{
+            Assignments,
+            ingress::{Message as Input, Session},
+        },
+    };
+    use std::collections::BTreeSet;
+    let adapter = AdapterId::PolymarketV1;
+    let mut desired = Snapshot::default();
+    for id in ["A", "B", "C"] {
+        desired.markets.insert(
+            MarketKey {
+                adapter,
+                id: id.into(),
+            },
+            MarketEntry {
+                instruments: vec![Instrument {
+                    id: id.into(),
+                    label: id.into(),
+                }],
+                desired: true,
+                uncertainty: None,
+            },
+        );
+    }
+    let mut assignments = Assignments::new(2, 2);
+    assignments.reconcile(&desired).unwrap();
+    let session = Session {
+        adapter,
+        worker: 0,
+        generation: 1,
+        slot: 0,
+    };
+    let mut p = Processor::new(orderbook::Config::default()).unwrap();
+    for message in [
+        Input::Started(session),
+        Input::SubscriptionsRequested { session, revisions: vec![1; 3],
+            add: vec!["A".into(), "B".into(), "X".into()], remove: vec![] },
+        Input::Data { session, ordinal: 1, received_at: chrono::Utc::now(), received_mono: std::time::Instant::now(),
+            payload: r#"[{"event_type":"book","asset_id":"A","timestamp":"1","bids":[],"asks":[]},{"event_type":"book","asset_id":"X","timestamp":"1","bids":[],"asks":[]}]"#.into() },
+    ] {
+        p.process(&message, Duration::ZERO, &mut |_| Ok(())).unwrap();
+    }
+    let identities = |s: &Snapshot| -> BTreeSet<_> {
+        s.markets
+            .iter()
+            .filter(|(_, m)| m.desired)
+            .flat_map(|(k, m)| m.instruments.iter().map(|i| (k.adapter, i.id.clone())))
+            .collect()
+    };
+    let before = identities(&desired);
+    let requested: BTreeSet<_> = p
+        .requested()
+        .map(|(asset, binding)| (binding.session.adapter, asset.to_owned()))
+        .collect();
+    assert_eq!(before.len(), requested.len()); // A counts-only check would pass.
+    assert_eq!(
+        before.difference(&requested).cloned().collect::<Vec<_>>(),
+        vec![(adapter, "C".into())]
+    );
+    assert_eq!(
+        requested.difference(&before).cloned().collect::<Vec<_>>(),
+        vec![(adapter, "X".into())]
+    );
+    let rows: Vec<_> = p.coverage().collect();
+    assert!(
+        rows.iter()
+            .all(|r| r.input_cutoff == 3 && r.owner_time == Duration::ZERO)
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.selected && r.state == Validity::Live)
+            .map(|r| r.asset)
+            .collect::<Vec<_>>(),
+        vec!["A", "X"]
+    );
+    assert!(
+        !rows
+            .iter()
+            .find(|r| r.asset == "B")
+            .unwrap()
+            .initialization_overdue
+    );
+    for (ordinal, second, overdue) in [(2, 29, false), (3, 30, true)] {
+        p.process(
+            &Input::Data {
+                session,
+                ordinal,
+                received_at: chrono::Utc::now(),
+                received_mono: std::time::Instant::now(),
+                payload: "[]".into(),
+            },
+            Duration::from_secs(second),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            p.coverage()
+                .find(|r| r.asset == "B")
+                .unwrap()
+                .initialization_overdue,
+            overdue
+        );
+    }
+
+    desired
+        .markets
+        .get_mut(&MarketKey {
+            adapter,
+            id: "B".into(),
+        })
+        .unwrap()
+        .desired = false;
+    let after = identities(&desired);
+    // Bracket changes are unresolved sampling intervals, not atomic cross-owner state.
+    assert_eq!(
+        before
+            .symmetric_difference(&after)
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![(adapter, "B".into())]
+    );
+    let changes = assignments.reconcile(&desired).unwrap();
+    let removal = changes.iter().find(|c| c.remove == ["B"]).unwrap();
+    for message in [
+        Input::ReconcileBegin {
+            revision: removal.revision,
+            chunks: 1,
+        },
+        Input::DesiredChunk {
+            adapter,
+            revision: removal.revision,
+            index: 0,
+            add: vec![],
+            remove: removal.remove.clone(),
+        },
+        Input::ReconcileComplete {
+            revision: removal.revision,
+        },
+    ] {
+        p.process(&message, Duration::from_secs(31), &mut |_| Ok(()))
+            .unwrap();
+    }
+    let assigned: BTreeSet<_> = assignments
+        .current()
+        .flat_map(|a| {
+            a.assets
+                .iter()
+                .map(move |id| (a.market.adapter, id.clone()))
+        })
+        .collect();
+    assert_eq!(assigned, after);
+    assert!(assignments.current().all(|a| a.revision == 1)); // Unchanged assignments keep their admission revision.
+    let retired = p.coverage().find(|r| r.asset == "B").unwrap();
+    assert_eq!(retired.state, Validity::Inactive);
+    assert!(!retired.selected && !retired.initialization_overdue);
+    assert_eq!(retired.input_cutoff, 8);
+    assert_eq!(retired.owner_time, Duration::from_secs(31));
+    assert!(!p.requested().any(|(id, _)| id == "B"));
+    assert!(!after.contains(&(adapter, "B".into())));
+    let live: BTreeSet<_> = p
+        .coverage()
+        .filter(|r| r.state == Validity::Live)
+        .map(|r| (r.binding.session.adapter, r.asset.to_owned()))
+        .collect();
+    assert_eq!(
+        after.difference(&live).cloned().collect::<Vec<_>>(),
+        vec![(adapter, "C".into())]
+    );
+    assert_eq!(
+        live.difference(&after).cloned().collect::<Vec<_>>(),
+        vec![(adapter, "X".into())]
+    );
+    p.process(
+        &Input::Ended {
+            session,
+            reason: "cutoff".into(),
+        },
+        Duration::from_secs(32),
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(p.requested().count(), 0);
+    assert!(!p.coverage().any(|r| r.state == Validity::Live));
+}
+
+#[test]
 fn recording_rejects_missing_existing_and_uncreatable_integrity_paths() {
     let directory = tempfile::tempdir().unwrap();
     let existing = directory.path().join("existing.jsonl");
@@ -60,10 +250,14 @@ async fn collector_records_or_validates_and_bounds_stalled_output_shutdown() {
         "sigint",
         "books",
         "books-sigint",
+        "books-dual",
+        "books-dual-sigint",
         "books-blocked",
         "books-broken",
     ] {
         let books = mode.starts_with("books");
+        let dual = mode.contains("dual");
+        let sockets = if dual { 4 } else { 2 };
         let interrupt = mode.ends_with("sigint");
         let blocked = mode.ends_with("blocked");
         let broken = mode.ends_with("broken");
@@ -103,7 +297,7 @@ async fn collector_records_or_validates_and_bounds_stalled_output_shutdown() {
         let server_received = received_prefixes.clone();
         let ws_task = tokio::spawn(async move {
             let mut peers = tokio::task::JoinSet::new();
-            for _ in 0..2 {
+            for _ in 0..sockets {
                 let (socket, _) = ws.accept().await.unwrap();
                 let received = server_received.clone();
                 peers.spawn(async move {
@@ -161,8 +355,18 @@ async fn collector_records_or_validates_and_bounds_stalled_output_shutdown() {
                 "2",
                 "--transport-only",
                 if books { "false" } else { "true" },
+                "--replicas-per-market",
+                if dual { "2" } else { "1" },
+                "--monitoring",
+                if dual { "true" } else { "false" },
                 "--seconds",
-                if interrupt { "30" } else { "3" },
+                if interrupt {
+                    "30"
+                } else if dual {
+                    "5"
+                } else {
+                    "3"
+                },
             ])
             .stdout(if books && !blocked && !broken {
                 Stdio::from(std::fs::File::create(&archive).unwrap())
@@ -183,7 +387,7 @@ async fn collector_records_or_validates_and_bounds_stalled_output_shutdown() {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
             }
-            if interrupt && !interrupted && received_prefixes.load(Ordering::SeqCst) == 2 {
+            if interrupt && !interrupted && received_prefixes.load(Ordering::SeqCst) == sockets {
                 assert!(
                     Command::new("kill")
                         .args(["-INT", &child.id().to_string()])
@@ -265,9 +469,22 @@ async fn collector_records_or_validates_and_bounds_stalled_output_shutdown() {
             assert_eq!(last["success"], true);
             assert_eq!(last["output"]["records_confirmed"], 8);
             assert!(
-                diagnostics.contains("snapshots: 4, changes: 4, selected_changes: 4, rejected: 0"),
+                diagnostics.contains(if dual {
+                    "snapshots: 8, changes: 8, selected_changes: 4, rejected: 0"
+                } else {
+                    "snapshots: 4, changes: 4, selected_changes: 4, rejected: 0"
+                }),
                 "{diagnostics}"
             );
+            if dual {
+                assert_eq!(
+                    text.lines()
+                        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                        .filter(|row| row["kind"] == "standby_baseline")
+                        .count(),
+                    4
+                );
+            }
         } else {
             assert!(
                 diagnostics.contains("transport validation only"),
@@ -275,9 +492,12 @@ async fn collector_records_or_validates_and_bounds_stalled_output_shutdown() {
             );
         }
         assert!(
-            diagnostics.contains("requested_at_cutoff=4"),
+            diagnostics.contains(&format!("requested_at_cutoff={}", sockets * 2)),
             "{diagnostics}"
         );
-        assert!(diagnostics.contains("drained_messages=4"), "{diagnostics}");
+        assert!(
+            diagnostics.contains(&format!("drained_messages={}", sockets * 2)),
+            "{diagnostics}"
+        );
     }
 }

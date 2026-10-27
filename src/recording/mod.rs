@@ -2,7 +2,6 @@
 pub mod encode;
 mod output;
 use crate::{
-    discovery::AdapterId,
     orderbook::{self, Binding, Observation, ObservationKind, SnapshotOrigin},
     util::dtos::SbeEncode,
 };
@@ -227,15 +226,6 @@ impl Recorder {
     }
     fn observe_inner(&mut self, o: Observation<'_>) -> Result<()> {
         ensure!(self.failed.is_none(), "recorder already failed");
-        if matches!(
-            o.kind,
-            ObservationKind::Invalidated {
-                output_binding: None,
-                ..
-            }
-        ) {
-            return Ok(());
-        }
         let id = o.binding.book.0 as usize;
         ensure!(id < self.max_symbols, "symbol cache budget exceeded");
         if id >= self.symbols.len() {
@@ -245,10 +235,7 @@ impl Recorder {
             }
             self.symbols.resize_with(id + 1, || None);
         }
-        let prefix = match o.adapter {
-            AdapterId::PolymarketV1 => "polymarket:v1:",
-            AdapterId::PolymarketV2 => "polymarket:v2:",
-        };
+        let prefix = o.adapter.namespace();
         let symbol = self.symbols[id].get_or_insert_with(|| format!("{prefix}{}", o.asset));
         ensure!(
             symbol.strip_prefix(prefix) == Some(o.asset),
@@ -256,11 +243,17 @@ impl Recorder {
         );
         // Prepare metadata only for snapshots/gaps; level updates allocate no JSON or symbol.
         let (size, metadata) = match &o.kind {
+            ObservationKind::StandbyBaseline => (
+                0,
+                Some(json!({"kind":"standby_baseline",
+                "input":o.input,"next_ordinal":self.ordinal,"symbol":symbol,"binding":binding(o.binding),
+                "source_ordinal":o.metadata.map(|m| m.cursor.ordinal),"source_event":o.metadata.map(|m| m.cursor.event)})),
+            ),
             ObservationKind::Snapshot { book, origin } => {
                 let m = o.metadata.context("snapshot has no source metadata")?;
                 let (name, at, due) = match origin {
                     SnapshotOrigin::Exchange => ("exchange", m.received_at, None),
-                    SnapshotOrigin::Selection { at } => ("selection", *at, None),
+                    SnapshotOrigin::Selection { at, .. } => ("selection", *at, None),
                     SnapshotOrigin::Periodic { at, due } => {
                         ("periodic", *at, Some(due.as_micros()))
                     }
@@ -271,10 +264,21 @@ impl Recorder {
                     received_at: at,
                     exchange_us: m.exchange_us.context("missing exchange time")?,
                 };
+                let selection = match origin {
+                    SnapshotOrigin::Selection {
+                        previous,
+                        reason,
+                        freshness,
+                        receive_age,
+                        ..
+                    } => Some(json!({"previous":previous.map(binding),"reason":reason,
+                            "freshness":freshness,"receive_age_us":receive_age.map(|age| age.as_micros())})),
+                    _ => None,
+                };
                 (
                     record.encoded_length_with_header()?,
                     Some(
-                        json!({"kind":"snapshot", "ordinal":self.ordinal, "symbol":symbol, "binding":binding(o.binding), "origin":name, "input":o.input, "source_ordinal":m.cursor.ordinal, "source_event":m.cursor.event, "source_entry":m.cursor.entry, "received_us":at.timestamp_micros(), "source_received_us":m.received_at.timestamp_micros(), "exchange_us":m.exchange_us, "due_us":due}),
+                        json!({"kind":"snapshot", "ordinal":self.ordinal, "symbol":symbol, "binding":binding(o.binding), "origin":name, "selection":selection, "input":o.input, "source_ordinal":m.cursor.ordinal, "source_event":m.cursor.event, "source_entry":m.cursor.entry, "received_us":at.timestamp_micros(), "source_received_us":m.received_at.timestamp_micros(), "exchange_us":m.exchange_us, "due_us":due}),
                     ),
                 )
             }
@@ -286,7 +290,7 @@ impl Recorder {
             } => (
                 0,
                 Some(
-                    json!({"kind":"unavailable", "next_ordinal":self.ordinal, "symbol":symbol, "binding":binding(output_binding.unwrap()), "input":o.input, "cause":cause, "reason":reason.chars().take(128).collect::<String>(), "detected_us":chrono::Utc::now().timestamp_micros()}),
+                    json!({"kind":if output_binding.is_some() {"unavailable"} else {"replica_unavailable"}, "next_ordinal":self.ordinal, "symbol":symbol, "binding":binding(output_binding.unwrap_or(o.binding)), "input":o.input, "cause":cause, "reason":reason.chars().take(128).collect::<String>(), "detected_us":chrono::Utc::now().timestamp_micros()}),
                 ),
             ),
         };
@@ -325,9 +329,8 @@ impl Recorder {
                     let m = o.metadata.context("snapshot metadata absent")?;
                     let at = match origin {
                         SnapshotOrigin::Exchange => m.received_at,
-                        SnapshotOrigin::Selection { at } | SnapshotOrigin::Periodic { at, .. } => {
-                            at
-                        }
+                        SnapshotOrigin::Selection { at, .. }
+                        | SnapshotOrigin::Periodic { at, .. } => at,
                     };
                     encode::SnapshotRecord {
                         book,
@@ -353,7 +356,7 @@ impl Recorder {
                     }
                     .encode(target)?
                 }
-                ObservationKind::Invalidated { .. } => 0,
+                ObservationKind::Invalidated { .. } | ObservationKind::StandbyBaseline => 0,
             };
             ensure!(encoded == size, "record length mismatch");
             let n = if let Some(value) = &metadata {
@@ -396,6 +399,46 @@ impl Recorder {
         self.max_snapshot_lateness_us = stats.max_snapshot_lateness.as_micros();
         self.snapshots_due_at_cutoff = stats.snapshots_due_at_cutoff;
     }
+    /// Ordered, bounded control provenance. It never writes binary stdout or
+    /// advances the financial record ordinal.
+    pub fn control(&mut self, input: u64, value: &Value) -> Result<()> {
+        self.input = input;
+        let result = (|| {
+            self.reserve(INTEGRITY_BYTES, 1)?;
+            let batch = self.current.as_mut().unwrap();
+            let start = batch.bytes.len();
+            batch.bytes.resize(start + INTEGRITY_BYTES, 0);
+            let encoded = json_line(
+                &mut batch.bytes[start..],
+                &json!({
+                    "kind":"control", "input":input,"next_ordinal":self.ordinal,"event":value
+                }),
+            );
+            match encoded {
+                Ok(len) => {
+                    batch.bytes.truncate(start + len);
+                    batch.entries.push(Entry {
+                        end: start + len,
+                        kind: Kind::Integrity,
+                    });
+                }
+                Err(error) => {
+                    batch.bytes.truncate(start);
+                    return Err(error);
+                }
+            }
+            if batch.bytes.len() >= self.config.publish_bytes
+                || batch.entries.len() == self.config.entries
+            {
+                self.publish()?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.failed.get_or_insert(input);
+        }
+        result
+    }
     /// Success here is handoff only; `Output::run` establishes physical completion.
     pub fn finish(mut self, input_result: Result<()>) -> Result<()> {
         let publication = self.publish();
@@ -432,7 +475,7 @@ impl Recorder {
     }
 }
 fn binding(b: Binding) -> Value {
-    json!({"book":b.book.0, "slot":b.slot, "revision":b.revision, "worker":b.session.worker, "generation":b.session.generation, "adapter":format!("{:?}", b.session.adapter)})
+    json!({"book":b.book.0, "slot":b.session.slot, "revision":b.revision, "worker":b.session.worker, "generation":b.session.generation, "adapter":format!("{:?}", b.session.adapter)})
 }
 fn json_line(buffer: &mut [u8], value: &impl serde::Serialize) -> Result<usize> {
     let mut cursor = std::io::Cursor::new(buffer);

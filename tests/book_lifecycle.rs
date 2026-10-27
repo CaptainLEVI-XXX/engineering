@@ -1,22 +1,23 @@
 use chrono::{TimeZone, Utc};
 use engineering_challenge::{
     discovery::AdapterId,
-    orderbook::{Config, ObservationKind, Processor, Validity},
+    orderbook::{Config, ObservationKind, Processor, SelectionPolicy, Validity},
     websocket::ingress::{Message, Session},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn session(worker: usize, generation: u64) -> Session {
     Session {
         worker,
         generation,
         adapter: AdapterId::PolymarketV1,
+        slot: 0,
     }
 }
 fn request(session: Session, slot: u16, revision: u64, add: bool) -> Message {
+    assert_eq!(session.slot, slot);
     Message::SubscriptionsRequested {
         session,
-        source_slot: slot,
         revisions: vec![revision],
         add: if add { vec!["A".into()] } else { vec![] },
         remove: if add { vec![] } else { vec!["A".into()] },
@@ -36,12 +37,35 @@ fn data(session: Session, ordinal: u64, snapshot: bool, quantity: &str) -> Messa
         session,
         ordinal,
         received_at: Utc.timestamp_opt(100, 0).unwrap(),
+        received_mono: Instant::now(),
         payload: payload.into(),
     }
 }
 fn apply(p: &mut Processor, message: Message, seconds: u64) {
     p.process(&message, Duration::from_secs(seconds), &mut |_| Ok(()))
         .unwrap();
+}
+
+fn reconciliation(
+    adapter: AdapterId,
+    revision: u64,
+    add: &[&str],
+    remove: &[&str],
+) -> [Message; 3] {
+    [
+        Message::ReconcileBegin {
+            revision,
+            chunks: 1,
+        },
+        Message::DesiredChunk {
+            adapter,
+            revision,
+            index: 0,
+            add: add.iter().map(|s| (*s).to_owned()).collect(),
+            remove: remove.iter().map(|s| (*s).to_owned()).collect(),
+        },
+        Message::ReconcileComplete { revision },
+    ]
 }
 
 #[test]
@@ -160,15 +184,21 @@ fn retirement_cutoff_preserves_exact_history_across_all_valid_interleavings() {
             ("level", b, 19_000_000),
         ]);
         for actor in &schedule {
+            if *actor == 2 {
+                // Ordered global retirement precedes the new admission fence;
+                // both complete before either worker's next scheduled operation.
+                for message in reconciliation(a.adapter, 2, &[], &["A"])
+                    .into_iter()
+                    .chain(reconciliation(a.adapter, 3, &["A"], &[]))
+                {
+                    producers[2].send(message).unwrap();
+                }
+                continue;
+            }
             let message = match actor {
                 0 => old.next().unwrap(),
                 1 => new.next().unwrap(),
-                _ => Message::Retired {
-                    worker: a.worker,
-                    adapter: a.adapter,
-                    revision: 2,
-                    assets: vec!["A".into()],
-                },
+                _ => unreachable!(),
             };
             producers[*actor].send(message).unwrap();
         }
@@ -179,7 +209,7 @@ fn retirement_cutoff_preserves_exact_history_across_all_valid_interleavings() {
             p.process(&envelope.message, Duration::ZERO, &mut |o| {
                 assert_eq!(o.asset, "A");
                 assert_eq!(o.adapter, a.adapter);
-                assert_eq!(o.binding.slot, 0);
+                assert_eq!(o.binding.session.slot, 0);
                 let value = match o.kind {
                     ObservationKind::Snapshot { book, .. } => (
                         "snapshot",
@@ -198,6 +228,7 @@ fn retirement_cutoff_preserves_exact_history_across_all_valid_interleavings() {
                         ("level", quantity.value())
                     }
                     ObservationKind::Invalidated { .. } => ("invalid", 0),
+                    ObservationKind::StandbyBaseline => return Ok(()),
                 };
                 observed.push((value.0, o.binding.session, value.1));
                 Ok(())
@@ -234,8 +265,8 @@ fn retirement_cutoff_preserves_exact_history_across_all_valid_interleavings() {
 #[test]
 fn initialization_retries_and_deadlines_survive_reconnect_and_duplicate_requests() {
     let config = Config {
-        initialization_timeout: Duration::from_secs(2),
-        recovery_timeout: Duration::from_secs(9),
+        initialization_timeout: Duration::from_secs(10),
+        recovery_timeout: Duration::from_secs(120),
         recovery_attempts: 2,
         ..Config::default()
     };
@@ -245,52 +276,66 @@ fn initialization_retries_and_deadlines_survive_reconnect_and_duplicate_requests
     apply(&mut p, request(a, 0, 1, true), 0);
     apply(&mut p, data(a, 1, false, "8"), 1);
     assert!(p.replica(a.adapter, "A", 0).unwrap().book.is_empty());
-    p.tick(Duration::from_secs(2)).unwrap();
-    assert_eq!(p.take_recovery(), vec![a]);
-    apply(&mut p, request(a, 0, 1, true), 3);
-    p.tick(Duration::from_secs(3)).unwrap();
-    assert!(p.take_recovery().is_empty());
-    apply(
-        &mut p,
-        Message::Ended {
-            session: a,
-            reason: "restart".into(),
-        },
-        3,
-    );
-    let b = session(0, 2);
-    apply(&mut p, Message::Started(b), 4);
-    apply(&mut p, request(b, 0, 1, true), 4);
-    p.tick(Duration::from_secs(6)).unwrap();
-    assert_eq!(p.take_recovery(), vec![b]);
-    apply(
-        &mut p,
-        Message::Ended {
-            session: b,
-            reason: "restart".into(),
-        },
-        6,
-    );
-    let c = session(0, 3);
-    apply(&mut p, Message::Started(c), 6);
-    apply(&mut p, request(c, 0, 1, true), 6);
+    let mut current = a;
+    let mut repairs = vec![];
+    for second in 1..=360 {
+        if second % 3 == 0 {
+            apply(&mut p, request(current, 0, 1, true), second);
+        }
+        p.tick(Duration::from_secs(second)).unwrap();
+        let pending = p.take_recovery();
+        assert!(pending.len() <= 1, "one outstanding repair per session");
+        if !pending.is_empty() {
+            assert_eq!(pending, vec![current]);
+            repairs.push(second);
+            apply(
+                &mut p,
+                Message::Ended {
+                    session: current,
+                    reason: "repair".into(),
+                },
+                second,
+            );
+            current.generation += 1;
+            apply(&mut p, Message::Started(current), second);
+            apply(&mut p, request(current, 0, 1, true), second);
+        }
+        if second >= 130 {
+            assert_eq!(p.stats().coverage_overdue, 1);
+            assert_eq!(p.stats().degraded_replicas, 1);
+        }
+    }
+    // Allow the bounded policy sweep's ten-second scheduling granularity,
+    // without treating the 120-second coverage escalation as process failure.
     assert!(
-        p.tick(Duration::from_secs(8))
-            .unwrap_err()
-            .to_string()
-            .contains("attempts")
+        (3..=5).contains(&repairs.len()),
+        "unexpected retry schedule: {repairs:?}"
     );
+    for pair in repairs[2..].windows(2) {
+        assert!(
+            pair[1] - pair[0] >= 60,
+            "duplicate requests reset cooldown: {repairs:?}"
+        );
+    }
+    if repairs.len() >= 5 {
+        assert!(repairs[4] - repairs[3] >= 120);
+    }
+    assert!(p.stats().max_unavailable_age >= Duration::from_secs(350));
 
-    let mut p = Processor::new(config).unwrap();
+    let mut p = Processor::new(Config {
+        initialization_timeout: Duration::from_secs(2),
+        recovery_timeout: Duration::from_secs(9),
+        ..config
+    })
+    .unwrap();
     apply(&mut p, Message::Started(a), 0);
     apply(&mut p, request(a, 0, 1, true), 0);
     apply(&mut p, data(a, 1, false, "bad"), 8);
-    assert!(
-        p.tick(Duration::from_secs(9))
-            .unwrap_err()
-            .to_string()
-            .contains("deadline")
-    );
+    p.tick(Duration::from_secs(9)).unwrap();
+    assert_eq!(p.stats().coverage_overdue, 1);
+    assert_eq!(p.stats().degraded_replicas, 1);
+    assert_eq!(p.stats().max_unavailable_age, Duration::from_secs(9));
+    assert_ne!(p.replica(a.adapter, "A", 0).unwrap().state, Validity::Live);
 }
 
 #[test]
@@ -303,8 +348,10 @@ fn selection_requires_live_baseline_and_equal_books_still_create_boundary() {
             let metadata = o.metadata.unwrap();
             assert_eq!(metadata.exchange_us, Some(10000));
             assert_eq!(metadata.received_at, Utc.timestamp_opt(100, 0).unwrap());
-            if let engineering_challenge::orderbook::SnapshotOrigin::Selection { at: selected_at } =
-                origin
+            if let engineering_challenge::orderbook::SnapshotOrigin::Selection {
+                at: selected_at,
+                ..
+            } = origin
             {
                 assert_eq!(selected_at, at);
                 assert_eq!(o.input, 8);
@@ -313,7 +360,12 @@ fn selection_requires_live_baseline_and_equal_books_still_create_boundary() {
         }
         Ok(())
     };
-    for (slot, s) in [(0, session(0, 1)), (1, session(1, 1))] {
+    let a = session(0, 1);
+    let b = Session {
+        slot: 1,
+        ..session(1, 1)
+    };
+    for (slot, s) in [(0, a), (1, b)] {
         p.process(&Message::Started(s), Duration::ZERO, &mut sink)
             .unwrap();
         p.process(&request(s, slot, 1, true), Duration::ZERO, &mut sink)
@@ -330,7 +382,7 @@ fn selection_requires_live_baseline_and_equal_books_still_create_boundary() {
         )
         .is_err()
     );
-    for s in [session(0, 1), session(1, 1)] {
+    for s in [a, b] {
         p.process(&data(s, 1, true, "17"), Duration::ZERO, &mut sink)
             .unwrap();
     }
@@ -366,16 +418,12 @@ fn selection_requires_live_baseline_and_equal_books_still_create_boundary() {
         .is_err()
     );
     let mut quantities = vec![];
-    p.process(
-        &data(session(1, 1), 2, false, "19"),
-        Duration::from_secs(1),
-        &mut |o| {
-            if let ObservationKind::Level { quantity, .. } = o.kind {
-                quantities.push(quantity.value());
-            }
-            Ok(())
-        },
-    )
+    p.process(&data(b, 2, false, "19"), Duration::from_secs(1), &mut |o| {
+        if let ObservationKind::Level { quantity, .. } = o.kind {
+            quantities.push(quantity.value());
+        }
+        Ok(())
+    })
     .unwrap();
     assert_eq!(quantities, vec![19000000]);
 }
@@ -394,16 +442,9 @@ fn retirement_while_disconnected_cancels_coverage_recovery() {
         },
         1,
     );
-    apply(
-        &mut p,
-        Message::Retired {
-            worker: 0,
-            adapter: s.adapter,
-            revision: 2,
-            assets: vec!["A".into()],
-        },
-        2,
-    );
+    for message in reconciliation(s.adapter, 2, &[], &["A"]) {
+        apply(&mut p, message, 2);
+    }
     p.tick(Duration::from_secs(200)).unwrap();
     assert_eq!(
         p.replica(s.adapter, "A", 0).unwrap().state,
@@ -421,7 +462,10 @@ fn periodic_capture_uses_selected_live_state_and_actual_deadlines() {
     })
     .unwrap();
     let a = session(0, 1);
-    let b = session(1, 1);
+    let b = Session {
+        slot: 1,
+        ..session(1, 1)
+    };
     for (s, slot) in [(a, 0), (b, 1)] {
         apply(&mut p, Message::Started(s), 0);
         apply(&mut p, request(s, slot, 1, true), 0);
@@ -485,6 +529,504 @@ fn periodic_capture_uses_selected_live_state_and_actual_deadlines() {
 }
 
 #[test]
+fn retirement_fences_late_slots_and_requires_new_baselines_after_readmission() {
+    for disconnect_first in [false, true] {
+        let mut p = Processor::new(Config {
+            selection: SelectionPolicy::Automatic,
+            snapshot_interval: Some(Duration::from_secs(60)),
+            ..Config::default()
+        })
+        .unwrap();
+        let a = session(0, 1);
+        let b = Session {
+            slot: 1,
+            ..session(1, 1)
+        };
+        for message in reconciliation(a.adapter, 1, &["A"], &[]) {
+            apply(&mut p, message, 0);
+        }
+        for s in [a, b] {
+            apply(&mut p, Message::Started(s), 0);
+        }
+        apply(&mut p, request(a, 0, 1, true), 0);
+        apply(&mut p, data(a, 1, true, "3"), 0);
+        if disconnect_first {
+            apply(&mut p, request(b, 1, 1, true), 0);
+            apply(&mut p, data(b, 1, true, "7"), 0);
+            for s in [a, b] {
+                apply(
+                    &mut p,
+                    Message::Ended {
+                        session: s,
+                        reason: "disconnected".into(),
+                    },
+                    0,
+                );
+            }
+        }
+        for message in reconciliation(a.adapter, 2, &[], &["A"]) {
+            apply(&mut p, message, 0);
+        }
+        let fresh = if disconnect_first {
+            let fresh = Session { generation: 2, ..b };
+            apply(&mut p, Message::Started(fresh), 0);
+            fresh
+        } else {
+            b
+        };
+        apply(&mut p, request(fresh, 1, 1, true), 0);
+        assert!(
+            p.replica(a.adapter, "A", 1)
+                .is_none_or(|r| r.state == Validity::Inactive)
+        );
+        assert_eq!(
+            p.replica(a.adapter, "A", 0).unwrap().state,
+            Validity::Inactive
+        );
+        assert_eq!(p.next_snapshot_due(), None);
+        assert!(p.take_recovery().is_empty());
+        for message in reconciliation(a.adapter, 3, &["A"], &[]) {
+            apply(&mut p, message, 0);
+        }
+        // An old request remains inadmissible even after desired state returns.
+        apply(&mut p, request(fresh, 1, 1, true), 0);
+        assert!(
+            p.replica(a.adapter, "A", 1)
+                .is_none_or(|r| r.state != Validity::Live)
+        );
+        apply(&mut p, request(fresh, 1, 3, true), 0);
+        apply(&mut p, data(fresh, 1, false, "99"), 0);
+        assert_eq!(
+            p.replica(a.adapter, "A", 1).unwrap().state,
+            Validity::AwaitingSnapshot
+        );
+        assert!(p.replica(a.adapter, "A", 1).unwrap().book.is_empty());
+        apply(&mut p, data(fresh, 2, true, "11"), 0);
+        let replica = p.replica(a.adapter, "A", 1).unwrap();
+        assert_eq!(replica.binding.revision, 3);
+        assert_eq!(replica.state, Validity::Live);
+        assert_eq!(
+            replica
+                .book
+                .best(engineering_challenge::Side::Buy)
+                .unwrap()
+                .1
+                .value(),
+            11_000_000
+        );
+    }
+}
+
+#[test]
+fn reconciliation_rejects_invalid_boundaries_and_retains_accepted_cutoffs() {
+    let adapter = AdapterId::PolymarketV1;
+    let chunk = || Message::DesiredChunk {
+        adapter,
+        revision: 1,
+        index: 0,
+        add: vec!["A".into()],
+        remove: vec![],
+    };
+    let mut empty = Processor::new(Config::default()).unwrap();
+    apply(
+        &mut empty,
+        Message::ReconcileBegin {
+            revision: 1,
+            chunks: 0,
+        },
+        0,
+    );
+    apply(&mut empty, Message::ReconcileComplete { revision: 1 }, 0);
+    assert!(empty.reconciliation().complete);
+    empty.finish().unwrap();
+    for invalid in [
+        chunk(),
+        Message::DesiredChunk {
+            adapter,
+            revision: 1,
+            index: 2,
+            add: vec![],
+            remove: vec![],
+        },
+        Message::ReconcileComplete { revision: 1 },
+        Message::ReconcileComplete { revision: 2 },
+        Message::ReconcileBegin {
+            revision: 2,
+            chunks: 0,
+        },
+    ] {
+        let mut p = Processor::new(Config::default()).unwrap();
+        apply(
+            &mut p,
+            Message::ReconcileBegin {
+                revision: 1,
+                chunks: 2,
+            },
+            0,
+        );
+        apply(&mut p, chunk(), 0);
+        assert_eq!(p.reconciliation().accepted_chunks, 1);
+        assert!(!p.reconciliation().complete);
+        assert!(
+            p.finish().is_err(),
+            "missing final boundary must remain incomplete"
+        );
+        assert!(
+            p.process(&invalid, Duration::ZERO, &mut |_| Ok(()))
+                .is_err()
+        );
+        assert_eq!(p.reconciliation().accepted_chunks, 1);
+        assert!(!p.reconciliation().complete);
+    }
+}
+
+#[test]
+fn automatic_failover_publishes_latest_snapshot_before_any_standby_delta() {
+    for defer in [false, true] {
+        let mut p = Processor::new(Config {
+            selection: SelectionPolicy::Automatic,
+            ..Config::default()
+        })
+        .unwrap();
+        let a = session(0, 1);
+        let b = Session {
+            slot: 1,
+            ..session(1, 1)
+        };
+        let mut trace = vec![];
+        let mut record = |o: engineering_challenge::orderbook::Observation<'_>| {
+            match o.kind {
+                ObservationKind::Snapshot { book, .. } => trace.push(format!(
+                    "snapshot:{}:{}",
+                    o.binding.session.slot,
+                    book.best(engineering_challenge::Side::Buy)
+                        .unwrap()
+                        .1
+                        .value()
+                )),
+                ObservationKind::Level { quantity, .. } => trace.push(format!(
+                    "delta:{}:{}",
+                    o.binding.session.slot,
+                    quantity.value()
+                )),
+                ObservationKind::Invalidated {
+                    output_binding: Some(_),
+                    ..
+                } => trace.push(format!("unavailable:{}", o.binding.session.slot)),
+                ObservationKind::Invalidated {
+                    output_binding: None,
+                    ..
+                } => {}
+                ObservationKind::StandbyBaseline => {}
+            }
+            Ok(())
+        };
+        for message in [
+            Message::Started(a),
+            request(a, 0, 1, true),
+            Message::Started(b),
+            request(b, 1, 1, true),
+            data(a, 1, true, "3"),
+            data(b, 1, true, "7"),
+            Message::Ended {
+                session: a,
+                reason: "lost selected source".into(),
+            },
+        ] {
+            p.process(&message, Duration::ZERO, &mut record).unwrap();
+        }
+        if defer {
+            p.process(&data(b, 2, false, "9"), Duration::ZERO, &mut record)
+                .unwrap();
+        }
+        p.maintain(
+            Duration::ZERO,
+            Utc.timestamp_opt(101, 0).unwrap(),
+            true,
+            &mut record,
+        )
+        .unwrap();
+        if !defer {
+            p.process(&data(b, 2, false, "9"), Duration::ZERO, &mut record)
+                .unwrap();
+        }
+        // Recovered slot zero must not steal selection back from the live peer.
+        let recovered = Session { generation: 2, ..a };
+        for message in [
+            Message::Started(recovered),
+            request(recovered, 0, 1, true),
+            data(recovered, 1, true, "20"),
+            data(recovered, 2, false, "21"),
+        ] {
+            p.process(&message, Duration::ZERO, &mut record).unwrap();
+        }
+        p.maintain(
+            Duration::ZERO,
+            Utc.timestamp_opt(102, 0).unwrap(),
+            true,
+            &mut record,
+        )
+        .unwrap();
+        p.process(&data(b, 3, false, "5"), Duration::ZERO, &mut record)
+            .unwrap();
+        let mut expected = vec!["snapshot:0:3000000", "unavailable:0"];
+        if defer {
+            expected.push("snapshot:1:9000000");
+        } else {
+            expected.extend(["snapshot:1:7000000", "delta:1:9000000"]);
+        }
+        expected.push("delta:1:5000000");
+        assert_eq!(trace, expected);
+    }
+}
+
+#[test]
+fn automatic_startup_from_slot_one_preserves_snapshot_then_delta_in_one_frame() {
+    let mut p = Processor::new(Config {
+        selection: SelectionPolicy::Automatic,
+        ..Config::default()
+    })
+    .unwrap();
+    let s = Session {
+        slot: 1,
+        ..session(1, 1)
+    };
+    apply(&mut p, Message::Started(s), 0);
+    apply(&mut p, request(s, 1, 1, true), 0);
+    let Message::Data {
+        payload: baseline, ..
+    } = data(s, 1, true, "7")
+    else {
+        unreachable!()
+    };
+    let Message::Data { payload: delta, .. } = data(s, 1, false, "5") else {
+        unreachable!()
+    };
+    let mut frame = data(s, 1, true, "7");
+    let Message::Data { payload, .. } = &mut frame else {
+        unreachable!()
+    };
+    *payload = format!("[{baseline},{delta}]").into();
+    let mut trace = vec![];
+    p.process(&frame, Duration::ZERO, &mut |o| {
+        assert_eq!(o.binding.session.slot, 1);
+        match o.kind {
+            ObservationKind::Snapshot { book, .. } => trace.push((
+                "snapshot",
+                book.best(engineering_challenge::Side::Buy)
+                    .unwrap()
+                    .1
+                    .value(),
+            )),
+            ObservationKind::Level { quantity, .. } => trace.push(("delta", quantity.value())),
+            ObservationKind::Invalidated { .. } => panic!("valid startup frame invalidated"),
+            ObservationKind::StandbyBaseline => panic!("first valid snapshot must select slot one"),
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(trace, vec![("snapshot", 7_000_000), ("delta", 5_000_000)]);
+}
+
+#[test]
+fn failed_automatic_switch_sink_is_terminal() {
+    let mut p = Processor::new(Config {
+        selection: SelectionPolicy::Automatic,
+        ..Config::default()
+    })
+    .unwrap();
+    let a = session(0, 1);
+    let b = Session {
+        slot: 1,
+        ..session(1, 1)
+    };
+    for message in [
+        Message::Started(a),
+        request(a, 0, 1, true),
+        Message::Started(b),
+        request(b, 1, 1, true),
+        data(a, 1, true, "3"),
+        data(b, 1, true, "7"),
+        Message::Ended {
+            session: a,
+            reason: "lost".into(),
+        },
+    ] {
+        apply(&mut p, message, 0);
+    }
+    let mut attempted = 0;
+    assert!(
+        p.maintain(Duration::ZERO, Utc::now(), true, &mut |o| {
+            assert!(matches!(o.kind, ObservationKind::Snapshot { .. }));
+            assert_eq!(o.binding.session, b);
+            attempted += 1;
+            anyhow::bail!("synthetic output failure")
+        })
+        .is_err()
+    );
+    assert_eq!(attempted, 1);
+    assert!(
+        p.process(&data(b, 2, false, "9"), Duration::ZERO, &mut |_| panic!(
+            "delta published after failed switch"
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn quiet_selected_book_continues_when_standby_is_overdue() {
+    let mut p = Processor::new(Config {
+        selection: SelectionPolicy::Automatic,
+        ..Config::default()
+    })
+    .unwrap();
+    let a = session(0, 1);
+    let b = Session {
+        slot: 1,
+        ..session(1, 1)
+    };
+    for message in [
+        Message::Started(a),
+        request(a, 0, 1, true),
+        Message::Started(b),
+        request(b, 1, 1, true),
+        data(a, 1, true, "7"),
+    ] {
+        apply(&mut p, message, 0);
+    }
+    for second in 1..=130 {
+        p.tick(Duration::from_secs(second)).unwrap();
+        assert!(p.take_recovery().iter().all(|s| *s == b));
+    }
+    assert_eq!(p.stats().coverage_overdue, 0);
+    assert_eq!(p.stats().selected_live, 1);
+    assert_eq!(p.stats().degraded_replicas, 1);
+    let mut quantities = vec![];
+    p.process(
+        &data(a, 2, false, "2"),
+        Duration::from_secs(131),
+        &mut |o| {
+            if let ObservationKind::Level { quantity, .. } = o.kind {
+                quantities.push(quantity.value());
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(quantities, vec![2_000_000]);
+}
+
+#[test]
+fn unknown_freshness_fallback_is_explicit_but_invalid_or_ended_backups_are_ineligible() {
+    use engineering_challenge::orderbook::{Freshness, SnapshotOrigin, SwitchReason};
+    for backup in ["quiet", "invalid", "ended"] {
+        let mut p = Processor::new(Config {
+            selection: SelectionPolicy::Automatic,
+            ..Config::default()
+        })
+        .unwrap();
+        let a = session(0, 1);
+        let b = Session {
+            slot: 1,
+            ..session(1, 1)
+        };
+        for message in [
+            Message::Started(a),
+            request(a, 0, 1, true),
+            Message::Started(b),
+            request(b, 1, 1, true),
+            data(a, 1, true, "3"),
+            data(b, 1, true, "7"),
+        ] {
+            apply(&mut p, message, 0);
+        }
+        if backup == "invalid" {
+            apply(&mut p, data(b, 2, false, "bad"), 0);
+        }
+        if backup == "ended" {
+            apply(
+                &mut p,
+                Message::Ended {
+                    session: b,
+                    reason: "standby ended".into(),
+                },
+                0,
+            );
+        }
+        apply(
+            &mut p,
+            Message::Ended {
+                session: a,
+                reason: "selected ended".into(),
+            },
+            0,
+        );
+        let mut snapshots = 0;
+        p.maintain(
+            Duration::from_secs(20),
+            Utc.timestamp_opt(120, 0).unwrap(),
+            true,
+            &mut |o| {
+                let ObservationKind::Snapshot {
+                    origin:
+                        SnapshotOrigin::Selection {
+                            previous,
+                            reason,
+                            freshness,
+                            receive_age,
+                            ..
+                        },
+                    ..
+                } = o.kind
+                else {
+                    panic!("unexpected policy observation")
+                };
+                assert_eq!(backup, "quiet");
+                assert_eq!(o.binding.session, b);
+                assert_eq!(previous.unwrap().session, a);
+                assert!(matches!(reason, SwitchReason::SourceUnavailable));
+                assert!(matches!(freshness, Freshness::Unknown));
+                assert_eq!(receive_age, Some(Duration::from_secs(20)));
+                snapshots += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(snapshots, usize::from(backup == "quiet"));
+    }
+}
+
+#[test]
+fn deferred_recovery_is_deduplicated_expires_and_is_cancelled_by_retirement() {
+    for retire in [false, true] {
+        let mut p = Processor::new(Config::default()).unwrap();
+        let s = session(0, 1);
+        for message in [
+            Message::Started(s),
+            request(s, 0, 1, true),
+            data(s, 1, false, "bad"),
+        ] {
+            apply(&mut p, message, 0);
+        }
+        for second in [1, 10, 20, 29] {
+            apply(&mut p, request(s, 0, 1, true), second);
+            p.tick(Duration::from_secs(second)).unwrap();
+            assert_eq!(p.pending_recovery(), Some((s, false)));
+        }
+        if retire {
+            for message in reconciliation(s.adapter, 2, &[], &["A"]) {
+                apply(&mut p, message, 29);
+            }
+            p.tick(Duration::from_secs(60)).unwrap();
+            assert!(p.pending_recovery().is_none());
+        } else {
+            let error = p.tick(Duration::from_secs(30)).unwrap_err();
+            assert!(error.to_string().contains("recovery delivery deadline"));
+        }
+    }
+}
+
+#[test]
 fn periodic_sink_failure_and_missed_interval_are_terminal() {
     for sink_failure in [false, true] {
         let mut p = Processor::new(Config {
@@ -521,7 +1063,6 @@ fn periodic_sweeps_are_fair_and_replacement_and_retirement_cancel_old_deadlines(
         Message::Started(s),
         Message::SubscriptionsRequested {
             session: s,
-            source_slot: 0,
             revisions: vec![1; 130],
             add: assets.clone(),
             remove: vec![],
@@ -535,6 +1076,7 @@ fn periodic_sweeps_are_fair_and_replacement_and_retirement_cancel_old_deadlines(
             session: s,
             ordinal: 1,
             received_at: Utc::now(),
+            received_mono: Instant::now(),
             payload: frame.into(),
         },
         Duration::ZERO,
@@ -547,6 +1089,7 @@ fn periodic_sweeps_are_fair_and_replacement_and_retirement_cancel_old_deadlines(
             session: s,
             ordinal: 2,
             received_at: Utc::now(),
+            received_mono: Instant::now(),
             payload:
                 r#"{"event_type":"book","asset_id":"A0","timestamp":"40","bids":[],"asks":[]}"#
                     .into(),
@@ -555,17 +1098,10 @@ fn periodic_sweeps_are_fair_and_replacement_and_retirement_cancel_old_deadlines(
         &mut |_| Ok(()),
     )
     .unwrap();
-    p.process(
-        &Message::Retired {
-            worker: 0,
-            adapter: s.adapter,
-            revision: 2,
-            assets: vec!["A1".into()],
-        },
-        Duration::from_secs(59),
-        &mut |_| Ok(()),
-    )
-    .unwrap();
+    for message in reconciliation(s.adapter, 2, &[], &["A1"]) {
+        p.process(&message, Duration::from_secs(59), &mut |_| Ok(()))
+            .unwrap();
+    }
     let mut captures = vec![];
     for want in [64, 128] {
         p.capture_due(&mut || (Duration::from_secs(60), Utc::now()), &mut |o| {

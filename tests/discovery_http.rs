@@ -37,11 +37,19 @@ fn encoded_server(
     replies: Vec<EncodedReply>,
     gate: Option<(usize, std::sync::mpsc::Receiver<()>)>,
 ) -> (String, thread::JoinHandle<()>) {
+    encoded_server_with_budget(replies, gate, Duration::from_secs(15))
+}
+
+fn encoded_server_with_budget(
+    replies: Vec<EncodedReply>,
+    gate: Option<(usize, std::sync::mpsc::Receiver<()>)>,
+    budget: Duration,
+) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/markets/keyset", listener.local_addr().unwrap());
     listener.set_nonblocking(true).unwrap();
     let handle = thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + budget;
         for (index, (query_parts, status, body, headers)) in replies.into_iter().enumerate() {
             let mut socket = loop {
                 match listener.accept() {
@@ -206,6 +214,216 @@ async fn uncertain_record_triggers_closed_any_lookup_and_does_not_block_other_ma
 }
 
 #[tokio::test]
+async fn evidence_preserves_scan_errors_and_verified_recovery_with_exact_final_identities() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("discovery.jsonl");
+    let mut v1 = market(0);
+    v1["id"] = json!("same-native-id");
+    v1["clobTokenIds"] = json!("[\"00123\",\"456\"]");
+    let mut malformed = v1.clone();
+    malformed["active"] = Value::Null;
+    let mut v2 = market(1);
+    v2["id"] = json!("same-native-id");
+    v2["positionIds"] = json!(["00123", "789"]);
+    let (url, server) = server(vec![
+        (
+            vec!["version=v1", "closed=false"],
+            200,
+            json!({"markets":[malformed]}),
+        ),
+        (
+            vec!["version=v1", "closed=any", "id=same-native-id"],
+            200,
+            json!({"markets":[v1]}),
+        ),
+        (
+            vec!["version=v2", "closed=false"],
+            200,
+            json!({"markets":[v2]}),
+        ),
+    ]);
+    let (mut discovery, _commands, _changes) = Discovery::new(Gamma::new(&url).unwrap());
+    discovery.enable_evidence(&path, 1024 * 1024).unwrap();
+    let report = discovery.run_for(Duration::from_secs(10), true).await;
+    server.join().unwrap();
+    assert!(!report.coverage_accepted());
+    assert!(report.evidence.as_ref().unwrap().complete);
+    let rows: Vec<Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let events: Vec<_> = rows.iter().map(|row| &row["event"]).collect();
+    assert!(events.iter().any(|e| e["kind"] == "record"
+        && e["resolved"] == false
+        && e["adapter"] == "polymarket_v1"
+        && e["record"]["Err"]["market_id"] == "same-native-id"));
+    assert!(events.iter().any(|e| e["kind"] == "verification_result"
+        && e["resolved"] == true
+        && e["key"] == json!({"adapter":"polymarket_v1", "id":"same-native-id"})));
+    let scans: Vec<_> = events.iter().filter(|e| e["kind"] == "scan").collect();
+    assert_eq!(scans.len(), 2);
+    assert_eq!(scans[0]["report"]["unresolved_records"], 1);
+    let mut desired: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "desired")
+        .map(|e| {
+            (
+                e["key"].clone(),
+                e["entry"]["instruments"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| i["id"].clone())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    desired.sort_by_key(|(key, _)| key["adapter"].as_str().unwrap().to_owned());
+    assert_eq!(
+        desired,
+        vec![
+            (
+                json!({"adapter":"polymarket_v1", "id":"same-native-id"}),
+                vec![json!("00123"), json!("456")]
+            ),
+            (
+                json!({"adapter":"polymarket_v2", "id":"same-native-id"}),
+                vec![json!("00123"), json!("789")]
+            ),
+        ]
+    );
+    assert!(!events.iter().any(|e| e["kind"] == "pending"));
+    assert_eq!(events.last().unwrap()["kind"], "complete");
+    let before = std::fs::read(&path).unwrap();
+    assert!(discovery.enable_evidence(&path, 1024 * 1024).is_err());
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn evidence_cap_stops_intake_and_does_not_claim_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("capped.jsonl");
+    let (url, server) = server(vec![(
+        vec!["version=v1"],
+        200,
+        json!({"markets":[market(0)]}),
+    )]);
+    let (mut discovery, _commands, _changes) = Discovery::new(Gamma::new(&url).unwrap());
+    discovery.enable_evidence(&path, 512).unwrap();
+    let report = discovery.run_for(Duration::from_secs(10), true).await;
+    server.join().unwrap();
+    let status = report.evidence.unwrap();
+    assert!(!status.complete);
+    assert!(status.error.unwrap().contains("byte cap"));
+    assert!(report.stopped);
+    assert_eq!(report.listing_requests, 1);
+    assert_eq!(report.desired_assets, 2);
+    assert!(std::fs::metadata(&path).unwrap().len() <= 512);
+    let prefix = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !prefix
+            .lines()
+            .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+            .any(|row| row["event"]["kind"] == "complete")
+    );
+    let (mut other, _commands, _changes) =
+        Discovery::new(Gamma::new("http://127.0.0.1:1").unwrap());
+    assert!(other.enable_evidence(&path, 4096).is_err());
+    assert_eq!(std::fs::read_to_string(path).unwrap(), prefix);
+}
+
+#[test]
+fn discovery_cli_reports_evidence_creation_failure_without_stdout_or_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("existing.jsonl");
+    std::fs::write(&path, b"independent existing evidence\n").unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_discovery"))
+        .args(["--seconds", "1", "--once", "--strict", "--evidence"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("cannot enable discovery evidence")
+    );
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        b"independent existing evidence\n"
+    );
+    // Failure happens before the run loop can issue any public HTTP request.
+}
+
+#[tokio::test]
+async fn evidence_keeps_each_sweep_not_only_the_last_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sweeps.jsonl");
+    let (url, server) = encoded_server_with_budget(
+        vec![
+            (vec!["version=v1"], 422, b"{}".to_vec(), ""),
+            (
+                vec!["version=v2"],
+                200,
+                json!({"markets":[market(1)]}).to_string().into_bytes(),
+                "",
+            ),
+            (
+                vec!["version=v1"],
+                200,
+                json!({"markets":[market(0)]}).to_string().into_bytes(),
+                "",
+            ),
+            (
+                vec!["version=v2"],
+                200,
+                json!({"markets":[market(1)]}).to_string().into_bytes(),
+                "",
+            ),
+        ],
+        None,
+        Duration::from_secs(70),
+    );
+    let (mut discovery, _commands, _changes) = Discovery::new(Gamma::new(&url).unwrap());
+    discovery.enable_evidence(&path, 1024 * 1024).unwrap();
+    // Exercise the real production reconciliation interval rather than changing
+    // scheduling or adding test-clock dependencies for evidence reporting.
+    let report = discovery.run_for(Duration::from_secs(62), false).await;
+    server.join().unwrap();
+    assert!(report.stopped);
+    assert!(
+        report
+            .scans
+            .iter()
+            .all(|s| s.pagination_complete && s.error.is_none())
+    );
+    assert!(report.evidence.unwrap().complete);
+    let rows: Vec<Value> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let scans: Vec<_> = rows
+        .iter()
+        .map(|r| &r["event"])
+        .filter(|e| e["kind"] == "scan")
+        .collect();
+    assert_eq!(scans.len(), 4);
+    assert_eq!(scans[0]["sweep"], 1);
+    assert!(
+        scans[0]["report"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("422")
+    );
+    assert_eq!(scans[2]["sweep"], 2);
+    assert_eq!(scans[2]["report"]["pagination_complete"], true);
+    assert!(scans[2]["report"]["error"].is_null());
+}
+
+#[tokio::test]
 async fn v2_verification_uses_its_adapter_even_when_native_ids_overlap_v1() {
     let v1 = market(0);
     let mut v2 = market(1);
@@ -358,6 +576,8 @@ async fn exhausted_retries_do_not_stop_the_other_version() {
 
 #[tokio::test]
 async fn stop_and_snapshot_requests_work_during_retry_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stopped.jsonl");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/markets/keyset", listener.local_addr().unwrap());
     let (sent, received) = oneshot::channel();
@@ -377,6 +597,7 @@ async fn stop_and_snapshot_requests_work_during_retry_wait() {
         sent.send(()).unwrap();
     });
     let (mut discovery, commands, _changes) = Discovery::new(Gamma::new(&url).unwrap());
+    discovery.enable_evidence(&path, 1024 * 1024).unwrap();
     let control = async {
         received.await.unwrap();
         let (send, receive) = oneshot::channel();
@@ -391,6 +612,27 @@ async fn stop_and_snapshot_requests_work_during_retry_wait() {
     .expect("control requests were blocked by retry sleep");
     assert!(report.stopped);
     assert!(!report.scans[0].pagination_complete);
+    assert!(report.evidence.unwrap().complete);
+    let rows: Vec<Value> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let scans: Vec<_> = rows
+        .iter()
+        .map(|row| &row["event"])
+        .filter(|event| event["kind"] == "scan")
+        .collect();
+    assert_eq!(scans.len(), 2);
+    assert!(
+        scans
+            .iter()
+            .all(|scan| scan["report"]["pagination_complete"] == false)
+    );
+    assert!(rows.iter().any(|row| row["event"]["kind"] == "snapshot_end"
+        && row["event"]["desired_assets"] == 0
+        && row["event"]["pending_verifications"] == 0));
+    assert_eq!(rows.last().unwrap()["event"]["kind"], "complete");
     server.join().unwrap();
 }
 

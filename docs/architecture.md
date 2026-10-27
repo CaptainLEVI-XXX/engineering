@@ -1,6 +1,62 @@
 # Collector architecture and decision record
 
-Status: Components 1–5 cover discovery, raw ingestion, exact decoding, source-specific L2 books and binary recording. Automatic redundancy/health policies and connection experiments remain later extension work. Full-universe acceptance and representative production latency remain open. Updated: 2026-10-27.
+Status: Components 1–5 cover discovery, raw ingestion, exact decoding, source-specific L2 books and binary recording. R1–R7 extension implementation is being integrated; combined verification is deferred to the final pass at the user's request. Full-universe acceptance and representative production latency remain open. Updated: 2026-10-27.
+
+## R1–R7 extension contracts (supersede historical extension exclusions below)
+
+- Each physical worker has one immutable adapter/slot and increasing generations.
+  Replica count is explicitly 1 or 2. Packing preflights the entire reconciliation
+  against the physical socket budget; it never silently admits half a redundant
+  market. Existing assignments remain stable.
+- Begin, contiguous desired chunks and Complete fence C4 ownership before related
+  worker commands. C4 retains numeric identities/tombstones, not another eligibility
+  registry. Retirement affects every slot even when disconnected. Partial delivery
+  is terminal and cannot certify admission; Complete is not exchange acknowledgment.
+- Session decoders own their protocol state. Normalized quantities distinguish
+  `Set` and signed `Add`; event preparation validates every intermediate quantity
+  before mutation, and output always carries resulting absolute levels. Generic
+  price domains are nonnegative; Polymarket itself enforces probability bounds.
+  Unknown exchange time remains `None`, which the current SBE sink rejects.
+- Automatic selection is sticky, with snapshot-before-delta boundaries and a
+  bounded dirty-book queue. Initial snapshots may select either slot. Suspect,
+  stale, inactive or pending-repair sources cannot publish. Unknown freshness is
+  explicit fallback evidence, never proof of synchronization. Backlogged receipt
+  is not fresh processing. Both sources down suppress that instrument while other
+  books continue; 120s marks overdue coverage rather than a process-integrity fault.
+- Health keeps fixed tagged buckets per replica and counts only committed changes.
+  An ordered due index schedules a population-derived examination slice, targeting
+  a 10s revisit with a 1ms per-tick work cap. Revisit maxima and outstanding work are
+  evidence, not a qualified full-universe service rate. Relative suspicion needs
+  two observations at least 10s apart; the absolute heuristic freezes three prior
+  active minutes and needs two low minutes. Both quiet peers remain unknown.
+- Planned renewal first reserves affected instruments, then switches publishing
+  books to qualified peers in bounded slices. Every peer is rechecked before the
+  grant. Reservations persist through reinitialization or explicit timeout;
+  expiry alone never makes a missing peer eligible. Single-source rotation defers.
+  Healthy candidates are not replaced merely because another socket looks faster.
+- The shared connection budget initially permits two initializing attempts and
+  one start per second; voluntary attempts cannot occupy the reserved mandatory
+  slot. A lease lasts until full book readiness, explicit 30s expiry, or session
+  end—not merely handshake. Assignment churn after a readiness marker is
+  conservatively ambiguous under the generation-only acknowledgment: the worker
+  retains its lease until expiry/end. This limits throughput, not book validity.
+- A repair fences intake with Ended before bounded best-effort unsubscribe/close
+  I/O. It always reconnects on a fresh generation; no same-session re-add proof is
+  assumed. Control queue saturation defers bounded deduplicated repair intent;
+  closed/expired control, ingress overflow and output failure remain terminal.
+- Optional lifecycle hints use Gamma `id`, not condition `market`. Missing version
+  routes verification to both namespaces. A bounded overflow schedules coalesced
+  reconciliation; only discovery evidence can change eligibility.
+- The integrity sidecar carries desired/requested/baseline/selection/loss history.
+  Financial stdout is still one selected stream and uses the unchanged schema.
+  Two sockets share one process: neither process death nor host/network failure
+  is protected. Independent processes would need separate archives and approval.
+
+Future Kalshi integration additionally needs an authenticated handshake, market
+tickers, explicit yes/no bid conversion, signed `delta_fp`, subscription `sid/seq`,
+market-scoped clocks/maintenance epochs and a reviewed missing-timestamp mapping.
+Its documented snapshot request is not a Polymarket capability. Synthetic
+alternate-decoder conformance is not a second production exchange.
 
 ## Boundaries
 

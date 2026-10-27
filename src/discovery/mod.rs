@@ -1,12 +1,16 @@
 //! Single-owner desired-state registry. This module makes no subscription claims.
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
-use tokio::sync::watch;
+use serde_json::json;
+use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
+mod evidence;
+pub use evidence::EvidenceStatus;
 pub mod polymarket;
 
 #[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -16,19 +20,35 @@ pub enum AdapterId {
     PolymarketV2,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+impl AdapterId {
+    pub fn namespace(self) -> &'static str {
+        match self {
+            Self::PolymarketV1 => "polymarket:v1:",
+            Self::PolymarketV2 => "polymarket:v2:",
+        }
+    }
+}
+
+pub enum Command {
+    Snapshot(oneshot::Sender<Arc<Snapshot>>),
+    Hint(MarketKey),
+    Reconcile,
+    Stop,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct MarketKey {
     pub adapter: AdapterId,
     pub id: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct Instrument {
     pub id: String,
     pub label: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct MarketEntry {
     pub instruments: Vec<Instrument>,
     pub desired: bool,
@@ -67,21 +87,21 @@ pub struct PageReport {
 
 /// Adapters supply nonempty, distinct native instrument IDs for eligible and
 /// closed records. Unavailable records need no instruments and cannot retire.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct MarketRecord {
     pub id: String,
     pub instruments: Vec<Instrument>,
     pub eligibility: Eligibility,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct RecordError {
     pub market_id: Option<String>,
     pub instrument_ids: Vec<String>,
     pub reason: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub enum Eligibility {
     Eligible,
     Closed,
@@ -107,6 +127,8 @@ pub struct Registry {
     identity_conflicts: usize,
     expired_verifications: usize,
     verification_overflow: usize,
+    evidence: Option<evidence::Evidence>,
+    reconcile_requested: bool,
 }
 
 impl Default for Registry {
@@ -121,11 +143,78 @@ impl Default for Registry {
             identity_conflicts: 0,
             expired_verifications: 0,
             verification_overflow: 0,
+            evidence: None,
+            reconcile_requested: false,
         }
     }
 }
 
 impl Registry {
+    /// Enable a create-new, byte-capped JSONL stream before applying input.
+    /// Reporting does not change registry decisions. The discovery driver stops
+    /// intake on evidence failure; direct registry users must check the status.
+    pub fn enable_evidence(
+        &mut self,
+        path: impl AsRef<Path>,
+        max_bytes: u64,
+    ) -> std::io::Result<()> {
+        if self.evidence.is_some() {
+            return Err(std::io::Error::other("discovery evidence already enabled"));
+        }
+        let mut evidence = evidence::Evidence::create(path.as_ref(), max_bytes)?;
+        evidence.emit(&json!({"kind":"start", "schema_version":1, "max_bytes":max_bytes}));
+        evidence.flush();
+        let error = evidence.status().error;
+        self.evidence = Some(evidence);
+        match error {
+            Some(error) => Err(std::io::Error::other(format!(
+                "incomplete discovery evidence: {error}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    pub fn evidence_status(&self) -> Option<EvidenceStatus> {
+        self.evidence.as_ref().map(evidence::Evidence::status)
+    }
+
+    /// Final owner sample, not an atomic exchange snapshot. No additional
+    /// retained identity map is built; rows borrow the existing registry.
+    pub fn finish_evidence(&mut self) -> Option<EvidenceStatus> {
+        let evidence = self.evidence.as_mut()?;
+        let now = Instant::now();
+        evidence.emit(&json!({"kind":"snapshot_begin"}));
+        let mut desired_markets = 0;
+        let mut desired_assets = 0;
+        for (key, entry) in &self.markets {
+            if evidence.failed() {
+                break;
+            }
+            if entry.desired {
+                desired_markets += 1;
+                desired_assets += entry.instruments.len();
+                evidence.emit(&json!({"kind":"desired", "key":key, "entry":entry}));
+            } else if entry.uncertainty.is_some() {
+                evidence.emit(&json!({"kind":"uncertain_market", "key":key, "entry":entry}));
+            }
+        }
+        for (key, job) in &self.pending {
+            if evidence.failed() {
+                break;
+            }
+            evidence.emit(
+                &json!({"kind":"pending", "key":key, "attempts":job.attempts,
+                "age_ms":now.saturating_duration_since(job.first_seen).as_millis(),
+                "next_attempt_in_ms":job.next_attempt.saturating_duration_since(now).as_millis()}),
+            );
+        }
+        evidence.emit(
+            &json!({"kind":"snapshot_end", "desired_markets":desired_markets,
+            "desired_assets":desired_assets, "pending_verifications":self.pending.len()}),
+        );
+        Some(evidence.finish())
+    }
+
     pub fn subscribe(&self) -> watch::Receiver<()> {
         self.changed.subscribe()
     }
@@ -158,6 +247,9 @@ impl Registry {
                 >= UNKNOWN_LIMIT
         {
             self.verification_overflow += 1;
+            if let Some(evidence) = &mut self.evidence {
+                evidence.emit(&json!({"kind":"verification_overflow", "key":key}));
+            }
             return;
         }
         let now = Instant::now();
@@ -178,6 +270,10 @@ impl Registry {
             let keep = self.markets.contains_key(key) || now < job.first_seen + UNKNOWN_LIFETIME;
             if !keep {
                 self.expired_verifications += 1;
+                if let Some(evidence) = &mut self.evidence {
+                    evidence.emit(&json!({"kind":"verification_expired", "key":key,
+                        "attempts":job.attempts}));
+                }
             }
             keep
         });
@@ -241,6 +337,9 @@ impl Registry {
     }
 
     fn uncertain(&mut self, key: &MarketKey, reason: &str) {
+        if let Some(evidence) = &mut self.evidence {
+            evidence.emit(&json!({"kind":"uncertain", "key":key, "reason":reason}));
+        }
         self.request_verification(key.clone());
         if let Some(entry) = self.markets.get_mut(key)
             && entry.uncertainty.as_deref() != Some(reason)
@@ -276,6 +375,9 @@ impl Registry {
         }
         report.identity_conflicts = self.identity_conflicts - conflicts_before;
         self.flush_changes();
+        if let Some(evidence) = &mut self.evidence {
+            evidence.flush();
+        }
         report
     }
 
@@ -289,6 +391,10 @@ impl Registry {
     ) {
         let mut matched: HashMap<String, Vec<_>> = HashMap::new();
         for record in records {
+            if let Some(evidence) = &mut self.evidence {
+                evidence.emit(&json!({"kind":"verification_record", "adapter":adapter,
+                    "record":record}));
+            }
             let id = match &record {
                 Ok(market) => Some(&market.id),
                 Err(error) => error.market_id.as_ref(),
@@ -304,6 +410,7 @@ impl Registry {
             };
             let Some(rows) = matched.remove(id) else {
                 self.uncertain(&key, "missing targeted result");
+                self.verification_evidence(&key, false);
                 continue;
             };
             // Compare only normalized relevant fields, not incidental metadata.
@@ -314,16 +421,46 @@ impl Registry {
                 .is_ok_and(|a| rows.all(|record| record.as_ref().is_ok_and(|b| a == b)));
             if !consistent {
                 self.uncertain(&key, "malformed or contradictory targeted result");
+                self.verification_evidence(&key, false);
                 continue;
             }
-            if self.apply_record(adapter, first, true) {
+            let resolved = self.apply_record(adapter, first, true);
+            if resolved {
                 self.pending.remove(&key);
             }
+            self.verification_evidence(&key, resolved);
         }
         self.flush_changes();
+        if let Some(evidence) = &mut self.evidence {
+            evidence.flush();
+        }
+    }
+
+    fn verification_evidence(&mut self, key: &MarketKey, resolved: bool) {
+        if let Some(evidence) = &mut self.evidence {
+            evidence.emit(&json!({"kind":"verification_result", "key":key, "resolved":resolved}));
+        }
     }
 
     fn apply_record(
+        &mut self,
+        adapter: AdapterId,
+        record: Result<MarketRecord, RecordError>,
+        verified: bool,
+    ) -> bool {
+        // Only the opt-in diagnostic run copies one normalized record at a time.
+        let observation = self.evidence.as_ref().map(|_| record.clone());
+        let resolved = self.apply_record_inner(adapter, record, verified);
+        if let (Some(evidence), Some(record)) = (&mut self.evidence, observation) {
+            evidence.emit(
+                &json!({"kind":"record", "adapter":adapter, "verified":verified,
+                "record":record, "resolved":resolved}),
+            );
+        }
+        resolved
+    }
+
+    fn apply_record_inner(
         &mut self,
         adapter: AdapterId,
         record: Result<MarketRecord, RecordError>,

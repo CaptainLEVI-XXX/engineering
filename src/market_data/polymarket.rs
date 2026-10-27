@@ -1,4 +1,4 @@
-use super::{Change, DecodeError, Event, Level, Limits, Price};
+use super::{Change, DecodeError, Event, Level, Limits, Price, QuantityChange};
 use crate::Side;
 use anyhow::{Context, Result, ensure};
 use serde::{
@@ -84,6 +84,10 @@ struct Wire<'a> {
     price_changes: Option<&'a RawValue>,
     #[serde(borrow)]
     new_tick_size: Option<&'a RawValue>,
+    #[serde(borrow)]
+    id: Option<&'a RawValue>,
+    #[serde(borrow)]
+    version: Option<&'a RawValue>,
 }
 #[derive(Deserialize)]
 struct Entry<'a> {
@@ -105,10 +109,8 @@ impl<'de> Deserialize<'de> for Change<'de> {
         Ok(Self {
             asset: entry.asset_id,
             side,
-            level: Level {
-                price: entry.price,
-                quantity: entry.size,
-            },
+            price: entry.price,
+            quantity: QuantityChange::Set(entry.size),
         })
     }
 }
@@ -158,9 +160,15 @@ pub fn decode<'a>(raw: &'a RawValue, limits: &Limits) -> Result<Event<'a>, Decod
                     wire.asks.context("missing asks")?.get(),
                     limits.entries.saturating_sub(bids.len()),
                 )?;
+                ensure!(
+                    bids.iter()
+                        .chain(&asks)
+                        .all(|l| l.price.value() <= 1_000_000),
+                    "price outside probability range"
+                );
                 Ok(Event::Snapshot {
                     asset,
-                    exchange_us: time(wire.timestamp.as_deref())?,
+                    exchange_us: Some(time(wire.timestamp.as_deref())?),
                     bids,
                     asks,
                 })
@@ -172,9 +180,13 @@ pub fn decode<'a>(raw: &'a RawValue, limits: &Limits) -> Result<Event<'a>, Decod
                 )?;
                 for change in &changes {
                     identity(&change.asset, limits)?;
+                    ensure!(
+                        change.price.value() <= 1_000_000,
+                        "price outside probability range"
+                    );
                 }
                 Ok(Event::Changes {
-                    exchange_us: time(wire.timestamp.as_deref())?,
+                    exchange_us: Some(time(wire.timestamp.as_deref())?),
                     changes,
                 })
             }
@@ -183,16 +195,47 @@ pub fn decode<'a>(raw: &'a RawValue, limits: &Limits) -> Result<Event<'a>, Decod
                 identity(&asset, limits)?;
                 let tick: Price =
                     serde_json::from_str(wire.new_tick_size.context("missing tick")?.get())?;
-                ensure!(tick.value() > 0, "zero tick size");
+                ensure!(
+                    tick.value() > 0 && tick.value() <= 1_000_000,
+                    "invalid probability tick size"
+                );
                 Ok(Event::Tick {
                     asset,
-                    exchange_us: time(wire.timestamp.as_deref())?,
+                    exchange_us: Some(time(wire.timestamp.as_deref())?),
                     tick,
                 })
             }
-            "last_trade_price" | "best_bid_ask" | "new_market" | "market_resolved" => {
-                Ok(Event::NonBook)
+            "new_market" | "market_resolved" => {
+                // `market` is a condition ID, not the Gamma key. Invalid hints
+                // cannot invalidate financial books or manufacture an identity.
+                let market_id = wire.id.and_then(|raw| {
+                    let text = raw.get();
+                    let id = if text.starts_with('"') {
+                        Cow::Owned(serde_json::from_str::<String>(text).ok()?)
+                    } else if text.bytes().all(|b| b.is_ascii_digit()) {
+                        Cow::Borrowed(text)
+                    } else {
+                        return None;
+                    };
+                    identity(&id, limits).ok().map(|()| id)
+                });
+                let adapter = match wire.version.map(RawValue::get) {
+                    Some("\"v1\"") => Some(crate::discovery::AdapterId::PolymarketV1),
+                    Some("\"v2\"") => Some(crate::discovery::AdapterId::PolymarketV2),
+                    _ => None,
+                };
+                let kind = if wire.event_type == "new_market" {
+                    super::LifecycleKind::NewMarket
+                } else {
+                    super::LifecycleKind::Resolved
+                };
+                Ok(Event::Lifecycle {
+                    kind,
+                    market_id,
+                    adapter,
+                })
             }
+            "last_trade_price" | "best_bid_ask" => Ok(Event::NonBook),
             _ => anyhow::bail!("unknown event type"),
         }
     })();

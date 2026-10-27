@@ -1,5 +1,6 @@
 //! Single-owner source replicas. No network I/O or SBE encoding in mutation.
 mod book;
+pub mod health;
 mod store;
 use crate::{
     Side,
@@ -15,6 +16,9 @@ pub use store::Processor;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub wire: Limits,
+    pub selection: SelectionPolicy,
+    pub monitoring: bool,
+    pub renewal_interval: Duration,
     pub instruments: usize,
     pub replicas: usize,
     pub sessions: usize,
@@ -31,6 +35,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             wire: Limits::default(),
+            selection: SelectionPolicy::Manual,
+            monitoring: false,
+            renewal_interval: Duration::from_secs(1800),
             instruments: 1_000_000,
             replicas: 2_000_000,
             sessions: 2048,
@@ -48,9 +55,17 @@ pub struct BookId(pub u32);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Binding {
     pub book: BookId,
-    pub slot: u16,
     pub revision: u64,
     pub session: Session,
+}
+
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct Reconciliation {
+    pub revision: u64,
+    pub chunks: u32,
+    pub accepted_chunks: u32,
+    pub complete: bool,
+    pub input_cutoff: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Validity {
@@ -59,6 +74,42 @@ pub enum Validity {
     Stale,
     Inactive,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectionPolicy {
+    Manual,
+    Automatic,
+}
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Freshness {
+    RecentProgress,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchReason {
+    Manual,
+    SourceUnavailable,
+    HealthSuspicion,
+    PlannedRotation,
+}
+
+/// Borrowed owner-local diagnostic row, not an exchange coverage certificate.
+/// The caller supplies wall-clock sample time and brackets with C1 snapshots.
+pub struct CoverageRecord<'a> {
+    pub asset: &'a str,
+    pub binding: Binding,
+    pub state: Validity,
+    /// Selection affinity can survive invalidation; usable output also requires Live.
+    pub selected: bool,
+    pub levels: usize,
+    pub initialization_overdue: bool,
+    pub unavailable_since: Option<Duration>,
+    pub input_cutoff: u64,
+    pub owner_time: Duration,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Cursor {
     pub session: Session,
@@ -83,9 +134,15 @@ pub struct Replica {
     pub applied: u64,
     pub observed: u64,
     pub last_received_at: Option<DateTime<Utc>>,
+    pub last_valid_receive: Option<Duration>,
+    pub suspect: bool,
+    pub(crate) suspicion_reported: bool,
+    pub health: health::Health,
     pub(crate) unavailable_since: Option<Duration>,
     pub(crate) requested_at: Duration,
     pub(crate) attempts: u32,
+    pub(crate) next_retry: Duration,
+    pub(crate) cooldown: Duration,
 }
 pub struct Observation<'a> {
     pub asset: &'a str,
@@ -99,8 +156,17 @@ pub struct Observation<'a> {
 #[derive(Clone, Copy, Debug)]
 pub enum SnapshotOrigin {
     Exchange,
-    Selection { at: DateTime<Utc> },
-    Periodic { at: DateTime<Utc>, due: Duration },
+    Selection {
+        at: DateTime<Utc>,
+        previous: Option<Binding>,
+        reason: SwitchReason,
+        freshness: Freshness,
+        receive_age: Option<Duration>,
+    },
+    Periodic {
+        at: DateTime<Utc>,
+        due: Duration,
+    },
 }
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -109,8 +175,11 @@ pub enum InvalidationCause {
     InvalidData,
     AssignmentReplaced,
     Retired,
+    PolicySuspension,
 }
 pub enum ObservationKind<'a> {
+    /// Validated standby state; provenance only, never a financial output record.
+    StandbyBaseline,
     Snapshot {
         book: &'a Book,
         origin: SnapshotOrigin,
@@ -127,7 +196,7 @@ pub enum ObservationKind<'a> {
         output_binding: Option<Binding>,
     },
 }
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct Stats {
     pub messages: u64,
     pub events: u64,
@@ -141,4 +210,18 @@ pub struct Stats {
     pub late_snapshots: u64,
     pub max_snapshot_lateness: Duration,
     pub snapshots_due_at_cutoff: usize,
+    pub desired_books: usize,
+    pub selected_live: usize,
+    pub coverage_overdue: usize,
+    pub degraded_replicas: usize,
+    pub max_unavailable_age: Duration,
+    pub health_checks: u64,
+    pub max_health_revisit: Duration,
+    pub max_health_lateness: Duration,
+    pub health_suspicions: u64,
+    pub max_ingress_age: Duration,
+    pub health_pending: usize,
+    pub renewal_deferred: u64,
+    pub renewals_granted: u64,
+    pub lifecycle_hints_dropped: u64,
 }
