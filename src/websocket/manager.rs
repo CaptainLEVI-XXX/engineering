@@ -597,6 +597,9 @@ pub async fn run_manager(
                     let deliveries = plan.deliveries(config.subscription_batch, output.byte_limit())?;
                     let revision = plan.revision;
                     let chunks = u32::try_from(deliveries.len())?;
+                    // Preflight can outlast the intake cutoff on a large universe.
+                    // Do not publish a new reconciliation after shutdown.
+                    if *shutdown.borrow() { return Ok(()); }
                     output.send(ingress::Message::ReconcileBegin { revision, chunks })
                         .with_context(|| format!("reconciliation {revision} Begin rejected"))?;
                     // Workers start empty; no subscription can precede its fence.
@@ -628,7 +631,9 @@ pub async fn run_manager(
                             control_poll = Instant::now();
                         }
                     }
-                    ensure!(!*shutdown.borrow(), "incomplete reconciliation {revision}: shutdown before Complete");
+                    // All fences and commands have been accepted. Shutdown does
+                    // not undo delivery, including an empty reconciliation.
+                    // Partial delivery still fails at the checks inside the loop.
                     output.send(ingress::Message::ReconcileComplete { revision })
                         .with_context(|| format!("incomplete reconciliation {revision}: all commands delivered, Complete rejected"))?;
                     assignments.commit(plan);

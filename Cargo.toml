@@ -16,6 +16,9 @@ tokio-tungstenite = { version = "=0.28.0", default-features = false, features = 
 futures-util = { version = "=0.3.32", features = ["sink"] }
 tempfile = "3"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [build-dependencies]
 ergo-sbe = "=0.1.16"
 indexmap = { version = "2", features = ["serde"] }

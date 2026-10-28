@@ -69,6 +69,48 @@ fn reconciliation(
 }
 
 #[test]
+fn readiness_survives_backpressure_churn_and_ignores_old_generation_acknowledgments() {
+    let mut p = Processor::new(Config::default()).unwrap();
+    let a = session(0, 1);
+    apply(&mut p, Message::Started(a), 0);
+    apply(&mut p, request(a, 0, 1, true), 0);
+    apply(&mut p, Message::RequestsComplete { session: a }, 0);
+    assert_eq!(p.initialized_sessions().count(), 0);
+    apply(&mut p, data(a, 1, true, "3"), 0);
+    for _ in 0..2 {
+        // An unaccepted control must remain available on the next attempt.
+        assert_eq!(p.initialized_sessions().collect::<Vec<_>>(), [a]);
+    }
+    p.initialization_delivered(a);
+    assert_eq!(p.initialized_sessions().count(), 0);
+
+    // Even an already initialized subscription needs a new complete marker.
+    apply(&mut p, request(a, 0, 1, true), 1);
+    assert_eq!(p.initialized_sessions().count(), 0);
+    apply(&mut p, Message::RequestsComplete { session: a }, 1);
+    assert_eq!(p.initialized_sessions().collect::<Vec<_>>(), [a]);
+    apply(
+        &mut p,
+        Message::Ended {
+            session: a,
+            reason: "disconnect".into(),
+        },
+        1,
+    );
+    assert_eq!(p.initialized_sessions().count(), 0);
+    let b = session(0, 2);
+    apply(&mut p, Message::Started(b), 2);
+    apply(&mut p, request(b, 0, 1, true), 2);
+    apply(&mut p, Message::RequestsComplete { session: b }, 2);
+    apply(&mut p, data(b, 1, true, "7"), 2);
+    p.initialization_delivered(a);
+    assert_eq!(p.initialized_sessions().collect::<Vec<_>>(), [b]);
+    // A failed event before control delivery retracts readiness immediately.
+    apply(&mut p, data(b, 2, false, "bad"), 3);
+    assert_eq!(p.initialized_sessions().count(), 0);
+}
+
+#[test]
 fn cross_worker_revisions_reject_late_removal_data_and_end() {
     let mut p = Processor::new(Config::default()).unwrap();
     let a = session(0, 9);

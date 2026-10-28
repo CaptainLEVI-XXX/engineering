@@ -230,25 +230,46 @@ impl Stamp {
 
 /// All writes share a hard serialized-byte cap, with space reserved for termination.
 /// Raw JSON strings round-trip the complete UTF-8 message, including whitespace.
-struct Evidence {
-    writer: BufWriter<File>,
+trait EvidenceSink: Write {
+    fn sync_all(&self) -> std::io::Result<()>;
+}
+impl EvidenceSink for File {
+    fn sync_all(&self) -> std::io::Result<()> {
+        File::sync_all(self)
+    }
+}
+struct Evidence<W: EvidenceSink = File> {
+    writer: Option<BufWriter<W>>,
     bytes: u64,
     limit: u64,
     rows: u64,
     failed_write: bool,
 }
-impl Evidence {
+impl Evidence<File> {
     fn create(path: &std::path::Path, limit: u64) -> Result<Self> {
-        Ok(Self {
-            writer: BufWriter::with_capacity(
-                64 << 10,
-                OpenOptions::new().write(true).create_new(true).open(path)?,
-            ),
+        Ok(Self::new(
+            OpenOptions::new().write(true).create_new(true).open(path)?,
+            limit,
+        ))
+    }
+}
+impl<W: EvidenceSink> Evidence<W> {
+    fn new(writer: W, limit: u64) -> Self {
+        Self {
+            writer: Some(BufWriter::with_capacity(64 << 10, writer)),
             bytes: 0,
             limit,
             rows: 0,
             failed_write: false,
-        })
+        }
+    }
+    fn poison(&mut self) {
+        self.failed_write = true;
+        // BufWriter's destructor otherwise retries its remaining buffer after
+        // a failed/partial flush. The prefix is uncertain: never retry it.
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.into_parts();
+        }
     }
     fn row(&mut self, row: &Value) -> Result<()> {
         self.write(row, 16 << 10)
@@ -268,8 +289,13 @@ impl Evidence {
             next <= self.limit.saturating_sub(reserve),
             "evidence byte cap reached; trial incomplete"
         );
-        if let Err(error) = self.writer.write_all(&bytes) {
-            self.failed_write = true;
+        if let Err(error) = self
+            .writer
+            .as_mut()
+            .context("evidence closed")?
+            .write_all(&bytes)
+        {
+            self.poison();
             return Err(error.into());
         }
         self.bytes = next;
@@ -277,10 +303,19 @@ impl Evidence {
         Ok(())
     }
     fn finish(&mut self, status: &Value) -> Result<()> {
-        self.write(status, 0)?;
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
-        Ok(())
+        let result = (|| {
+            // Detect failed prefix writes before appending a success marker.
+            self.writer.as_mut().context("evidence closed")?.flush()?;
+            self.write(status, 0)?;
+            let writer = self.writer.as_mut().context("evidence closed")?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.poison();
+        }
+        result
     }
 }
 
@@ -744,16 +779,49 @@ fn deliver(tx: &mpsc::Sender<Input>, input: Input) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("probe input full/closed: {e}"))
 }
 
-struct ConnectionBudget(Cell<Instant>);
+// Private injection seam: the CLI always constructs production(), never accepts
+// an endpoint or timing override. Local tests use plain ws and accelerated clocks
+// only to exercise control flow, never as connection-latency evidence.
+struct Network {
+    endpoint: String,
+    host: String,
+    port: u16,
+    start_gap: Duration,
+    connect_timeout: Duration,
+    io_timeout: Duration,
+    heartbeat: Duration,
+    renewal_at: Duration,
+    init_timeout: Duration,
+}
+impl Network {
+    fn production(config: &Config) -> Self {
+        Self {
+            endpoint: ENDPOINT.into(),
+            host: HOST.into(),
+            port: 443,
+            start_gap: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(15),
+            io_timeout: IO_TIMEOUT,
+            heartbeat: Duration::from_secs(10),
+            renewal_at: Duration::from_secs(60 + config.warmup + config.seconds / 2),
+            init_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+struct ConnectionBudget {
+    next: Cell<Instant>,
+    gap: Duration,
+}
 impl ConnectionBudget {
     async fn acquire(&self) {
         loop {
-            let next = self.0.get();
+            let next = self.next.get();
             let now = Instant::now();
             if now >= next {
                 // Both feed futures run on this one runtime thread; no await
                 // between checking and reserving, and no lock held over I/O.
-                self.0.set(now + Duration::from_secs(30));
+                self.next.set(now + self.gap);
                 return;
             }
             tokio::time::sleep_until(next.into()).await;
@@ -767,9 +835,10 @@ async fn feed(
     origin: Instant,
     tx: mpsc::Sender<Input>,
     budget: &ConnectionBudget,
+    network: &Network,
 ) -> Result<()> {
     // A starts at 0, B at >=30s. Concurrent measurement, not simultaneous handshakes.
-    sleep(Duration::from_secs(source as u64 * 30)).await;
+    sleep(network.start_gap * source as u32).await;
     let wire = protocol(config.adapter);
     let mut generation = 0u32;
     let mut renew = config.cohort == "renewal" && source == config.treatment();
@@ -782,11 +851,14 @@ async fn feed(
                 source,
                 generation,
                 stamp: connect_start,
-                details: json!({"phase":"attempt", "endpoint":ENDPOINT}),
+                details: json!({"phase":"attempt", "endpoint":network.endpoint}),
             },
         )?;
-        let (mut socket, details) = timeout(Duration::from_secs(15), async {
-            let dns: Vec<SocketAddr> = lookup_host((HOST, 443)).await?.take(65).collect();
+        let (mut socket, details) = timeout(network.connect_timeout, async {
+            let dns: Vec<SocketAddr> = lookup_host((network.host.as_str(), network.port))
+                .await?
+                .take(65)
+                .collect();
             ensure!(dns.len() <= 64, "DNS answer budget exceeded");
             let remote = *dns.first().context("empty DNS answer")?;
             let tcp = if remote.is_ipv4() {
@@ -815,7 +887,7 @@ async fn feed(
                 .max_write_buffer_size(256 << 10);
             // Default rustls connector preserves WebPKI roots, SNI and verification.
             let (socket, response) = client_async_tls_with_config(
-                wire.handshake_request(ENDPOINT)?,
+                wire.handshake_request(&network.endpoint)?,
                 stream,
                 Some(ws),
                 None,
@@ -826,7 +898,9 @@ async fn feed(
                 json!({"phase":"connected", "dns":dns,
                 "local":local, "remote":peer, "http_status":response.status().as_u16(),
                 "requested_local_port":requested_port, "tcp_nodelay":true,
-                "tls":"rustls default WebPKI verification + SNI; negotiated cipher not captured"}),
+                "tls":if network.endpoint.starts_with("wss:") {
+                    "rustls default WebPKI verification + SNI; negotiated cipher not captured"
+                } else { "plain ws: local test only, not latency evidence" }}),
             ))
         })
         .await
@@ -842,7 +916,7 @@ async fn feed(
         )?;
         let subscription = wire.subscription(SubscriptionOp::Initial, &config.assets)?;
         timeout(
-            IO_TIMEOUT,
+            network.io_timeout,
             socket.send(Message::Text(subscription.clone().into())),
         )
         .await
@@ -856,11 +930,11 @@ async fn feed(
                 payload: subscription,
             },
         )?;
-        let mut heartbeat = interval(Duration::from_secs(10));
+        let mut heartbeat = interval(network.heartbeat);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
         heartbeat.tick().await;
         // Fixed origin schedule is recorded, independent of observed fast/slow source.
-        let renewal_at = origin + Duration::from_secs(60 + config.warmup + config.seconds / 2);
+        let renewal_at = origin + network.renewal_at;
         let renewal_timer = tokio::time::sleep_until(renewal_at.into());
         tokio::pin!(renewal_timer);
         let mut ordinal = 0u64;
@@ -876,7 +950,7 @@ async fn feed(
                     deliver(&tx, Input::Frame { source, generation, ordinal, stamp, frame })?;
                     ensure!(!closed, "peer closed: coverage degraded; no retry");
                     if ping {
-                        timeout(IO_TIMEOUT, socket.flush()).await.context("control pong deadline")??;
+                        timeout(network.io_timeout, socket.flush()).await.context("control pong deadline")??;
                     }
                     // Buffered socket messages must not fill the queue in a
                     // single uninterrupted poll before the consumer can run.
@@ -884,15 +958,15 @@ async fn feed(
                 }
                 _ = heartbeat.tick() => {
                     if let Some(text) = wire.heartbeat() {
-                        timeout(IO_TIMEOUT, socket.send(Message::Text(text.into()))).await.context("heartbeat deadline")??;
+                        timeout(network.io_timeout, socket.send(Message::Text(text.into()))).await.context("heartbeat deadline")??;
                         deliver(&tx, Input::Sent { source, generation, stamp: Stamp::now(origin)?, payload: text.into() })?;
                     }
                 }
                 _ = &mut renewal_timer, if renew => {
                     let (grant, permitted) = oneshot::channel();
                     deliver(&tx, Input::Renewal { source, stamp: Stamp::now(origin)?, grant })?;
-                    timeout(IO_TIMEOUT, permitted).await.context("renewal grant deadline")?.context("renewal grant refused")?;
-                    timeout(IO_TIMEOUT, socket.close(None)).await.context("renewal close deadline")??;
+                    timeout(network.io_timeout, permitted).await.context("renewal grant deadline")?.context("renewal grant refused")?;
+                    timeout(network.io_timeout, socket.close(None)).await.context("renewal close deadline")??;
                     drop(socket); // At most two physical sockets, never old+new+peer.
                     generation += 1;
                     renew = false;
@@ -903,10 +977,10 @@ async fn feed(
     }
 }
 
-struct Probe {
+struct Probe<W: EvidenceSink = File> {
     config: Config,
     origin: Instant,
-    evidence: Evidence,
+    evidence: Evidence<W>,
     report: File,
     assets: HashSet<String>,
     initialized: [HashSet<String>; 2],
@@ -924,7 +998,7 @@ struct Probe {
     renewal_start: Option<u64>,
     renewal_ready_ns: Option<u64>,
 }
-impl Probe {
+impl<W: EvidenceSink> Probe<W> {
     fn pairs(&mut self, pairs: Vec<Pair>) -> Result<()> {
         for pair in pairs {
             ensure!(
@@ -1085,20 +1159,29 @@ impl Probe {
         );
         Ok(())
     }
-    fn tick(&mut self, inputs_empty: bool) -> Result<bool> {
+    fn tick(&mut self, inputs_empty: bool, init_timeout: Duration) -> Result<bool> {
         let now = Stamp::now(self.origin)?.mono_ns;
         for source in 0..2 {
             if self.ready_ns[source].is_none()
-                && self.requested_ns[source].is_some_and(|s| now.saturating_sub(s) > 30_000_000_000)
+                && self.requested_ns[source]
+                    .is_some_and(|s| u128::from(now.saturating_sub(s)) > init_timeout.as_nanos())
             {
-                bail!("source {source} failed complete snapshot coverage within 30s");
+                bail!("source {source} failed complete snapshot coverage within {init_timeout:?}");
             }
         }
         if let Some(start) = self.measured_start {
             if now >= start && inputs_empty {
-                let pairs = self
-                    .matcher
-                    .advance(now.min(start + self.config.seconds * 1_000_000_000))?;
+                let watermark = now.min(start + self.config.seconds * 1_000_000_000);
+                if watermark
+                    >= self.matcher.start_ns
+                        + self.matcher.window_ns * self.matcher.blocks.len() as u64
+                {
+                    // Record only effective timer advances, before their match
+                    // rows. Push advances remain inferable from received events.
+                    self.evidence
+                        .row(&json!({"type":"matcher_advance", "mono_ns":watermark}))?;
+                }
+                let pairs = self.matcher.advance(watermark)?;
                 self.pairs(pairs)?;
             }
             if now >= start + self.config.seconds * 1_000_000_000 {
@@ -1158,7 +1241,7 @@ fn block_interval(medians: &[i64]) -> Option<(i64, i64)> {
     ))
 }
 
-fn report(probe: &mut Probe, status: &str, cutoff: Stamp) -> Result<()> {
+fn report<W: EvidenceSink>(probe: &mut Probe<W>, status: &str, cutoff: Stamp) -> Result<()> {
     let start = probe.measured_start.unwrap_or(cutoff.mono_ns);
     let mut strata: BTreeMap<(String, Kind), Vec<i64>> = BTreeMap::new();
     let mut blocks: BTreeMap<u64, Vec<i64>> = BTreeMap::new();
@@ -1290,7 +1373,7 @@ async fn main() -> Result<()> {
         "os":std::env::consts::OS, "arch":std::env::consts::ARCH,
         "crate_version":env!("CARGO_PKG_VERSION"), "sample_cap":SAMPLE_CAP,
         "input_queue":8, "max_message_bytes":MESSAGE_BYTES, "treatment_source":config.treatment(),
-        "policy":{"matcher":"three-block-full-content-v1", "financial_scale":1_000_000,
+        "policy":{"matcher":"three-block-full-content-v1", "matcher_advance_logged":true, "financial_scale":1_000_000,
             "guard_blocks":3, "init_deadline_seconds":30, "connect_deadline_seconds":15,
             "send_deadline_seconds":5, "local_stall_limit_ns":1_000_000_000,
             "report_byte_cap":REPORT_BYTES, "dns_answer_cap":64, "tail_minimum_matches":100_000,
@@ -1325,13 +1408,34 @@ async fn main() -> Result<()> {
         renewal_start: None,
         renewal_ready_ns: None,
     };
+    drive(
+        &mut probe,
+        &Network::production(&config),
+        tokio::signal::ctrl_c(),
+    )
+    .await?;
+    eprintln!(
+        "Bounded trial complete; inspect raw.jsonl and report.md. No production recommendation."
+    );
+    Ok(())
+}
+
+async fn drive<W: EvidenceSink>(
+    probe: &mut Probe<W>,
+    network: &Network,
+    signal: impl std::future::Future<Output = std::io::Result<()>>,
+) -> Result<()> {
+    let config = probe.config.clone();
+    let origin = probe.origin;
     let (tx, mut rx) = mpsc::channel(8);
-    let budget = ConnectionBudget(Cell::new(origin));
+    let budget = ConnectionBudget {
+        next: Cell::new(origin),
+        gap: network.start_gap,
+    };
     let outcome: Result<()> = {
-        let a = feed(&config, 0, origin, tx.clone(), &budget);
-        let b = feed(&config, 1, origin, tx, &budget);
+        let a = feed(&config, 0, origin, tx.clone(), &budget, network);
+        let b = feed(&config, 1, origin, tx, &budget, network);
         tokio::pin!(a, b);
-        let signal = tokio::signal::ctrl_c();
         tokio::pin!(signal);
         let mut timer = interval(Duration::from_millis(100));
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1347,7 +1451,7 @@ async fn main() -> Result<()> {
                 scheduled = timer.tick() => {
                     let lateness = u64::try_from(scheduled.elapsed().as_nanos()).unwrap_or(u64::MAX);
                     probe.max_tick_lateness_ns = probe.max_tick_lateness_ns.max(lateness);
-                    if lateness > 1_000_000_000 { Err(anyhow::anyhow!("local timer stalled >1s")) } else { probe.tick(rx.is_empty()) }
+                    if lateness > 1_000_000_000 { Err(anyhow::anyhow!("local timer stalled >1s")) } else { probe.tick(rx.is_empty(), network.init_timeout) }
                 },
             };
             match step {
@@ -1377,7 +1481,7 @@ async fn main() -> Result<()> {
     } else {
         format!("INCOMPLETE: {}", errors.join("; "))
     };
-    if let Err(error) = report(&mut probe, &status, cutoff) {
+    if let Err(error) = report(probe, &status, cutoff) {
         errors.push(format!("report: {error:#}"));
     }
     let summary = json!({"type":"complete", "successful":errors.is_empty(), "errors":errors,
@@ -1390,9 +1494,6 @@ async fn main() -> Result<()> {
         errors.push(format!("evidence finalization: {error:#}"));
     }
     ensure!(errors.is_empty(), "{}", errors.join("; "));
-    eprintln!(
-        "Bounded trial complete; inspect raw.jsonl and report.md. No production recommendation."
-    );
     Ok(())
 }
 
@@ -1681,5 +1782,1051 @@ mod tests {
         m.advance(300).unwrap();
         assert!(m.push(observation(0, 110, "A", 7)).is_err());
         assert_eq!(m.entries, 0);
+    }
+
+    // These fixtures deliberately bypass CLI duration minimums. They exercise
+    // real loopback TCP/WebSocket + feed + Probe + finalization, not latency.
+    fn local_config(destination: PathBuf) -> Config {
+        Config {
+            assets: vec!["A".into()],
+            adapter: AdapterId::PolymarketV2,
+            destination,
+            cohort: "baseline".into(),
+            trial: 1,
+            region: "LOCAL TEST ONLY".into(),
+            revision: "synthetic".into(),
+            toolchain: "test".into(),
+            seconds: 1,
+            warmup: 0,
+            local_port: None,
+            raw_bytes: 1 << 20,
+            raw_observations: 1000,
+            matcher_entries: 1000,
+            matcher_bytes: 1 << 20,
+            window_ms: 200,
+        }
+    }
+    async fn local_network(config: &Config) -> (tokio::net::TcpListener, Network) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut network = Network::production(config);
+        network.endpoint = format!("ws://{address}/ws/market");
+        network.host = "127.0.0.1".into();
+        network.port = address.port();
+        network.start_gap = Duration::from_millis(20);
+        network.connect_timeout = Duration::from_millis(500);
+        network.io_timeout = Duration::from_millis(500);
+        network.heartbeat = Duration::from_millis(50);
+        network.renewal_at = Duration::from_millis(400);
+        network.init_timeout = Duration::from_millis(500);
+        (listener, network)
+    }
+    fn local_probe<W: EvidenceSink>(config: Config, evidence: Evidence<W>) -> Probe<W> {
+        let report = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(config.destination.join("report.md"))
+            .unwrap();
+        Probe {
+            assets: config.assets.iter().cloned().collect(),
+            initialized: [HashSet::new(), HashSet::new()],
+            requested_ns: [None; 2],
+            ready_ns: [None; 2],
+            measured_start: None,
+            matcher: Matcher::new(
+                0,
+                config.window_ms * 1_000_000,
+                config.matcher_entries,
+                config.matcher_bytes,
+            ),
+            config,
+            origin: Instant::now(),
+            evidence,
+            report,
+            samples: Vec::new(),
+            observations: 0,
+            captured_observations: 0,
+            max_processing_ns: 0,
+            max_queue_age_ns: 0,
+            max_tick_lateness_ns: 0,
+            warmup_events: 0,
+            renewal_start: None,
+            renewal_ready_ns: None,
+        }
+    }
+    fn file_probe(config: Config) -> Probe {
+        let evidence =
+            Evidence::create(&config.destination.join("raw.jsonl"), config.raw_bytes).unwrap();
+        local_probe(config, evidence)
+    }
+    fn raw(probe: &Probe) -> Vec<Value> {
+        std::fs::read_to_string(probe.config.destination.join("raw.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+    fn complete(rows: &[Value], success: bool) {
+        let last = rows.last().unwrap();
+        assert_eq!(last["type"], "complete");
+        assert_eq!(last["successful"], success);
+        assert_eq!(last["undrained_inputs"], 0);
+        assert_eq!(last["raw_observations"], last["captured_observations"]);
+    }
+    type ServerSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+    async fn accept_subscription(listener: &tokio::net::TcpListener) -> ServerSocket {
+        let (stream, _) = listener.accept().await.unwrap();
+        stream.set_nodelay(true).unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let text = socket.next().await.unwrap().unwrap().into_text().unwrap();
+        // Independent assertion of the actual bytes decoded by the fake venue.
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            json!({
+                "type":"market", "assets_ids":["A"], "level":2, "initial_dump":true
+            })
+        );
+        socket
+    }
+    fn book() -> Message {
+        Message::Text(
+            r#"{"event_type":"book","asset_id":"A","timestamp":"1","bids":[],"asks":[]}"#.into(),
+        )
+    }
+    fn change(quantity: &str) -> Value {
+        json!({"event_type":"price_change", "timestamp":"2", "price_changes":[{
+            "asset_id":"A", "side":"BUY", "price":"0.50", "size":quantity, "hash":"same-hash"
+        }]})
+    }
+    async fn until_drop(socket: &mut ServerSocket) -> usize {
+        let mut heartbeats = 0;
+        while let Some(Ok(frame)) = socket.next().await {
+            match frame {
+                Message::Text(text) => {
+                    assert_eq!(text.as_str(), "PING");
+                    heartbeats += 1;
+                    // The client can drop between receive and this send at cutoff.
+                    if socket.send(Message::Text("PONG".into())).await.is_err() {
+                        break;
+                    }
+                }
+                Message::Close(_) => break,
+                Message::Pong(_) => {}
+                other => panic!("unexpected client frame: {other:?}"),
+            }
+        }
+        heartbeats
+    }
+    async fn bounded<F: std::future::Future>(future: F) -> F::Output {
+        timeout(Duration::from_secs(5), future)
+            .await
+            .expect("local fixture deadline")
+    }
+    fn never_cancel() -> impl std::future::Future<Output = std::io::Result<()>> {
+        std::future::pending()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_orchestration_matches_controls_and_preserves_auditable_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        // Only this test reads the retention variable. Never overwrites a run.
+        let destination = std::env::var_os("PROBE_TEST_EVIDENCE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| temp.path().join("trial"));
+        std::fs::create_dir(&destination).unwrap();
+        let config = local_config(destination);
+        let (listener, network) = local_network(&config).await;
+        let mut probe = file_probe(config);
+        probe.report.write_all(b"> LOCAL SYNTHETIC TEST ONLY: accelerated 20ms starts, 50ms heartbeats, zero warmup, 1s measurement, 200ms guards. Not latency evidence. Production timing descriptions below do not apply to this fixture.\n\n").unwrap();
+        probe.evidence.row(&json!({"type":"metadata", "format_version":1,
+            "config":probe.config, "endpoint":network.endpoint,
+            "test_only":true, "latency_evidence":false, "timing":"accelerated real monotonic clock, not paused",
+            "start_gap_ns":network.start_gap.as_nanos(), "heartbeat_ns":network.heartbeat.as_nanos(),
+            "window_ns":probe.matcher.window_ns, "matcher":"three-block-full-content-v1",
+            "policy":{"matcher":"three-block-full-content-v1", "matcher_advance_logged":true,"guard_blocks":3,"financial_scale":1_000_000},
+            "fixture":"unique 7; repeated 8 twice A/once B; unmatched 9 on A; identical hash and exchange timestamp"})).unwrap();
+        let server = async {
+            let mut a = accept_subscription(&listener).await;
+            let mut b = accept_subscription(&listener).await;
+            a.send(book()).await.unwrap();
+            b.send(book()).await.unwrap();
+            a.send(Message::Ping(vec![1, 2, 3].into())).await.unwrap();
+            // Verify the protocol-level pong, not just the evidence of a ping.
+            loop {
+                match a.next().await.unwrap().unwrap() {
+                    Message::Pong(payload) => {
+                        assert_eq!(payload.as_ref(), &[1, 2, 3]);
+                        break;
+                    }
+                    Message::Text(text) => assert_eq!(text.as_str(), "PING"),
+                    other => panic!("expected pong: {other:?}"),
+                }
+            }
+            a.send(Message::Pong(vec![4, 5].into())).await.unwrap();
+            b.send(Message::Text("PONG".into())).await.unwrap();
+            // Middle of the [200,400)ms block; a full guard on either side.
+            sleep(Duration::from_millis(300)).await;
+            a.send(Message::Text(
+                json!([change("7.0000000"), change("8"), change("8"), change("9")])
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            b.send(Message::Text(
+                json!([change("7"), change("8.0")]).to_string().into(),
+            ))
+            .await
+            .unwrap();
+            let (ha, hb) = tokio::join!(until_drop(&mut a), until_drop(&mut b));
+            assert!(
+                ha > 0 && hb > 0,
+                "both feeds must send application heartbeats"
+            );
+        };
+        let (result, ()) =
+            bounded(async { tokio::join!(drive(&mut probe, &network, never_cancel()), server) })
+                .await;
+        result.unwrap();
+        assert_eq!(probe.samples.len(), 1);
+        assert_eq!(counts(&probe.matcher, "A").matched, [1, 1]);
+        assert_eq!(counts(&probe.matcher, "A").ambiguous, [2, 1]);
+        assert_eq!(counts(&probe.matcher, "A").unmatched, [1, 0]);
+        let rows = raw(&probe);
+        complete(&rows, true);
+        assert_eq!(rows[0]["policy"]["matcher_advance_logged"], true);
+        let advances: Vec<_> = rows
+            .iter()
+            .filter(|r| r["type"] == "matcher_advance")
+            .collect();
+        assert!(!advances.is_empty() && advances.len() <= 5);
+        assert!(advances.iter().all(
+            |r| r["mono_ns"].as_u64().unwrap() <= probe.measured_start.unwrap() + 1_000_000_000
+        ));
+        let matched_at = rows.iter().position(|r| r["type"] == "match").unwrap();
+        assert_eq!(rows[matched_at - 1]["type"], "matcher_advance");
+        assert!(rows.iter().any(|r| r["frame"] == "ping"));
+        assert!(rows.iter().any(|r| r["frame"] == "pong"));
+        for source in 0..2 {
+            let received: Vec<_> = rows
+                .iter()
+                .filter(|r| r["type"] == "received" && r["source"] == source)
+                .collect();
+            for (index, row) in received.iter().enumerate() {
+                assert_eq!(row["ordinal"], index + 1);
+                assert_eq!(row["generation"], 0);
+            }
+        }
+        let attempts: Vec<_> = rows
+            .iter()
+            .filter(|r| r["details"]["phase"] == "attempt")
+            .collect();
+        assert_eq!(attempts.len(), 2);
+        assert!(
+            attempts[1]["stamp"]["mono_ns"].as_u64().unwrap()
+                - attempts[0]["stamp"]["mono_ns"].as_u64().unwrap()
+                >= network.start_gap.as_nanos() as u64
+        );
+        assert!(
+            std::fs::read_to_string(probe.config.destination.join("report.md"))
+                .unwrap()
+                .contains("completed bounded trial")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "bounded local load/RSS qualification; run alone, never latency evidence"]
+    async fn local_bounded_load_retains_every_offered_event() {
+        use std::io::BufRead;
+        const BATCHES: usize = 1000;
+        const EVENTS_PER_BATCH: usize = 20;
+        const PERIOD: Duration = Duration::from_millis(5);
+        let temp = tempfile::tempdir().unwrap();
+        let destination = std::env::var_os("PROBE_TEST_LOAD_EVIDENCE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| temp.path().join("load"));
+        std::fs::create_dir(&destination).unwrap();
+        let mut config = local_config(destination);
+        config.seconds = 7;
+        config.raw_bytes = 64 << 20;
+        config.raw_observations = 10_000;
+        config.matcher_entries = 100_000;
+        config.matcher_bytes = 64 << 20;
+        let (listener, mut network) = local_network(&config).await;
+        // Heartbeat/control behavior is covered by the short fixture. Retain
+        // production heartbeat here so the fake can concentrate on offered load.
+        network.heartbeat = Duration::from_secs(10);
+        let mut probe = file_probe(config);
+        probe.report.write_all(b"> LOCAL SYNTHETIC LOAD TEST ONLY: 20ms starts, zero warmup, 7s measurement, 200ms guards. Not latency evidence. Production timing descriptions below do not apply.\n\n").unwrap();
+        probe.evidence.row(&json!({"type":"metadata", "format_version":1,
+            "config":probe.config, "endpoint":network.endpoint, "test_only":true, "latency_evidence":false,
+            "timing":"real monotonic clock; accelerated starts and measurement; absolute offered schedule",
+            "policy":{"matcher":"three-block-full-content-v1", "matcher_advance_logged":true,
+                "guard_blocks":3, "financial_scale":1_000_000},
+            "load":{"sources":2,"batches_per_source":BATCHES,"events_per_batch":EVENTS_PER_BATCH,
+                "period_ns":PERIOD.as_nanos(),"offered_events_per_second_per_source":4000,
+                "total_canonical_changes":2*BATCHES*EVENTS_PER_BATCH,"max_generator_lateness_ns":250_000_000},
+            "rss_scope":"whole test process including local fake, probe, report and streaming evidence verification"})).unwrap();
+        let server = async {
+            let mut a = accept_subscription(&listener).await;
+            let mut b = accept_subscription(&listener).await;
+            a.send(book()).await.unwrap();
+            b.send(book()).await.unwrap();
+            let first = tokio::time::Instant::now() + Duration::from_millis(500);
+            let mut max_lateness = Duration::ZERO;
+            for batch in 0..BATCHES {
+                let scheduled = first + PERIOD * batch as u32;
+                tokio::time::sleep_until(scheduled).await;
+                // Unique quantities retain canonical equality across sources,
+                // without relying on hashes or timestamps for uniqueness.
+                let events: Vec<_> = (0..EVENTS_PER_BATCH)
+                    .map(|i| change(&(10 + batch * EVENTS_PER_BATCH + i).to_string()))
+                    .collect();
+                let frame = Message::Text(serde_json::to_string(&events).unwrap().into());
+                a.send(frame.clone()).await.unwrap();
+                b.send(frame).await.unwrap();
+                max_lateness = max_lateness.max(scheduled.elapsed());
+                assert!(
+                    max_lateness <= Duration::from_millis(250),
+                    "offered-load schedule missed: {max_lateness:?}; cannot claim requested rate"
+                );
+            }
+            tokio::join!(until_drop(&mut a), until_drop(&mut b));
+            max_lateness
+        };
+        let (result, max_lateness) = timeout(Duration::from_secs(15), async {
+            tokio::join!(drive(&mut probe, &network, never_cancel()), server)
+        })
+        .await
+        .expect("local load deadline");
+        result.unwrap();
+        assert_eq!(probe.matcher.resource_resets, 0);
+        assert_eq!(probe.observations, (2 * BATCHES + 2) as u64);
+        assert_eq!(probe.captured_observations, probe.observations);
+        let counts = counts(&probe.matcher, "A");
+        for source in 0..2 {
+            assert_eq!(counts.seen[source], (BATCHES * EVENTS_PER_BATCH) as u64);
+            assert_eq!(
+                counts.matched[source]
+                    + counts.ambiguous[source]
+                    + counts.unmatched[source]
+                    + counts.censored[source],
+                counts.seen[source]
+            );
+        }
+        assert!(!probe.samples.is_empty());
+        // Stream verification: do not inflate the RSS measurement by retaining
+        // a second complete parsed copy of the evidence file.
+        let path = probe.config.destination.join("raw.jsonl");
+        let mut retained_rows = 0;
+        let mut received_rows = 0;
+        let mut matched_rows = 0;
+        let mut last = Value::Null;
+        for line in std::io::BufReader::new(File::open(&path).unwrap()).lines() {
+            let row: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            retained_rows += 1;
+            received_rows += u64::from(row["type"] == "received");
+            matched_rows += u64::from(row["type"] == "match");
+            last = row;
+        }
+        complete(std::slice::from_ref(&last), true);
+        assert_eq!(last["errors"], json!([]));
+        assert_eq!(retained_rows, probe.evidence.rows);
+        assert_eq!(received_rows, probe.observations);
+        assert_eq!(matched_rows, probe.samples.len() as u64);
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        assert!(bytes <= probe.config.raw_bytes);
+        eprintln!(
+            "LOCAL LOAD ONLY: offered=4000 changes/s/source, sources=2, total_changes=40000, batches/source=1000, period=5ms; generator_max_lateness_ns={}; retained_rows={retained_rows}; received_rows={received_rows}; matched_pairs={matched_rows}; raw_bytes={bytes}; counts={}; max_queue_age_ns={}; max_processing_ns={}; max_tick_lateness_ns={}",
+            max_lateness.as_nanos(),
+            serde_json::to_string(counts).unwrap(),
+            probe.max_queue_age_ns,
+            probe.max_processing_ns,
+            probe.max_tick_lateness_ns
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_bad_frames_close_and_eof_are_terminal_without_retries() {
+        let cases = [
+            (Some(Message::Close(None)), "close"),
+            (Some(Message::Binary(vec![1, 2].into())), "binary"),
+            (Some(Message::Text("not-json".into())), "JSON"),
+            (
+                Some(Message::Text(r#"{"event_type":"rejected"}"#.into())),
+                "unknown event",
+            ),
+            (
+                Some(Message::Text("x".repeat(MESSAGE_BYTES + 1).into())),
+                "Space limit",
+            ),
+            (None, "reset"),
+        ];
+        for (frame, expected) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let config = local_config(temp.path().into());
+            let (listener, mut network) = local_network(&config).await;
+            network.start_gap = Duration::from_secs(2);
+            let mut probe = file_probe(config);
+            let server = async {
+                let mut socket = accept_subscription(&listener).await;
+                if let Some(frame) = frame {
+                    // An oversized message may be rejected while the server is writing.
+                    let _ = socket.send(frame).await;
+                    until_drop(&mut socket).await;
+                }
+            };
+            let (result, ()) = bounded(async {
+                tokio::join!(drive(&mut probe, &network, never_cancel()), server)
+            })
+            .await;
+            let error = format!("{:#}", result.unwrap_err());
+            if expected == "JSON" {
+                assert!(
+                    error.contains("expected") || error.contains("JSON"),
+                    "{error}"
+                );
+            } else {
+                assert!(
+                    error.to_lowercase().contains(&expected.to_lowercase()),
+                    "{error}"
+                );
+            }
+            let rows = raw(&probe);
+            complete(&rows, false);
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r["details"]["phase"] == "attempt")
+                    .count(),
+                1
+            );
+            assert!(probe.measured_start.is_none());
+            assert!(
+                timeout(Duration::from_millis(20), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_handshake_and_initialization_deadlines_are_terminal() {
+        use tokio::io::AsyncReadExt;
+        for handshake in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = local_config(temp.path().into());
+            let (listener, mut network) = local_network(&config).await;
+            network.start_gap = Duration::from_secs(2);
+            network.connect_timeout = Duration::from_millis(100);
+            network.init_timeout = Duration::from_millis(200);
+            let mut probe = file_probe(config);
+            let server = async {
+                if handshake {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    socket.read_to_end(&mut bytes).await.unwrap();
+                    assert!(bytes.starts_with(b"GET /ws/market HTTP/1.1"));
+                } else {
+                    let mut socket = accept_subscription(&listener).await;
+                    until_drop(&mut socket).await;
+                }
+            };
+            let (result, ()) = bounded(async {
+                tokio::join!(drive(&mut probe, &network, never_cancel()), server)
+            })
+            .await;
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(
+                error.contains(if handshake {
+                    "connect deadline"
+                } else {
+                    "failed complete snapshot coverage"
+                }),
+                "{error}"
+            );
+            complete(&raw(&probe), false);
+            assert!(probe.ready_ns.iter().all(Option::is_none));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_cancellation_during_handshake_drops_socket_and_pending_start() {
+        use tokio::io::AsyncReadExt;
+        let temp = tempfile::tempdir().unwrap();
+        let config = local_config(temp.path().into());
+        let (listener, mut network) = local_network(&config).await;
+        network.start_gap = Duration::from_secs(2);
+        let mut probe = file_probe(config);
+        let (cancel, cancelled) = oneshot::channel();
+        let server = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 1024];
+            assert!(socket.read(&mut bytes).await.unwrap() > 0);
+            cancel.send(()).unwrap();
+            let mut tail = Vec::new();
+            socket.read_to_end(&mut tail).await.unwrap();
+        };
+        let signal = async {
+            cancelled.await.unwrap();
+            Ok(())
+        };
+        let (result, ()) =
+            bounded(async { tokio::join!(drive(&mut probe, &network, signal), server) }).await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("SIGINT: incomplete trial"));
+        let rows = raw(&probe);
+        complete(&rows, false);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["details"]["phase"] == "attempt")
+                .count(),
+            1
+        );
+        assert!(
+            timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_renewal_closes_before_replacement_and_resets_generation() {
+        for trial in [1, 2] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut config = local_config(temp.path().into());
+            config.cohort = "renewal".into();
+            config.trial = trial;
+            let treatment = config.treatment();
+            let (listener, network) = local_network(&config).await;
+            let mut probe = file_probe(config);
+            let server = async {
+                let mut sockets = [
+                    accept_subscription(&listener).await,
+                    accept_subscription(&listener).await,
+                ];
+                for socket in &mut sockets {
+                    socket.send(book()).await.unwrap();
+                }
+                // Treatment must close before its sole replacement is accepted.
+                loop {
+                    match sockets[treatment].next().await.unwrap().unwrap() {
+                        Message::Close(_) => break,
+                        Message::Text(text) => assert_eq!(text.as_str(), "PING"),
+                        other => panic!("unexpected pre-renewal frame {other:?}"),
+                    }
+                }
+                let mut replacement = accept_subscription(&listener).await;
+                replacement.send(book()).await.unwrap();
+                let (_, _) = tokio::join!(
+                    until_drop(&mut replacement),
+                    until_drop(&mut sockets[1 - treatment])
+                );
+            };
+            let (result, ()) = bounded(async {
+                tokio::join!(drive(&mut probe, &network, never_cancel()), server)
+            })
+            .await;
+            result.unwrap();
+            assert!(probe.renewal_ready_ns.unwrap() >= probe.renewal_start.unwrap());
+            let rows = raw(&probe);
+            complete(&rows, true);
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r["type"] == "renewal_cutoff")
+                    .count(),
+                1
+            );
+            let attempts: Vec<_> = rows
+                .iter()
+                .filter(|r| r["details"]["phase"] == "attempt")
+                .collect();
+            assert_eq!(attempts.len(), 3);
+            for pair in attempts.windows(2) {
+                assert!(
+                    pair[1]["stamp"]["mono_ns"].as_u64().unwrap()
+                        - pair[0]["stamp"]["mono_ns"].as_u64().unwrap()
+                        >= network.start_gap.as_nanos() as u64
+                );
+            }
+            assert_eq!(attempts[2]["source"], treatment);
+            assert_eq!(attempts[2]["generation"], 1);
+            let renewed: Vec<_> = rows
+                .iter()
+                .filter(|r| r["type"] == "received" && r["generation"] == 1)
+                .collect();
+            assert!(!renewed.is_empty());
+            assert_eq!(renewed[0]["ordinal"], 1);
+            assert!(
+                rows.iter()
+                    .any(|r| r["type"] == "all_initial_snapshots_observed" && r["generation"] == 1)
+            );
+            assert!(
+                timeout(Duration::from_millis(20), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_renewal_refuses_incomplete_peer_coverage() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = local_config(temp.path().into());
+        config.cohort = "renewal".into();
+        let (listener, network) = local_network(&config).await;
+        let mut probe = file_probe(config);
+        let server = async {
+            let mut a = accept_subscription(&listener).await;
+            let mut b = accept_subscription(&listener).await;
+            a.send(book()).await.unwrap();
+            tokio::join!(until_drop(&mut a), until_drop(&mut b));
+        };
+        let (result, ()) =
+            bounded(async { tokio::join!(drive(&mut probe, &network, never_cancel()), server) })
+                .await;
+        assert!(
+            format!("{:#}", result.unwrap_err())
+                .contains("renewal refused: peer coverage incomplete")
+        );
+        complete(&raw(&probe), false);
+        assert!(probe.renewal_start.is_none());
+        assert!(
+            timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_port_binding_is_actual_and_conflict_is_terminal() {
+        for occupied in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = reservation.local_addr().unwrap().port();
+            let mut config = local_config(temp.path().into());
+            config.cohort = "source-port".into();
+            config.local_port = Some(port);
+            let (listener, mut network) = local_network(&config).await;
+            network.start_gap = Duration::from_secs(2);
+            let mut probe = file_probe(config);
+            let held = occupied.then_some(reservation);
+            let (cancel, cancelled) = oneshot::channel();
+            let server = async {
+                let mut socket = accept_subscription(&listener).await;
+                assert_eq!(socket.get_ref().peer_addr().unwrap().port(), port);
+                socket.send(book()).await.unwrap();
+                // Receipt of ping/pong establishes that the feed is polling.
+                socket.send(Message::Ping(vec![9].into())).await.unwrap();
+                loop {
+                    if matches!(socket.next().await.unwrap().unwrap(), Message::Pong(_)) {
+                        break;
+                    }
+                }
+                cancel.send(()).unwrap();
+                until_drop(&mut socket).await;
+            };
+            let result = if occupied {
+                bounded(drive(&mut probe, &network, never_cancel())).await
+            } else {
+                let signal = async {
+                    cancelled.await.unwrap();
+                    Ok(())
+                };
+                let (result, ()) =
+                    bounded(async { tokio::join!(drive(&mut probe, &network, signal), server) })
+                        .await;
+                result
+            };
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(
+                error.contains(if occupied {
+                    "Address already in use"
+                } else {
+                    "SIGINT"
+                }),
+                "{error}"
+            );
+            complete(&raw(&probe), false);
+            if !occupied {
+                let rows = raw(&probe);
+                let connected = rows
+                    .iter()
+                    .find(|r| r["details"]["phase"] == "connected")
+                    .unwrap();
+                assert_eq!(connected["details"]["requested_local_port"], port);
+                assert_eq!(
+                    connected["details"]["local"]
+                        .as_str()
+                        .unwrap()
+                        .parse::<SocketAddr>()
+                        .unwrap()
+                        .port(),
+                    port
+                );
+            }
+            assert!(
+                timeout(Duration::from_millis(20), listener.accept())
+                    .await
+                    .is_err()
+            );
+            drop(held);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_full_ingress_stops_real_feed_without_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = local_config(temp.path().into());
+        let (listener, network) = local_network(&config).await;
+        let origin = Instant::now();
+        let budget = ConnectionBudget {
+            next: Cell::new(origin),
+            gap: network.start_gap,
+        };
+        // Attempt, connected, subscription occupy all three slots. The received
+        // book must fail the real feed handoff, never silently disappear.
+        let (tx, mut rx) = mpsc::channel(3);
+        let server = async {
+            let mut socket = accept_subscription(&listener).await;
+            socket.send(book()).await.unwrap();
+            until_drop(&mut socket).await;
+        };
+        let (result, ()) = bounded(async {
+            tokio::join!(feed(&config, 0, origin, tx, &budget, &network), server)
+        })
+        .await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("probe input full/closed"));
+        assert!(matches!(rx.try_recv().unwrap(), Input::Connected { .. }));
+        assert!(matches!(rx.try_recv().unwrap(), Input::Connected { .. }));
+        assert!(matches!(rx.try_recv().unwrap(), Input::Sent { .. }));
+        assert!(rx.try_recv().is_err());
+        assert!(
+            timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    // A recoverable-on-next-call sink detects unsafe implicit retries, including
+    // BufWriter::drop. It injects at the actual buffered writer boundary.
+    #[derive(Default)]
+    struct OutputState {
+        bytes: Vec<u8>,
+        fail_after: Option<usize>,
+        fail_flush: bool,
+        fail_sync: bool,
+        failed: bool,
+        writes_after_failure: usize,
+        delay_once: Option<Duration>,
+    }
+    #[derive(Clone, Default)]
+    struct TestOutput(std::rc::Rc<std::cell::RefCell<OutputState>>);
+    impl Write for TestOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let mut state = self.0.borrow_mut();
+            if let Some(delay) = state.delay_once.take() {
+                std::thread::sleep(delay);
+            }
+            if state.failed {
+                state.writes_after_failure += 1;
+            } else if let Some(limit) = state.fail_after {
+                if state.bytes.len() >= limit {
+                    state.failed = true;
+                    return Err(std::io::Error::other("injected write failure"));
+                }
+                let count = bytes.len().min(limit - state.bytes.len());
+                state.bytes.extend_from_slice(&bytes[..count]);
+                return Ok(count);
+            }
+            state.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            let mut state = self.0.borrow_mut();
+            if state.fail_flush && !state.failed {
+                state.failed = true;
+                return Err(std::io::Error::other("injected flush failure"));
+            }
+            Ok(())
+        }
+    }
+    impl EvidenceSink for TestOutput {
+        fn sync_all(&self) -> std::io::Result<()> {
+            if self.0.borrow().fail_sync {
+                Err(std::io::Error::other("injected sync failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_bufwriter_drop_retries_a_failed_partial_flush() {
+        // Regression reproducer for the old writer ownership: failed_write
+        // alone cannot prevent the BufWriter destructor from writing again.
+        let sink = TestOutput::default();
+        sink.0.borrow_mut().fail_after = Some(3);
+        let mut writer = BufWriter::with_capacity(32, sink.clone());
+        writer.write_all(b"abcdef").unwrap();
+        assert!(writer.flush().is_err());
+        assert_eq!(sink.0.borrow().bytes, b"abc");
+        drop(writer);
+        assert_eq!(sink.0.borrow().writes_after_failure, 1);
+        assert_eq!(sink.0.borrow().bytes, b"abcdef");
+    }
+
+    #[test]
+    fn failed_partial_evidence_never_retries_or_appends_success() {
+        for direct in [false, true] {
+            for prefix in [0, 3] {
+                let sink = TestOutput::default();
+                sink.0.borrow_mut().fail_after = Some(prefix);
+                let mut evidence = Evidence::new(sink.clone(), 1 << 20);
+                let row = json!({"payload":"x".repeat(if direct { 100_000 } else { 100 })});
+                let result = evidence.row(&row);
+                assert_eq!(result.is_err(), direct);
+                assert!(
+                    evidence
+                        .finish(&json!({"type":"complete", "successful":true}))
+                        .is_err()
+                );
+                assert!(evidence.failed_write);
+                assert!(evidence.row(&json!({"payload":"must not retry"})).is_err());
+                assert!(
+                    evidence
+                        .finish(&json!({"type":"complete", "successful":false}))
+                        .is_err()
+                );
+                drop(evidence);
+                let state = sink.0.borrow();
+                assert_eq!(state.bytes.len(), prefix);
+                assert_eq!(state.writes_after_failure, 0);
+                assert!(!String::from_utf8_lossy(&state.bytes).contains("complete"));
+            }
+        }
+    }
+
+    #[test]
+    fn partial_terminal_marker_is_not_retried_into_success() {
+        let sink = TestOutput::default();
+        let mut evidence = Evidence::new(sink.clone(), 1 << 20);
+        evidence.row(&json!({"type":"prefix"})).unwrap();
+        let prefix_len = evidence.bytes as usize;
+        sink.0.borrow_mut().fail_after = Some(prefix_len + 3);
+        assert!(
+            evidence
+                .finish(&json!({"type":"complete", "successful":true}))
+                .is_err()
+        );
+        drop(evidence);
+        let state = sink.0.borrow();
+        assert_eq!(state.bytes.len(), prefix_len + 3);
+        assert_eq!(state.writes_after_failure, 0);
+        let mut lines = state.bytes.split(|b| *b == b'\n');
+        assert_eq!(
+            serde_json::from_slice::<Value>(lines.next().unwrap()).unwrap()["type"],
+            "prefix"
+        );
+        assert!(serde_json::from_slice::<Value>(lines.next().unwrap()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_report_write_failure_marks_raw_completion_unsuccessful() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = local_config(temp.path().into());
+        config.seconds = 0;
+        let (listener, network) = local_network(&config).await;
+        let mut probe = file_probe(config);
+        probe.report = OpenOptions::new().write(true).open("/dev/full").unwrap();
+        let server = async {
+            let mut a = accept_subscription(&listener).await;
+            let mut b = accept_subscription(&listener).await;
+            a.send(book()).await.unwrap();
+            b.send(book()).await.unwrap();
+            tokio::join!(until_drop(&mut a), until_drop(&mut b));
+        };
+        let (result, ()) =
+            bounded(async { tokio::join!(drive(&mut probe, &network, never_cancel()), server) })
+                .await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("report:"));
+        assert!(probe.ready_ns.iter().all(Option::is_some));
+        let rows = raw(&probe);
+        complete(&rows, false);
+        assert!(
+            rows.last().unwrap()["errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str().unwrap().starts_with("report:"))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_final_output_failures_cannot_return_success() {
+        for failure in ["write", "partial", "flush", "sync"] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut config = local_config(temp.path().into());
+            config.seconds = 0; // Finalization test only, not a measurement.
+            let (listener, network) = local_network(&config).await;
+            let sink = TestOutput::default();
+            {
+                let mut state = sink.0.borrow_mut();
+                state.fail_after = match failure {
+                    "write" => Some(0),
+                    "partial" => Some(3),
+                    _ => None,
+                };
+                state.fail_flush = failure == "flush";
+                state.fail_sync = failure == "sync";
+            }
+            let mut probe = local_probe(config, Evidence::new(sink.clone(), 1 << 20));
+            let server = async {
+                let mut a = accept_subscription(&listener).await;
+                let mut b = accept_subscription(&listener).await;
+                a.send(book()).await.unwrap();
+                b.send(book()).await.unwrap();
+                tokio::join!(until_drop(&mut a), until_drop(&mut b));
+            };
+            let (result, ()) = bounded(async {
+                tokio::join!(drive(&mut probe, &network, never_cancel()), server)
+            })
+            .await;
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(
+                error.contains("evidence finalization") && error.contains("injected"),
+                "{error}"
+            );
+            assert!(probe.ready_ns.iter().all(Option::is_some));
+            drop(probe);
+            let state = sink.0.borrow();
+            assert_eq!(state.writes_after_failure, 0);
+            let raw = String::from_utf8_lossy(&state.bytes);
+            if failure != "sync" {
+                assert!(!raw.contains("\"type\":\"complete\""), "{raw}");
+            } else {
+                // sync_all may fail AFTER a fully written marker. The marker
+                // remains provisional: drive/CLI must fail, not claim durability.
+                assert!(raw.contains("\"type\":\"complete\""));
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_slow_evidence_write_invalidates_active_trial() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = local_config(temp.path().into());
+        let (_listener, network) = local_network(&config).await;
+        let sink = TestOutput::default();
+        sink.0.borrow_mut().delay_once = Some(Duration::from_millis(1100));
+        let mut evidence = Evidence::new(sink.clone(), 1 << 20);
+        // Fill almost all of the real 64KiB buffer so the first connection row
+        // forces synchronous physical I/O while feeds are still active.
+        evidence
+            .row(&json!({"padding":"x".repeat(65_500)}))
+            .unwrap();
+        let mut probe = local_probe(config, evidence);
+        let error = format!(
+            "{:#}",
+            bounded(drive(&mut probe, &network, never_cancel()))
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            error.contains("local processing/queue stall exceeds 1s"),
+            "{error}"
+        );
+        assert!(probe.max_processing_ns > 1_000_000_000);
+        let bytes = sink.0.borrow().bytes.clone();
+        let rows: Vec<Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        complete(&rows, false);
+        assert!(probe.measured_start.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_real_sigint_cancels_both_sockets_in_isolated_process() {
+        const CHILD: &str = "PROBE_SIGINT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Never send a process-wide signal into the parallel test runner.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::local_real_sigint_cancels_both_sockets_in_isolated_process",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let start = Instant::now();
+            while child.try_wait().unwrap().is_none() {
+                if start.elapsed() > Duration::from_secs(10) {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "SIGINT child deadline: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let config = local_config(temp.path().into());
+        let (listener, network) = local_network(&config).await;
+        let mut probe = file_probe(config);
+        let server = async {
+            let mut a = accept_subscription(&listener).await;
+            let mut b = accept_subscription(&listener).await;
+            for socket in [&mut a, &mut b] {
+                socket.send(book()).await.unwrap();
+                socket.send(Message::Ping(vec![42].into())).await.unwrap();
+                loop {
+                    if matches!(socket.next().await.unwrap().unwrap(), Message::Pong(_)) {
+                        break;
+                    }
+                }
+            }
+            assert!(
+                std::process::Command::new("kill")
+                    .args(["-INT", &std::process::id().to_string()])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            tokio::join!(until_drop(&mut a), until_drop(&mut b));
+        };
+        let (result, ()) = bounded(async {
+            tokio::join!(drive(&mut probe, &network, tokio::signal::ctrl_c()), server)
+        })
+        .await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("SIGINT: incomplete trial"));
+        let rows = raw(&probe);
+        complete(&rows, false);
+        for source in 0..2 {
+            assert!(
+                rows.iter()
+                    .any(|r| r["type"] == "received" && r["source"] == source)
+            );
+        }
+        assert!(
+            timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
     }
 }

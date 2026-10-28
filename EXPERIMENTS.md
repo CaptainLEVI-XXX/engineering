@@ -1384,3 +1384,397 @@ each**, opt-in probes ignored), strict all-target Clippy, diff checks and **14**
 Python runner tests. Source clocks and candidates are archived, not integrated.
 No live runs, commits or pushes. Results, exact patches, binaries' hashes,
 commands and `summary.json` are under `.amp/in/artifacts/harness/e21/`.
+
+## Full-owner capacity repair after frozen E21 (2026-10-28)
+
+User-authorized correctness/capacity follow-up, not resumption of H17/H18.
+Scope: preserve C1–C5 ownership and financial contracts; reproduce the production
+owner's missing load conditions before changing architecture or resource budgets.
+
+### Two localized changes, not full-universe qualification
+
+- C4 readiness feedback previously scanned every retained source after each
+  input. A bounded set now indexes active sources awaiting acknowledgment.
+  All original readiness predicates remain authoritative; retries, subscription
+  churn, disconnect and generation-matched acknowledgment preserve membership.
+  The public lifecycle regression also checks invalid-data readiness retraction.
+- C5's soft size watermark could publish the last partly used batch during a
+  writer pause, making the next record fail despite unused bounded storage.
+  Size publication now follows the existing age policy: retain the final batch
+  when other batches are outstanding. Hard byte/descriptor limits, single-batch
+  behavior, FIFO output and terminal failure remain unchanged. No pool enlargement.
+  The extended writer-pause regression failed before this fix; afterwards all
+  100 ordered records and control ordinals survived. The prefix-exhaustion test
+  now reaches a hard two-descriptor bound rather than assuming a soft watermark
+  must consume all capacity; its two-record prefix/failure assertions are intact.
+
+### Production-owner diagnostic and controls
+
+`src/owner_load_tests.rs` exercises actual `process_books`, bounded ingress,
+health maintenance, 60-second snapshots, recorder and file output. Initialization
+is paced by readiness; offered arrivals then use independent absolute deadlines.
+550,000 books have native-width IDs and 0–8 levels per side. Offered messages
+contain 80% single-level absolute changes/deletes with regressing exchange times
+and 20% ignored trade events. An independent arithmetic oracle checks every
+output delta and snapshot after drain. Runs of at least 65 seconds require a
+periodic capture for every initialized book. REST, sockets, ongoing discovery
+churn and live burst distributions are excluded. This is not a p99 benchmark.
+
+Evidence: `.amp/in/artifacts/owner-capacity/`.
+
+- Frozen owner at 550k books / 10k messages/s / 70s passed: 1,660,000 records,
+  including 550,000 periodic captures. A 50k/s profile attributed about 13.3%
+  sampled owner user CPU to readiness scanning/collection.
+- Two completed 50k/s / 20s pairs had whole-process CPU 31.82→29.92s and
+  30.90→30.30s. A third baseline failed during initialization; do not count it as
+  a successful pair. The initial harness omitted production's writer-startup
+  barrier; that omission was corrected rather than hidden.
+- At 100k/s / 70s, both frozen and readiness-only versions failed output-pool
+  exhaustion during periodic captures. This is not a replay of the live ingress
+  failure, and these timing-dependent failures alone do not prove causality.
+- Combined changes passed twice at 550k / 100k/s / 70s: 7,000,000 offered inputs,
+  **6,700,000 matching financial records**, including 550,000 periodic captures
+  in each run. The second run also enforced per-book periodic coverage. Maximum
+  producer lateness was 24.647/16.751ms; owner-reported maximum ingress age was
+  104.161/85.783ms. These maxima are not quantiles or sustainable-capacity claims.
+- A scratch oracle altered by one scaled quantity unit failed as intended
+  (1,000,000 versus 1,000,001); no negative-control code entered production.
+- Full debug and release suites passed **166 tests each**, with opt-in probes
+  ignored. Format, all-target check and strict Clippy passed; the strengthened
+  harness subsequently passed its full-size run and static checks again.
+
+### Live evidence still fails the acceptance gate
+
+All attempts used unfiltered V1/V2, one replica, at most 640 sockets, 10 GiB RSS
+and 20 GiB output. Market traffic differs between attempts; duration comparisons
+are not controlled speedups.
+
+- Frozen: ingress queue full at 637.25s. All 12,254,647 decoded archive records
+  were internally consistent; 2,107,858 periodic captures matched replay.
+- Readiness-only: output-pool exhaustion at 389.46s; 5,952,483 confirmed records.
+  Not independently archive-validated in this follow-up.
+- Combined: ingress queue full at **736.98s**, not recorder exhaustion. Peak RSS
+  4,610,256,896 bytes; 17,187,614 confirmed records in 46 completed chunks. All
+  **2,849,838 periodic snapshots** matched independent absolute-delta replay.
+  Recorder failure position was null; upstream intake/drain was incomplete and
+  the footer correctly reports failure. This does **not** fix full-universe
+  capture. Final desired count was 551,718, with 44 unresolved V1 records and
+  missing live identities; rolling health counts are not coverage evidence.
+
+Artifacts: `.amp/in/artifacts/full-universe-20261028-1631/`,
+`full-universe-readiness-20261028/` and `full-universe-capacity-fixed-20261028/`
+under the same artifact root. They retain manifests, binary hashes, resources,
+stderr, archives and sidecars; the first and third also have replay/coverage
+analysis. No raw-feed oracle or exchange-wide losslessness claim.
+
+### Measured burst allowance: completed intake/drain, coverage still incomplete
+
+A separate temporary diagnostic build retained up to 4,096 owner timing rows
+and the 64 slowest data payloads over 5ms, writing them only after processing
+finished. Five wall-time spans cover process, control provenance, tick/maintain,
+periodic capture and feedback/hints. One-second windows include queue high-water,
+queue age and processed counts. These measurements perturb execution and are
+not latency benchmarks. The profiler service restarted and overwrote its main
+capture; no CPU attribution from that attempt is used here.
+
+The diagnostic used **65,536 items with the unchanged 64 MiB byte budget**.
+Six pre-cutoff windows exceeded 8,192 queued messages. The largest reached
+**23,404** at 933.75s, then ended with four messages queued. It processed 36,466
+messages in that window; maximum processing span was 336µs and queue age
+123.954ms. Across complete pre-cutoff windows, maximum queue age was 141.678ms.
+A separate 91.722ms desired-state operation occurred earlier, but is not the
+cause of that largest burst. The trace does not identify whether exchange/network
+batching or worker scheduling produced the burst. It does show recovery rather
+than sustained owner saturation in these observations; sharding is not justified
+by the original failure alone. Shutdown age maxima are reported separately and
+must not be mistaken for pre-cutoff processing stalls.
+
+The **1,000-second** bounded run completed and drained in 1,003.29s, exit 0,
+without forced termination. 553 workers / 559 sessions received and drained
+**11,689,868 messages**. All **22,799,660** financial records decoded with the
+supplied reader; all **4,028,901** periodic snapshots matched independent replay.
+Peak RSS was 4,581,314,560 bytes; recorder error was absent and run footer success
+was true. These establish local intake/drain and archive consistency, not feed
+completeness. The build uses the same production library plus diagnostic timing;
+the final uninstrumented executable has not had a second full-universe run.
+
+The executable now defaults to the tested 65,536-item allowance, with headroom
+above the observed burst. Byte accounting, message limits, terminal overload,
+FIFO and per-session ordering are unchanged. Queue-slot allocation increases
+outside the byte-credit accounting; this is a finite burst budget, **not a
+computational optimization**. `--queue-items` remains configurable. The new
+deterministic regression with an unscheduled consumer fails at the old default
+and preserves 25,000 payloads, timestamps and ordinals at the new default.
+The independent steady-load harness intentionally retains its stricter 8,192
+item queue so earlier comparisons remain like-for-like.
+Final `cargo test --locked` and `cargo test --locked --release` each passed
+**167 tests**, with opt-in probes ignored. Format, all-target check and strict
+Clippy passed. Exact commands/output are in `owner-capacity/burst-final-checks.log`.
+
+**Full-universe coverage still fails:** desired 551,878; the exact owner-ledger
+cutoff has 21,024 V1 and 2,886 V2 desired identities not live. Discovery retained
+44 unresolved V1 records; its final V1 sweep was incomplete. Neither passing
+drain nor historical initialization totals certify current live coverage. Health
+revisit time also exceeded the provisional 10-second target; monitoring was off.
+
+Evidence: `.amp/in/artifacts/full-universe-owner-diagnostic-20261028/` contains
+the manifest, temporary diagnostic source, resource samples, bounded raw samples,
+timing trace, supplied-reader validation and exact coverage ledger. Production
+changes are in `src/main.rs`, `src/orderbook/store.rs`, `src/recording/mod.rs`;
+checks are in `src/owner_load_tests.rs`, `tests/book_lifecycle.rs`,
+`tests/recording.rs`; documentation is in README.md, docs/architecture.md and this
+ledger. No diagnostic tracing, raw capture, unsafe code, dependency, sharding,
+commit or push is included in the production change.
+
+### Coverage follow-up: fair admission, upstream missing books, shutdown race
+
+The diagnostic cutoff's 23,910 missing desired instruments separates into
+17,000 V1 never requested, 3,993 V1 and 2,886 V2 previously initialized but
+unavailable, and 31 V1 requested without any initialized snapshot. The 44 Gamma
+listings without token IDs are a separate discovery error: they were never
+admitted as subscriptions. Exact histories and current API responses are under
+`.amp/in/artifacts/coverage-gaps/`.
+
+**Confirmed C2 bug:** 17 workers repeatedly canceled semaphore admission after
+30 seconds, lost their FIFO position, and entered cold cooldowns without ever
+starting a connection. Tokio's fair semaphore does not preserve canceled queue
+positions. A bounded worker now retains one pending acquisition across diagnostic
+ticks. Retirement and shutdown remain cancellable; a superseding mandatory
+request cancels planned admission. Cold recovery starts at actual admission,
+not local queuing. Concurrency, pacing, handshake/initialization deadlines,
+financial validity and genuine failed-attempt escalation are unchanged.
+
+The real-worker regression failed before the fix: a later waiter acquired the
+released permit first, after the worker entered a 60-second cooldown. Afterwards,
+the worker retained priority through 155 seconds of virtual time, and retirement
+released its reservation without dialing. A second test holds local admission
+for 155 virtual seconds, resumes real time, rejects a localhost handshake, and
+observes the next attempt within two seconds instead of a 60-second cooldown.
+Tokio `test-util` is enabled only as a dev feature; no dependency version changed.
+
+**Independent upstream check:** a separate Node WebSocket client requested the
+31 absent IDs plus one control. During 30 seconds it received the control book
+and two PONGs but no snapshot for any of the 31. Public CLOB REST requests using
+curl returned `404: No orderbook exists for the requested token id` for every
+missing ID and 200 for the control. The first Python urllib probe received 403
+for every request and is not used as evidence of book absence. Gamma returned
+active/open/book-enabled records for 21 queried IDs and no result for ten.
+These are current observations, not proof of historical or permanent absence.
+Do not remove valid desired identities or create empty books from these errors.
+
+**Uninstrumented 1,000-second full-universe attempt:** all 554 workers started.
+At the exact pre-shutdown owner-ledger cutoff, desired was 552,148 and live was
+548,140 (**99.274%**). V1 had 4,008 missing live identities; V2 had zero. Every
+missing identity had been requested at least once: the never-requested category
+fell from 17,000 to zero. Current requested coverage is distinct: 3,186 desired
+V1 identities were not requested on a live session at cutoff. The remaining live
+gaps were 3,975 previously initialized books on four recovering workers and 33
+never initialized. The latter comprise 21 of the previously checked 404 IDs and
+12 additional IDs, all also returning 404. Whole-session recovery still creates
+collateral gaps for initialized books; this change does not implement isolated
+per-instrument recovery or filter out missing books.
+
+The run processed 14,377,942 messages with no ingress/output-capacity failure;
+peak RSS was 4,682,924,032 bytes. The supplied reader decoded **28,033,578**
+records; all **4,728,354** periodic snapshots matched independent absolute-delta
+replay. This validates internal archive consistency, not raw-exchange history.
+Live traffic and discovery changed between attempts, so the coverage difference
+is not a controlled throughput/latency improvement.
+
+**The run still exited 1:** shutdown raced with preflight of an empty desired
+reconciliation. Begin revision 738 was accepted, but the manager rejected
+Complete solely because shutdown was set. The footer honestly reports incomplete
+intake. The follow-up manager fix checks shutdown after preflight/before Begin,
+and closes an already fully delivered reconciliation even if shutdown arrives.
+Interrupted partial delivery still fails. A deterministic public-manager test
+stops at the existing per-chunk fairness yield: final-chunk completion failed
+before the fix and passes afterwards, while an undelivered second chunk still
+fails. This final shutdown change has not had another full-universe live run.
+
+Evidence: `coverage-gaps/{admission-before,admission-after,transport-checks,
+shutdown-before,shutdown-after,full-checks,final-checks}.log`, plus
+`full-universe-admission-fixed-20261028/` for the manifest, binary hash, resource
+samples, stderr, archive, sidecar, identity ledger and independent replay output.
+Full-universe acceptance remains **failed**: missing desired coverage, discovery
+uncertainty, the recorded shutdown failure, and a 44.138-second maximum health
+revisit versus the provisional 10-second target remain explicit limitations.
+
+After the shutdown fix, `cargo test --locked` and `cargo test --locked --release`
+each passed **170 tests**, with opt-in live/load probes ignored. Formatting,
+all-target checking, strict Clippy and the release executable build passed.
+The final source changes remain local and uncommitted; all live services from
+this follow-up have stopped. Isolating unavailable instruments from their
+initialized socket neighbors remains a separate recovery-architecture decision.
+
+## Dual-feed failure acceptance and health scheduling (2026-10-28)
+
+Scope: correct failover, safe monitoring/recovery, then synthetic capacity and
+local processing latency. No new architecture, financial representation, parser,
+production exchange, live socket budget, or automatic latency-based switching.
+Evidence directory: `.amp/in/artifacts/dual-feed-acceptance/`.
+
+`tests/dual_feed.rs` drives real localhost WebSocket workers, bounded ingress,
+C4, C5 and the supplied SBE reader. Six fixtures cover abrupt selected disconnect;
+symbol silence despite observed PING/PONG; both-quiet negative control; delayed
+equal-rate batches with regressing exchange times; a missing book on both feeds
+beside initialized neighbors; and staggered fresh-generation renewal. Expected
+quantities and record order are explicit and asymmetric, and raw ingress receipt
+timestamps are compared with recorded delta timestamps. Health windows use an
+explicit logical clock, not a claimed network latency. The harness bypasses the
+manager/shared dial budget and drains its small output at the end: it is neither
+a throughput test nor full-process failure isolation.
+
+The first run had a fixture configuration error (replicas defaulted to one); its
+six failures are not production evidence. After setting two replicas, five
+cases passed and missing-book recovery failed: both sessions restarted and
+suspended initialized A/B neighbors. The C4 repair guard now defers removing a
+neighbor's last eligible redundant copy. Single-copy and already-invalid-source
+recovery remain possible. Merely serializing exposed a second defect: slot zero
+could repeatedly win when both X replicas remained missing. The strengthened
+fixture reproduced that starvation. Due repairs now prefer the replica with
+fewer granted attempts, breaking ties by slot. All six cases pass, including a
+cold replacement blocking peer repair and restored A/B baselines allowing the
+previously deferred peer to try, while X remains honestly unavailable.
+See `failover-before-valid.log`, `fairness-before.log`, `fairness-after.log`.
+
+The actual-owner replay at 550,000 books, one replica, 10,000 messages/s for 30s
+reproduced a separate scheduling failure: maximum revisit **25.568909s**, health
+lateness **15.874047s**. All 790,000 financial records still matched the oracle.
+C4 bounded each slice to 1ms, but the owner waited another 100ms even with overdue
+work. The owner now schedules another slice after 1ms when work remains, keeping
+100ms idle polling and an ingress opportunity between slices. Identical replay
+passed with revisit **10.102103s**, lateness **312.290ms**, and the same 790,000
+matching records. This is a scheduling-contract repair, not a financial hot-path
+speedup or proof of live universe coverage. `OWNER_CHECK_HEALTH=1` enforces ≤11s
+revisit and ≤1s lateness. See `health-before.log` and `health-after.log`.
+
+The capacity harness now accepts `OWNER_REPLICAS=2`: 550,000 instruments become
+1,100,000 independent replicas across 1,100 synthetic sessions, with automatic
+selection and monitoring enabled. Input rate counts physical deliveries;
+alternating copies carry equivalent histories, with only the selected copy
+recorded. Independent arithmetic replay verifies every selected delta and every
+minute snapshot, not just record totals.
+
+An initial 100,000-message/s, 70s dual trial passed with 7,000,000 accepted inputs,
+3,900,000 matching output records and all 550,000 periodic snapshots. Its repeat
+failed at 52.03s with `ingress queue full` after 5,200,551 accepted inputs; the
+2,928,220-record accepted prefix matched, but missing Ended boundaries correctly
+made completion unsuccessful. Both trials still used the harness's old 8,192-item
+queue, not production's previously measured 65,536-item allowance. The harness
+now references `DEFAULT_QUEUE_ITEMS` directly, retaining the 64 MiB byte cap, and
+prints both limits. The failed smaller-queue control remains in
+`dual-capacity-{1,2}.log`; it must not be counted as a passing qualification.
+
+**Final production-limit runs:** `OWNER_BOOKS=550000 OWNER_REPLICAS=2
+OWNER_RATE=100000 OWNER_SECONDS=70 OWNER_CHECK_HEALTH=1 cargo test --locked
+--release --bin engineering-challenge production_owner_capacity -- --ignored
+--nocapture` passed twice, serialized without concurrent builds or benchmarks.
+Each processed 7,000,000 offered messages and independently matched 3,900,000
+selected-stream records, including all 550,000 periodic snapshots. Neither had
+rejection, false health suspicion, ingress exhaustion or output failure.
+
+| Metric | Trial 1 | Trial 2 |
+|---|---:|---:|
+| Full synthetic initialization | 14.902s | 15.270s |
+| Maximum health revisit | 10.111480s | 10.118199s |
+| Maximum health lateness | 232.495ms | 275.413ms |
+| Maximum ingress age | 90.466ms | 85.171ms |
+| Maximum periodic-snapshot lateness | 17.997ms | 9.107ms |
+| Maximum offered-message lateness | 116.210ms | 59.878ms |
+| Maximum process RSS (including oracle) | 5,132,104 KiB | 4,956,060 KiB |
+
+See `production-capacity-{1,2}.log` and `final-manifest.txt` (source hashes,
+Rust 1.93/LLVM 21.1.8, x86-64 orb, 8 CPUs, approximately 16 GiB RAM). This
+qualifies only the declared 0–8-level-per-side synthetic envelope, not maximum
+sustainable capacity, startup at live socket speed, or 1,100 actual sockets.
+The one-copy before/after health experiment retained identical 8,192-item queues;
+do not attribute the separate production-limit capacity results solely to the
+health scheduling change.
+
+Final `cargo test --locked` and `cargo test --locked --release` each passed
+176 tests (11 opt-in tests ignored). Formatting, all-target checking and strict
+Clippy passed; Clippy's one new harness style warning was fixed, not suppressed.
+Logs are `final-debug.log`, `final-release.log`, `fairness-after.log` and
+`clippy-fixed.log`. No commit or push was made by this follow-up.
+
+**Latest local latency:** three final release trials per mode with
+`C5_SECONDS=30 C5_RATE=1000 C5_WORKLOAD=native-ids C5_OUTPUT=file`, running
+`mixed_recording_matches_every_oracle_record` in `tests/recording_load.rs`.
+Each uses 100 instruments, a two-second warmup, 30,000 measured messages and
+224,108 independently matching SBE records. All six passed. Values below are
+medians of the three per-run percentiles, in microseconds, not pooled percentiles.
+
+| Mode / span | p50 | p95 | p99 | p99.9 |
+|---|---:|---:|---:|---:|
+| Ingress replay, processing including encoding | 8.755 | 24.230 | 29.676 | 50.024 |
+| Local WebSocket, processing including encoding | 9.098 | 24.704 | 33.542 | 57.327 |
+| Ingress replay, ingress queue residence | 42.607 | 90.198 | 113.748 | 251.779 |
+| Local WebSocket, ingress queue residence | 42.643 | 93.884 | 122.230 | 240.829 |
+
+Socket processing p99 was 33.542/34.861/33.357us across the three trials;
+ingress replay p99 was 29.561/29.676/38.878us. All measured offered rates were
+within 0.03 messages/s of 1,000. The two modes use different pacers; subtracting
+their percentiles would not establish transport overhead. Queue and processing
+percentiles cannot be added into an end-to-end percentile. These instrumented
+spans exclude physical file visibility and exchange/network arrival latency;
+30-second measurements do not include a minute boundary. The separate 70-second
+capacity replay covers periodic snapshots. p99.9 remains exploratory with only
+30,000 samples per run. No controlled before/after hot-path speedup is claimed.
+See `final-latency-{ingress,socket}-{1,2,3}.log`; earlier `latency-*` runs preceded
+the final repair-fairness change and are not the final figures.
+
+**Remaining gates:** no full-universe live rerun, real two-replica universe, or
+live paired-feed connection experiment ran in this follow-up. Existing live
+coverage/discovery gaps remain unclosed; synthetic success cannot remove them.
+The R7 local preflight below is now executed; live work still needs an explicitly
+approved sample/cohort/resource budget as specified in `docs/latency-research.md`.
+The current approved one-copy universe budget does not authorize approximately
+1,108 live sockets. For scoping a small future V1
+pilot only, the previously checked control asset again returned a public REST
+book (54 bids, 4 asks); `pilot-control-book.json` preserves that response. It is
+not a WebSocket readiness or activity guarantee.
+
+### R7 probe preflight — local evidence, not live latency
+
+The real loopback feed/probe/evidence path now covers handshake/initialization
+deadlines, malformed/oversized/closed connections, PING/PONG, cancellation and
+actual isolated-process SIGINT, requested source ports/conflicts, full ingress,
+staggered renewal and incomplete-peer refusal. Output-fault fixtures reproduce
+the old `BufWriter` destructor retry after partial failure. The writer now
+disarms its buffer on error and flushes the raw prefix before terminal status;
+final flush/sync or report failure must return an unsuccessful process. A final
+sync failure can leave a success-looking raw marker: always check process exit.
+
+Release load qualification: 1,000 batches/source × 20 unique changes/batch,
+5ms absolute schedule, two sources, seven-second measurement. All 2,002 received
+frames and 40,000 changes captured; zero resource resets. Generator maximum
+lateness 2.917ms (250ms failure bound); maximum queue age 5.382ms, processing
+5.364ms and timer lateness 1.902ms; 11,381,516 evidence bytes and 8,820 KiB maximum
+RSS. This short one-asset fixture includes fake venue/report/verification in the
+same process. It is not saturation, worst-case memory, or live latency evidence.
+
+The independent Python Decimal + offline grouping audit verified all 20,000
+pair decisions in that capture. A separate actual-socket fixture verified one
+unique pair out of six observations, rejecting repeated/unmatched controls.
+Audit mutation tests reject a one-scaled-unit discrepancy, wrong signed delay,
+omitted/duplicate matches, missing fresh baselines, incomplete output and
+unsupported reset/old-format captures. The checker validates full-content
+matching, not exchange occurrence identity; it refuses captures over 256MiB or
+200,000 canonical observations. Effective matcher timer advances are now logged
+so quiet-window decisions can be independently reproduced.
+
+Evidence: `probe-debug.log`, `probe-fixture.log`, `probe-fixture-audit.json`,
+`probe-load.log`, `probe-load-audit.json`, and the two retained `raw.jsonl` files
+under the same dual-feed acceptance directory. Implementation/tests are in
+`src/bin/latency_probe.rs`, `tools/check_latency_probe.py` and
+`tools/test_latency_probe_check.py`; protocol/limits are in
+`docs/latency-research.md`. No collector hot-path change was made during this
+probe preflight, so the collector capacity/latency results above remain the
+latest measurements; no live connection-treatment improvement is claimed.
+
+Final combined validation: formatting, locked all-target check and strict Clippy
+passed; `cargo test --locked` and `cargo test --locked --release` each passed
+191 tests with 12 opt-in cases ignored. The new load case was separately executed
+as described above. Python discovery passed all 18 tool tests. See
+`integrated-final-checks.log`, `python-checks-final.log` and
+`probe-final-manifest.txt`. All changes remain local, uncommitted and unpushed.

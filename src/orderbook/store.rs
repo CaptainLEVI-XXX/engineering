@@ -45,6 +45,9 @@ pub struct Processor {
     by_adapter: HashMap<AdapterId, HashMap<String, BookId>>,
     books: Vec<Instrument>,
     sources: BTreeMap<usize, Source>,
+    // Active sources awaiting an accepted all-ready acknowledgment. Readiness
+    // itself remains derived from Source, including recovery and request churn.
+    initializing: BTreeSet<usize>,
     total_levels: usize,
     replicas: usize,
     pending: Vec<Session>,
@@ -120,6 +123,7 @@ impl Processor {
             by_adapter: HashMap::new(),
             books: vec![],
             sources: BTreeMap::new(),
+            initializing: BTreeSet::new(),
             total_levels: 0,
             replicas: 0,
             pending: vec![],
@@ -219,8 +223,9 @@ impl Processor {
         }
     }
     pub fn initialized_sessions(&self) -> impl Iterator<Item = Session> + '_ {
-        self.sources
-            .values()
+        self.initializing
+            .iter()
+            .map(|worker| &self.sources[worker])
             .filter(|s| {
                 s.active
                     && s.requests_complete
@@ -237,6 +242,7 @@ impl Processor {
             .filter(|s| s.session == session)
         {
             source.ready_reported = true;
+            self.initializing.remove(&session.worker);
             for binding in source.requested.values() {
                 let instrument = &mut self.books[binding.book.0 as usize];
                 if instrument
@@ -368,6 +374,7 @@ impl Processor {
                             + Duration::from_secs(session.worker as u64 % 301),
                     },
                 );
+                self.initializing.insert(session.worker);
             }
             Message::SubscriptionsRequested {
                 session,
@@ -378,6 +385,7 @@ impl Processor {
                 self.active(*session)?;
                 self.active(*session)?.requests_complete = false;
                 self.active(*session)?.ready_reported = false;
+                self.initializing.insert(session.worker);
                 ensure!(
                     revisions.len() == add.len() + remove.len(),
                     "subscription revision cardinality mismatch"
@@ -394,6 +402,7 @@ impl Processor {
                 source.decoder = None;
                 source.requested.clear();
                 source.initialized = 0;
+                self.initializing.remove(&session.worker);
                 self.pending.retain(|s| s != session);
             }
             Message::RequestsComplete { session } => {
@@ -929,11 +938,30 @@ impl Processor {
     fn request_recovery(&mut self, session: Session) -> Result<()> {
         let source = self
             .sources
-            .get_mut(&session.worker)
+            .get(&session.worker)
             .context("unknown recovery source")?;
         if !source.active || source.session != session || source.recovery_requested {
             return Ok(());
         }
+        // A missing instrument can share a socket with useful books. Do not
+        // sacrifice their last eligible redundant copy while its peer repairs.
+        // Already-invalid sources and single-replica operation still recover.
+        if source.requested.values().any(|binding| {
+            let instrument = &self.books[binding.book.0 as usize];
+            instrument.desired
+                && instrument.replicas.len() > 1
+                && instrument
+                    .replicas
+                    .get(&session.slot)
+                    .is_some_and(|r| r.binding == *binding && self.eligible(r))
+                && !instrument
+                    .replicas
+                    .values()
+                    .any(|r| r.binding.session != session && self.eligible(r))
+        }) {
+            return Ok(());
+        }
+        let source = self.sources.get_mut(&session.worker).unwrap();
         for binding in source.requested.values() {
             let replica = self.books[binding.book.0 as usize]
                 .replicas
@@ -1606,6 +1634,10 @@ impl Processor {
     pub fn next_snapshot_due(&self) -> Option<Duration> {
         self.snapshot_due.first().map(|(due, _)| *due)
     }
+    /// Earliest health deadline, including work left by a bounded tick slice.
+    pub fn next_health_due(&self) -> Option<Duration> {
+        self.health_due.first().map(|(due, _)| *due)
+    }
     /// Stop generated work at intake cutoff, without backfilling from drained state.
     pub fn stop_snapshots(&mut self, now: Duration) {
         if self.config.snapshot_interval.take().is_some() {
@@ -1698,8 +1730,8 @@ impl Processor {
                     "recovery delivery deadline expired"
                 );
             }
-            // Population-derived demand at 100ms tick cadence. The time slice
-            // bounds interference, not a claim that this host meets that demand.
+            // Bound each slice; the owner must revisit unfinished due work
+            // sooner than its idle cadence, without starving ingress.
             let limit = self.books.len().div_ceil(100).max(64);
             let began = std::time::Instant::now();
             for _ in 0..limit {
@@ -1827,11 +1859,14 @@ impl Processor {
                     replica.cooldown = (replica.cooldown * 2).min(Duration::from_secs(900));
                 }
                 if *slot < 2 {
-                    requests[*slot as usize] = Some(replica.binding.session);
+                    requests[*slot as usize] = Some((replica.attempts, replica.binding.session));
                 }
             }
         }
-        for session in requests.into_iter().flatten() {
+        // When both copies remain unavailable, serialization must not always
+        // retry slot zero and starve its peer. Only granted repairs count.
+        requests.sort_unstable_by_key(|r| r.map(|(attempts, s)| (attempts, s.slot)));
+        for (_, session) in requests.into_iter().flatten() {
             self.request_recovery(session)?;
         }
         Ok(())

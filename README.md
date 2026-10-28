@@ -31,10 +31,11 @@ no required integrity file. An existing integrity path is rejected, never overwr
 The output pool reserves 16 × 4 MiB plus descriptors (~65 MiB); book, ingress,
 symbol-cache and physical-buffer memory is additional. Publication targets
 256 KiB / 5 ms; physical flush targets 5 ms. These are checked between work items,
-not hard-real-time guarantees. If all other batches are outstanding, age-only
-publication retains the last batch and appends exact records within its existing
-limits; it retries every 5 ms. Size/descriptor exhaustion still fails closed when
-no reusable batch remains. Records never cross 64 MiB logical chunks. Sparse
+not hard-real-time guarantees. With multiple batches, if all other batches are
+outstanding, soft size/age publication retains the last batch and appends exact
+records within its existing limits; age retries every 5 ms. Hard byte/descriptor
+exhaustion still fails closed when no reusable batch remains. Records never
+cross 64 MiB logical chunks. Sparse
 chunks are padded after 60 seconds or at finish, potentially adding ~64 MiB/minute.
 The supplied reader opens completed files and ignores incomplete final chunks;
 it is not a live pipe/tailing reader. Physical visibility is not reader compatibility.
@@ -58,11 +59,18 @@ an OS write or guarantee the tail. Keep stderr draining in operational runs.
 
 Options (each requires a value): `--seconds`, `--gamma-url`, `--ws-url`,
 `--assets-per-socket` (1000), `--max-sockets` (1024),
-`--queue-items` (8192), `--queue-bytes` (67108864), `--transport-only` (false),
+`--queue-items` (65536), `--queue-bytes` (67108864), `--transport-only` (false),
 `--replicas-per-market` (1 or 2, default 1), `--monitoring` (false),
 `--lifecycle-hints` (false),
 `--integrity-path` (required for recording). Socket/message/queue settings are
 collector safety budgets, **not verified exchange limits or a total RSS cap**.
+
+The ingress item allowance includes headroom above a measured 23,404-message
+live backlog that drained within its one-second observation window. The separate
+64 MiB accounted-byte limit is unchanged; both bounds still fail explicitly.
+This absorbs temporary bursts, not sustained overload, and does not make each
+message faster. Queue-slot allocation adds memory outside the accounted-byte
+limit. See the full-owner evidence in [EXPERIMENTS.md](EXPERIMENTS.md).
 
 ### Opt-in extensions and acceptance limits
 
@@ -74,6 +82,10 @@ Neither a replacement nor a recently received message proves missing history was
 recovered. The default remains one replica; monitoring and lifecycle hints are
 separate opt-ins. Monitoring uses accepted L2 activity, not PONG or trade counts.
 Guarded periodic renewal requires a usable peer and defers in single-source mode.
+Missing instruments cannot trigger overlapping repairs that remove a neighboring
+book's last usable redundant copy; fewer-attempted replicas get priority when
+both repairs are due. This does not isolate failures in single-replica mode or
+make an upstream-missing book available.
 
 **Do not enable full-universe redundancy from these defaults alone.** R0 observed
 556,974 desired assets, requiring 1,116 packed two-replica sockets, above the
@@ -87,6 +99,36 @@ See [the requirement/evidence ledger](docs/revision-check.md).
 automatic source-selection optimization. It requires explicit live approval and
 a fixed sample. See [the research protocol](docs/latency-research.md); no live
 performance improvement is claimed merely because the probe is implemented.
+Local socket/control/failure tests and a 40,000-change loopback load passed.
+`python3 -B tools/check_latency_probe.py <trial>/raw.jsonl` independently checks
+financial match decisions against retained raw evidence, including timer-driven
+window progress. It refuses incomplete captures and unsupported resource resets;
+also check the probe's exit status, since a terminal row cannot prove final sync.
+
+The opt-in production-owner capacity check runs the executable's real owner loop,
+bounded ingress, minute snapshots and recorder against a file, then independently
+checks every financial record. It defaults to 550,000 synthetic books, 550 sessions
+and 70 seconds of 10,000 messages/second after paced initialization. Run it alone;
+allow several GiB of RAM and temporary disk space. It excludes REST, WebSockets,
+ongoing discovery churn and live coverage, and is not a latency percentile test.
+`OWNER_REPLICAS=2` doubles stored replicas/sessions, enables automatic selection
+and monitoring, and alternates equivalent deliveries across both sources. The
+rate counts physical input messages, not unique selected updates. It uses the
+production ingress item limit and unchanged 64 MiB accounted-byte limit.
+`OWNER_CHECK_HEALTH=1` additionally requires maximum revisit ≤11s and lateness ≤1s;
+these tolerances do not turn the 10s target into an exact real-time guarantee.
+
+```sh
+OWNER_BOOKS=550000 OWNER_RATE=100000 OWNER_SECONDS=70 cargo test --locked --release --bin engineering-challenge production_owner_capacity -- --ignored --nocapture
+# Small dual-feed smoke before the expensive full-population replay:
+OWNER_BOOKS=1000 OWNER_REPLICAS=2 OWNER_RATE=10000 OWNER_SECONDS=3 OWNER_CHECK_HEALTH=1 cargo test --locked --release --bin engineering-challenge production_owner_capacity -- --ignored --nocapture
+```
+
+`cargo test --locked --test dual_feed` exercises real localhost WebSocket workers,
+ingress, book processing, recording and the supplied SBE reader under forced
+disconnect, symbol silence, delayed batches, missing books and staggered renewal.
+Its logical health clock accelerates policy thresholds; it does not measure
+latency or exercise discovery/manager routing/shared connection admission.
 
 For local optimization experiments, use the [bounded latency harness](EXPERIMENTS.md).
 It compares explicit commits (or preserved source patches) with the existing replay

@@ -693,6 +693,67 @@ async fn readmission_rotates_connection_and_forwards_raw_data_in_the_new_session
 }
 
 #[tokio::test]
+async fn shutdown_completes_delivered_reconciliation_but_not_partial_delivery() {
+    use engineering_challenge::{discovery::polymarket::Command, websocket::run_manager};
+    for batch in [1, 2] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = Arc::new(Config {
+            endpoint: format!("ws://{}", listener.local_addr().unwrap()),
+            subscription_batch: batch,
+            ..Config::default()
+        });
+        let (discovery, mut requests) = mpsc::channel(2);
+        let (_notify, changes) = watch::channel(());
+        let (output, received) = output::channel(16, 65536).unwrap();
+        let (stop, _) = watch::channel(false);
+        let manager = run_manager(
+            discovery,
+            changes,
+            output,
+            config,
+            stop.clone(),
+            mpsc::channel(1).1,
+        );
+        tokio::pin!(manager);
+        let request = tokio::select! {
+            result = &mut manager => panic!("manager exited before discovery: {result:?}"),
+            request = requests.recv() => request.unwrap(),
+        };
+        let Command::Snapshot(reply) = request else {
+            panic!("expected discovery snapshot request");
+        };
+        let mut state = Snapshot::default();
+        market(&mut state, "M", AdapterId::PolymarketV1, &["A", "B"]);
+        reply.send(Arc::new(state)).unwrap();
+        // Stop at the existing fairness yield after the first delivered chunk.
+        // With batch=2 this is all work; with batch=1 another chunk is owed.
+        assert!(futures_util::poll!(&mut manager).is_pending());
+        let before: Vec<_> = received.try_iter().map(|e| e.message).collect();
+        assert!(
+            matches!(before.as_slice(), [OutputMessage::ReconcileBegin { chunks, .. }, OutputMessage::DesiredChunk { index: 0, .. }] if *chunks == (2 / batch) as u32)
+        );
+        stop.send_replace(true);
+        let result = timeout(Duration::from_secs(1), manager).await.unwrap();
+        let tail: Vec<_> = received.try_iter().map(|e| e.message).collect();
+        if batch == 2 {
+            assert!(result.unwrap().iter().all(|r| r.connection_attempts == 0));
+            assert!(matches!(
+                tail.as_slice(),
+                [OutputMessage::ReconcileComplete { .. }]
+            ));
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("shutdown before chunk 1")
+            );
+            assert!(tail.is_empty(), "must not certify an undelivered chunk");
+        }
+    }
+}
+
+#[tokio::test]
 async fn manager_repairs_a_missed_notification_without_migrating_existing_assets() {
     use engineering_challenge::{discovery::polymarket::Command, websocket::run_manager};
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

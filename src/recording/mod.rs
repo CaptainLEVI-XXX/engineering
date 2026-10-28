@@ -387,8 +387,11 @@ impl Recorder {
             });
         }
         self.ordinal = next;
-        if batch.bytes.len() >= self.config.publish_bytes
-            || batch.entries.len() == self.config.entries
+        // The publish watermark is soft. Like age-based publication, retain
+        // the last batch during a writer pause; reserve enforces hard limits.
+        if batch.entries.len() == self.config.entries
+            || (batch.bytes.len() >= self.config.publish_bytes
+                && (self.config.batches == 1 || !self.free.is_empty()))
         {
             self.publish()?;
         }
@@ -427,8 +430,9 @@ impl Recorder {
                     return Err(error);
                 }
             }
-            if batch.bytes.len() >= self.config.publish_bytes
-                || batch.entries.len() == self.config.entries
+            if batch.entries.len() == self.config.entries
+                || (batch.bytes.len() >= self.config.publish_bytes
+                    && (self.config.batches == 1 || !self.free.is_empty()))
             {
                 self.publish()?;
             }

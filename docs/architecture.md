@@ -23,10 +23,17 @@ Status: Components 1–5 cover discovery, raw ingestion, exact decoding, source-
   explicit fallback evidence, never proof of synchronization. Backlogged receipt
   is not fresh processing. Both sources down suppress that instrument while other
   books continue; 120s marks overdue coverage rather than a process-integrity fault.
+- Recovery for a missing instrument defers if restarting its source would remove
+  a desired neighbor's last eligible redundant copy. Already-invalid sources and
+  single-copy operation still recover. When both missing copies are due, fewer
+  granted attempts take priority, with slot order breaking ties; deferral cannot
+  let slot zero monopolize repairs. Existing retry ages/cooldowns remain bounded.
 - Health keeps fixed tagged buckets per replica and counts only committed changes.
   An ordered due index schedules a population-derived examination slice, targeting
-  a 10s revisit with a 1ms per-tick work cap. Revisit maxima and outstanding work are
-  evidence, not a qualified full-universe service rate. Relative suspicion needs
+  a 10s revisit with a 1ms per-tick work cap. The owner waits 100ms between idle
+  checks, but only 1ms between slices when due work remains, servicing ingress
+  between slices. Revisit maxima and outstanding work are evidence, not a
+  qualified full-universe service rate. Relative suspicion needs
   two observations at least 10s apart; the absolute heuristic freezes three prior
   active minutes and needs two low minutes. Both quiet peers remain unknown.
 - Planned renewal first reserves affected instruments, then switches publishing
@@ -259,13 +266,24 @@ Implementation ownership stays small: discovery lifecycle changes in src/discove
 
 `src/websocket/ingress.rs` defines `Started`, `SubscriptionsRequested`, raw `Data` and `Ended` events. Data carries `Session { worker, generation, adapter }`, per-session ordinal, application receive time and owned `Utf8Bytes`. Financially malformed or unknown text is deliberately preserved for the downstream decoder; application PONG and WebSocket control frames are handled by the worker.
 
-The existing bounded crossbeam handoff remains; no replacement queue implementation is introduced. Defaults are 8,192 queued envelopes and 64 MiB of accounted bytes. A semaphore permit stays with each envelope through consumption. Accounting includes envelope size, raw text length and control-event vector/string capacities. Utf8Bytes hides backing allocation capacity, so this is **not** an allocation/RSS bound. Registry retention, allocator overhead and per-socket buffers are additional.
+The existing bounded crossbeam handoff remains; no replacement queue implementation is introduced. Defaults are 65,536 queued envelopes and 64 MiB of accounted bytes. The item allowance was raised after a full-universe diagnostic observed a transient 23,404-message backlog that drained within one measurement window; it is burst headroom, not a throughput improvement or a guarantee against sustained overload. A semaphore permit stays with each envelope through consumption. Accounting includes envelope size, raw text length and control-event vector/string capacities. Utf8Bytes hides backing allocation capacity, so this is **not** an allocation/RSS bound. Preallocated queue slots, registry retention, allocator overhead and per-socket buffers are additional.
 
 `src/main.rs --transport-only true` retains the **transport-validation runner**: a small consumer checks session/ordinal order, counts and discards raw messages, and drains until senders close. Its stdout stays empty. Default mode instead uses C3/C4 and C5 recording as described above; the supplied schema/reader are unchanged and the writer is adapted for stdout. Successful transport-only validation is not financial correctness, subscription confirmation or book initialization.
 
 Binary/oversized data and full/closed ingress fail the run through an independent stop signal. Accepted envelopes still drain; an unavailable final boundary remains an explicit failure, not a clean end. SIGINT stops discovery, socket intake and reconnect scheduling; shutdown joins workers and allows a shared 15-second drain deadline.
 
 Connection failures reconnect with 250 ms–30 s exponential delay plus up to 99 ms jitter. Heartbeats are text PING every 10 seconds, with a 30-second PONG timeout. Each socket allows 1,000 assets initially, sends at most 100 IDs per batch, accepts at most 2 MiB per complete message/frame, and caps writes/handshakes at 10 seconds. Up to 1,024 sockets are configured; no market is split across a socket budget. These are provisional collector budgets, not documented exchange maxima. C4 owns initialization/recovery deadlines and C5 enables periodic capture; load-based migration and redundant feed provisioning remain unimplemented.
+
+Shared connection admission retains one fair-queue waiter per bounded worker.
+Thirty-second wait diagnostics do not cancel or requeue it. Retirement, shutdown
+and superseding mandatory work can still cancel admission; network handshakes
+and initialization leases keep their existing deadlines. The transport's cold
+recovery episode begins only when admission grants an actual connection attempt,
+not while waiting for local capacity. After 120 seconds without accepted full
+readiness, network retry cooldowns remain 60, 120, 240, 480, then at most 900
+seconds. Only accepted full readiness resets that episode. This prevents local
+queue starvation from manufacturing network failures; it does not guarantee that
+the exchange supplies every requested instrument's snapshot.
 
 Per-session raw messages remain in receive order. Different workers may interleave; no global chronological ordering or exchange-wide completeness is promised.
 

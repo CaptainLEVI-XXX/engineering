@@ -144,7 +144,7 @@ pub struct WorkerReport {
     pub messages: u64,
     pub requested_at_cutoff: usize,
     pub connection_attempts: u64,
-    pub connection_wait_expiries: u64,
+    pub connection_wait_intervals: u64,
     pub initialization_expiries: u64,
     pub initialized_sessions: u64,
     pub connection_wait: Duration,
@@ -414,19 +414,26 @@ impl<P: WireProtocol + Clone> Worker<P> {
         let budget = self.budget.clone();
         let planned = self.next_planned;
         let waiting = Instant::now();
-        // Bound one admission attempt, not the lifetime of desired coverage.
-        // Timeout releases this queue position before retry, without consuming a
-        // network start or claiming readiness. Commands remain serviced throughout.
-        let acquire = timeout(Duration::from_secs(30), budget.acquire(planned));
+        // One cancellable waiter per bounded worker. Cancelling and rejoining
+        // the fair semaphore queue on a timer can starve older assignments.
+        // Waiting for local capacity is not a failed network attempt.
+        let acquire = budget.acquire(planned);
         tokio::pin!(acquire);
+        let mut report_at = waiting + Duration::from_secs(30);
         let acquired = loop {
             tokio::select! {
                 biased;
                 _ = stopping(&mut self.stop) => return Ok(false),
-                result = &mut acquire => break Some(result),
                 command = self.commands.recv() => {
                     self.offline_update(&command.context("assignment owner closed")?)?;
                     if self.desired.is_empty() || (planned && !self.next_planned) { break None; }
+                },
+                result = &mut acquire => break Some(result),
+                _ = sleep_until(report_at) => {
+                    self.report.connection_wait_intervals = self.report.connection_wait_intervals
+                        .checked_add(1).context("connection wait interval counter exhausted")?;
+                    eprintln!("connection_wait_pending worker={} slot={} planned={planned} wait_ms={} retaining_position=true", self.session.worker, self.session.slot, waiting.elapsed().as_millis());
+                    report_at = Instant::now() + Duration::from_secs(30);
                 },
             }
         };
@@ -437,8 +444,10 @@ impl<P: WireProtocol + Clone> Worker<P> {
             .checked_add(waited)
             .context("connection wait duration overflow")?;
         match acquired {
-            Some(Ok(result)) => {
-                self.lease = Some(result?);
+            Some(result) => {
+                let lease = result?;
+                self.cold_recovery.begin(lease.started);
+                self.lease = Some(lease);
                 self.next_planned = false; // Only this next attempt has planned status.
                 self.report.connection_attempts = self
                     .report
@@ -452,23 +461,6 @@ impl<P: WireProtocol + Clone> Worker<P> {
                     waited.as_millis()
                 );
                 Ok(true)
-            }
-            Some(Err(_)) => {
-                self.report.connection_wait_expiries = self
-                    .report
-                    .connection_wait_expiries
-                    .checked_add(1)
-                    .context("connection wait expiry counter exhausted")?;
-                // The granted renewal already ended its old session. Once its
-                // admission attempt expires, restoring coverage is mandatory.
-                self.next_planned = false;
-                eprintln!(
-                    "connection_wait_expired worker={} slot={} planned={planned} wait_ms={} retrying=mandatory",
-                    self.session.worker,
-                    self.session.slot,
-                    waited.as_millis()
-                );
-                Ok(false)
             }
             None => {
                 eprintln!(
@@ -543,13 +535,7 @@ impl<P: WireProtocol + Clone> Worker<P> {
                 }
                 continue;
             }
-            self.cold_recovery.begin(Instant::now());
             if !self.acquire_lease().await? {
-                if !*self.stop.borrow() && !self.desired.is_empty() {
-                    // Admission expiry is not readiness either. Preserve its
-                    // normal immediate retry until the cold episode escalates.
-                    self.wait_retry(Duration::ZERO).await?;
-                }
                 continue;
             }
             let config = self.config.clone();
@@ -923,6 +909,120 @@ mod tests {
             recovery.retry_delay(now + Duration::from_secs(120), normal),
             Duration::from_secs(60)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_worker_keeps_admission_priority_and_cancels_on_retirement() {
+        let config = Arc::new(Config {
+            connection_interval: Duration::from_millis(1),
+            ..Config::default()
+        });
+        let budget = ConnectionBudget::new(&config).unwrap();
+        let first = budget.acquire(false).await.unwrap();
+        let second = budget.acquire(false).await.unwrap();
+        let (commands, receiver) = mpsc::channel(2);
+        let (output, _ingress) = ingress::channel(4, 4096).unwrap();
+        let (stop, _) = watch::channel(false);
+        let worker = run_worker_protocol(
+            Session {
+                worker: 0,
+                generation: 0,
+                adapter: AdapterId::PolymarketV1,
+                slot: 0,
+            },
+            vec!["A".into()],
+            receiver,
+            output,
+            config,
+            stop.clone(),
+            (
+                budget.clone(),
+                protocol_with_lifecycle(AdapterId::PolymarketV1, false),
+            ),
+        );
+        tokio::pin!(worker);
+        assert!(futures_util::poll!(&mut worker).is_pending());
+        let later = budget.acquire(false);
+        tokio::pin!(later);
+        assert!(futures_util::poll!(&mut later).is_pending());
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(31)).await;
+            assert!(futures_util::poll!(&mut worker).is_pending());
+        }
+        drop(first);
+        // The first worker must still own the first queue position, even after
+        // long local contention; no network failure has occurred.
+        assert!(futures_util::poll!(&mut later).is_pending());
+        // Retiring its entire assignment must cancel admission without dialing.
+        commands
+            .try_send(WorkerCommand {
+                remove: vec!["A".into()],
+                ..WorkerCommand::default()
+            })
+            .unwrap();
+        assert!(futures_util::poll!(&mut worker).is_pending());
+        let _later = later.await.unwrap();
+        stop.send_replace(true);
+        let report = worker.await.unwrap();
+        assert_eq!(report.connection_attempts, 0);
+        assert_eq!(report.sessions, 0);
+        drop(second);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_admission_wait_does_not_delay_first_network_retry() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = Arc::new(Config {
+            endpoint: format!("ws://{}", listener.local_addr().unwrap()),
+            connection_interval: Duration::from_millis(1),
+            reconnect_min: Duration::from_millis(1),
+            ..Config::default()
+        });
+        let budget = ConnectionBudget::new(&config).unwrap();
+        let first = budget.acquire(false).await.unwrap();
+        let second = budget.acquire(false).await.unwrap();
+        let (_commands, receiver) = mpsc::channel(2);
+        let (output, _ingress) = ingress::channel(4, 4096).unwrap();
+        let (stop, _) = watch::channel(false);
+        let worker = run_worker_protocol(
+            Session {
+                worker: 0,
+                generation: 0,
+                adapter: AdapterId::PolymarketV1,
+                slot: 0,
+            },
+            vec!["A".into()],
+            receiver,
+            output,
+            config,
+            stop.clone(),
+            (
+                budget,
+                protocol_with_lifecycle(AdapterId::PolymarketV1, false),
+            ),
+        );
+        tokio::pin!(worker);
+        assert!(futures_util::poll!(&mut worker).is_pending());
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(31)).await;
+            assert!(futures_util::poll!(&mut worker).is_pending());
+        }
+        // Use real time for socket I/O; only local admission was simulated.
+        tokio::time::resume();
+        drop(first);
+        drop(second);
+        let peer = async {
+            let (socket, _) = listener.accept().await.unwrap();
+            drop(socket); // Reject the first handshake, without publishing data.
+            let (_retry, _) = listener.accept().await.unwrap();
+            stop.send_replace(true);
+        };
+        let (report, ()) = timeout(Duration::from_secs(2), async { tokio::join!(worker, peer) })
+            .await
+            .expect("local waiting incorrectly charged as a cold network failure");
+        let report = report.unwrap();
+        assert_eq!(report.connection_attempts, 2);
+        assert_eq!(report.sessions, 0);
     }
 
     #[tokio::test]

@@ -430,8 +430,9 @@ fn exhausted_pool_preserves_prefix_and_encoding_failure_never_publishes_partial_
     use engineering_challenge::recording;
     for exhausted in [false, true] {
         let config = recording::Config {
-            batches: 2,
-            publish_bytes: if exhausted { 1 } else { 262144 },
+            // Exhaust a hard descriptor bound, not the soft publish watermark.
+            batches: 1,
+            entries: if exhausted { 2 } else { 4096 },
             ..Default::default()
         };
         let (mut recorder, output) = recording::channel(config, &Config::default()).unwrap();
@@ -835,47 +836,65 @@ fn a_paused_writer_exhausts_the_fixed_pool_without_losing_the_earlier_prefix() {
 #[test]
 fn a_writer_pause_uses_the_remaining_batch_instead_of_publishing_tiny_tails() {
     use engineering_challenge::recording;
-    let (mut recorder, output) = recording::channel(
-        recording::Config {
-            batches: 2,
-            ..Default::default()
-        },
-        &Config::default(),
-    )
-    .unwrap();
-    // Writer is deliberately not scheduled yet. All records still fit comfortably
-    // in the bounded pool; age alone must not waste its last reusable batch.
-    for q in 1..=100 {
-        recorder.observe(observed_level(q)).unwrap();
-        recorder
-            .publish_due(recorder.next_publish_at().unwrap())
-            .unwrap();
-    }
-    recorder.finish(Ok(())).unwrap();
-    let file = tempfile::NamedTempFile::new().unwrap();
-    let (approve, approval) = crossbeam::channel::bounded(1);
-    approve.send(true).unwrap();
-    let report = output.run(
-        file.reopen().unwrap(),
-        io::sink(),
-        "temporary pause",
-        || {},
-        approval,
-    );
-    assert!(report.error.is_none(), "{report:?}");
-    let mut reader = AlignedSbeReader::<OrderbookSchema>::open(file.path()).unwrap();
-    for q in 1..=100 {
-        let Some(AnyMessage::PriceLevelUpdate(value)) = reader.read_msg().unwrap() else {
-            panic!("missing update")
-        };
-        assert_eq!(
-            PriceLevelUpdateDomain::try_from_decoder(value)
-                .unwrap()
-                .quantity,
-            q
+    for publish_bytes in [262144, 1] {
+        let (mut recorder, output) = recording::channel(
+            recording::Config {
+                batches: 2,
+                publish_bytes,
+                ..Default::default()
+            },
+            &Config::default(),
+        )
+        .unwrap();
+        // Writer is deliberately not scheduled yet. All records still fit comfortably
+        // in the bounded pool; soft age/size targets must not waste its last batch.
+        for q in 1..=100 {
+            recorder.observe(observed_level(q)).unwrap();
+            recorder
+                .control(q as u64, &serde_json::json!({"sequence":q}))
+                .unwrap();
+            if let Some(due) = recorder.next_publish_at() {
+                recorder.publish_due(due).unwrap();
+            }
+        }
+        recorder.finish(Ok(())).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let sidecar = tempfile::NamedTempFile::new().unwrap();
+        let (approve, approval) = crossbeam::channel::bounded(1);
+        approve.send(true).unwrap();
+        let report = output.run(
+            file.reopen().unwrap(),
+            sidecar.reopen().unwrap(),
+            "temporary pause",
+            || {},
+            approval,
         );
+        assert!(report.error.is_none(), "{report:?}");
+        let mut reader = AlignedSbeReader::<OrderbookSchema>::open(file.path()).unwrap();
+        for q in 1..=100 {
+            let Some(AnyMessage::PriceLevelUpdate(value)) = reader.read_msg().unwrap() else {
+                panic!("missing update")
+            };
+            assert_eq!(
+                PriceLevelUpdateDomain::try_from_decoder(value)
+                    .unwrap()
+                    .quantity,
+                q
+            );
+        }
+        assert!(reader.read_msg().unwrap().is_none());
+        let controls: Vec<serde_json::Value> = std::fs::read_to_string(sidecar.path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| row["kind"] == "control")
+            .collect();
+        assert_eq!(controls.len(), 100);
+        for (index, row) in controls.iter().enumerate() {
+            assert_eq!(row["event"]["sequence"], index + 1);
+            assert_eq!(row["next_ordinal"], index + 1);
+        }
     }
-    assert!(reader.read_msg().unwrap().is_none());
 }
 
 #[test]

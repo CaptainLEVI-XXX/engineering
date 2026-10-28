@@ -18,6 +18,13 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
+#[cfg(test)]
+mod owner_load_tests;
+
+// Live full-universe bursts exceeded 23k envelopes and drained promptly.
+// Keep independent byte accounting at 64 MiB; this is burst headroom, not speed.
+const DEFAULT_QUEUE_ITEMS: usize = 65_536;
+
 fn main() -> ExitCode {
     let result = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -42,7 +49,7 @@ async fn run() -> Result<()> {
     let mut config = Config::default();
     let mut gamma = GAMMA_MARKETS.to_owned();
     let mut seconds = None;
-    let mut queue_items = 8192;
+    let mut queue_items = DEFAULT_QUEUE_ITEMS;
     let mut queue_bytes = 64 << 20;
     let mut transport_only = false;
     let mut monitoring = false;
@@ -455,7 +462,16 @@ fn process_books(
                 let now = start.elapsed();
                 if now >= next_tick {
                     processor.tick(now)?;
-                    next_tick = now + Duration::from_millis(100);
+                    // A tick is a bounded slice, not necessarily all due work.
+                    // Leave ingress a turn before another slice; idle books do
+                    // not require polling at this catch-up cadence.
+                    let after = start.elapsed();
+                    let delay_ms = if processor.next_health_due().is_some_and(|due| due <= after) {
+                        1
+                    } else {
+                        100
+                    };
+                    next_tick = after + Duration::from_millis(delay_ms);
                 }
                 processor.maintain(
                     start.elapsed(),

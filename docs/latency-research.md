@@ -2,9 +2,10 @@
 
 ## Status and authorization
 
-**Implemented; all 15 deterministic probe tests pass in debug and release.**
-Locked all-target compilation and strict Clippy also pass on the integration
-checkout. No live paired-feed trial or connection-treatment experiment has run.
+**Implemented; local socket/failure preflight and independent capture audit now
+executed.** The probe has 30 regular cases and one opt-in local load case; the
+executed evidence and limitations are below. No live paired-feed trial or
+connection-treatment experiment has run.
 There are **no live arrival-latency results** or evidence of a reliable
 improvement. R7's live-research acceptance gate remains open. Local synthetic
 pipeline measurements belong in `docs/revision-check.md`, not this live gate.
@@ -13,7 +14,8 @@ The implementation is isolated in `src/bin/latency_probe.rs`. It does not change
 the collector, discover instruments, reconstruct/publish books, select sources,
 or write SBE. It uses the R1 wire protocol API and the shared exact decimal and
 envelope parsers; it deliberately does not depend on the changing normalized
-`Change` representation. All tests are beside the binary.
+`Change` representation. Rust tests are beside the binary; independent Python
+audit tests live beside their checker in `tools/`.
 
 R0's reported 556,974 desired assets, 44 unresolved V1 IDs, and two-copy capacity
 exceeding 1,024 sockets are **not authorization for a universe run**. This tool
@@ -58,6 +60,24 @@ with a fixed cohort and 60s warmup after both feeds have complete initial
 snapshots. Repeat on an independent time/cohort before promoting a production
 change. Extending a trial or adding trials when samples are inadequate requires
 approval; short exploratory runs are allowed but cannot satisfy this minimum.
+
+### Predeclared sample adequacy
+
+Before inspecting live timing, require zero process errors, complete initial
+coverage, no matcher resource resets, a successful independent capture audit,
+and at least 80% matched change observations **on each source for each asset**.
+Require at least 1,000 change pairs per asset and three completed nonempty 30s
+blocks for a descriptive central estimate. These are conservative operational
+screening thresholds, not a proof of unbiased sampling or statistical confidence.
+Include guard-censored observations in the denominator; report inadequate and
+quiet strata rather than silently removing them or extending the run. The
+100,000-match p99.9 threshold and repeated-trial requirements still apply.
+
+Inspect matched fraction and ambiguity/censoring before comparing treatments.
+Even 80% coverage can selectively omit delayed observations; a material change
+in missingness between cohorts makes a timing improvement inconclusive. The
+offline checker verifies pair decisions, not these per-stratum campaign gates;
+apply the gates to the report's per-source/asset counts and retain all failures.
 
 ### Command template — do not execute without approval
 
@@ -174,10 +194,13 @@ these hard observation/event bounds.
 
 Raw data and reports are separate **create-new** files in a new directory.
 `raw.jsonl` contains metadata, sends, complete received frames, connection
-attempts/endpoints, readiness, renewal cutoff, matching/resource diagnostics and
-terminal status. Financial raw bytes are written before matching. An I/O error
-poisons further evidence appends; a possibly partial line is never presented as
-a successful complete capture. A missing terminal record is incomplete.
+attempts/endpoints, readiness, renewal cutoff, effective timer-driven matcher
+advances, matching/resource diagnostics and terminal status. Financial raw bytes
+are written before matching. An I/O error poisons further evidence appends and
+disarms the buffered writer's destructor: it must not implicitly retry a failed
+prefix. Finalization flushes the prefix before appending terminal status. A
+possibly partial line is never presented as a successful complete capture. A
+missing terminal record is incomplete.
 Caps and failed output can prevent retaining the final delivered frame/prefix;
 the process fails and reports undrained input rather than claiming full capture.
 Terminal status separates handled observations from successfully captured raw
@@ -229,7 +252,7 @@ time. They are neither NIC timestamps nor receive-minus-exchange-time network
 latency. The tool does not measure collector end-to-end/SBE physical visibility,
 selection hysteresis or a useful latency-switching policy. R3 remains sticky.
 
-## Deferred verification and remaining plan items
+## Executed local preflight and remaining plan items
 
 The final implementation-first pass executed these checks successfully (the
 probe tests ran inside the full debug/release suites):
@@ -252,12 +275,78 @@ full/closed control handoff, expired-window rejection and uncertainty labels.
 Logs: `.amp/in/artifacts/r1-r8-debug-2.log`, `r1-r8-release-checks.log`
 and `r1-r8-small-smoke-2.log`. These tests do not exercise real paired feeds.
 
-Still needed before live execution: probe-specific local socket
-failure/control/renewal/port-binding and SIGINT tests; slow/failed/partial output
-tests; load/memory qualification; independent offline replay of raw match
-decisions; predeclared matched-fraction adequacy criteria. The small probe stops
-on known coverage failures, but does not prove freshness or diagnose silently
-stale initialized subscriptions. Quiet feeds can yield no useful samples.
+The subsequent preflight exercised real loopback TCP/WebSockets through the
+actual feed, probe, evidence writer and finalization paths. Private endpoint and
+timing injection leaves production CLI/TLS/timing limits unchanged. Cases cover
+PING/PONG, abrupt EOF/close, malformed/oversized messages, initialization and
+handshake deadlines, cancellation, actual Linux SIGINT in an isolated process,
+source-port binding/conflict, bounded full ingress, renewal with both treatment
+parities, and refusal to renew without complete peer initialization. Renewal
+must close the old stream before replacement and require a fresh baseline.
+
+Fault-injected output covers initial/partial writes, final flush/sync, failed
+report output and a >1s evidence stall. The legacy buffered-writer reproducer
+shows a destructor retry after a failed partial flush; the corrected writer
+disarms that destructor and its regressions observe no retry. A sync failure
+after writing terminal status still returns failure: the terminal row alone is
+not a successful-process or durability certificate. Blocking filesystem calls
+remain non-cancellable until control returns.
+
+`tools/check_latency_probe.py` independently parses raw evidence using Python
+Decimal and offline sorting/grouping over full canonical content, rather than
+the Rust online hash/window implementation. It verifies exact financial keys,
+source/generation/order, pair decisions and signed arrival differences. Timer
+watermarks make quiet-window decisions reproducible. Deliberately corrupted
+amounts, signed differences, omitted/duplicate matches, missing baselines,
+incomplete captures and unsupported reset/old-format captures fail its tests.
+The auditor is bounded to 256MiB input, 200,000 canonical observations and
+100,000 windows; it is not a validator for arbitrary larger probe configurations.
+It refuses resource resets because the old reset row lacks an exact event index.
+Its `process_exit_verified: false` is intentional: retain and check zero exit
+and final sync separately. It does not validate exchange event identity.
+
+Two release fixtures were retained in
+`.amp/in/artifacts/dual-feed-acceptance/`:
+
+- `probe-fixture/raw.jsonl`: actual controls, one unique pair, repeated content
+  and an unmatched observation. Independent audit found exactly one pair out of
+  six measured canonical observations (matched fraction 1/3, intentionally
+  inadequate for live timing).
+- `probe-load/raw.jsonl`: 1,000 batches/source, 20 unique changes/batch, scheduled
+  every 5ms (4,000 changes/s/source). Seven-second measurement, about five seconds
+  of offered load, one asset, two loopback sources. All 2,002 received frames and
+  40,000 changes were retained; the independent checker verified all 20,000
+  pairs. Zero resource resets, ambiguity, unmatched or censored observations in
+  this deliberately unique middle-window workload. Raw evidence: 11,381,516
+  bytes; maximum process RSS: 8,820 KiB; generator lateness: 2.917ms; maximum
+  queue age: 5.382ms; processing: 5.364ms; timer lateness: 1.902ms. The fixture
+  fails if offered-load lateness exceeds 250ms; observed max was below it.
+
+Commands: `PROBE_TEST_EVIDENCE_DIR=<new-absolute-directory> cargo test --locked
+--release --bin latency_probe local_orchestration_matches_controls --
+--test-threads=1`; for load, run the compiled release test executable alone under
+`/usr/bin/time -v`, setting `PROBE_TEST_LOAD_EVIDENCE_DIR=<new-directory>` and
+passing `--exact tests::local_bounded_load_retains_every_offered_event --ignored
+--nocapture --test-threads=1`. Audit either with `python3 -B
+tools/check_latency_probe.py <directory>/raw.jsonl`. Logs are `probe-debug.log`,
+`probe-fixture.log`, `probe-fixture-audit.json`, `probe-load.log`, and
+`probe-load-audit.json`.
+
+Final combined debug/release suites each passed 191 tests (12 opt-in cases
+ignored); format, all-target check and strict Clippy passed. All 18 Python tool
+tests passed. See `integrated-final-checks.log`, `python-checks-final.log` and
+`probe-final-manifest.txt` in the same directory. The opt-in probe load above
+ran separately, without concurrent builds or other measurements.
+
+These are synthetic correctness/tool-service measurements, **not live arrival
+latency, maximum capacity or qualification of worst-case 100-asset input**.
+The fake venue shares the process/runtime; RSS includes generation, report and
+streaming evidence verification. Starts/measurement/windows are accelerated,
+with zero warmup; production timing text in fixture reports is explicitly
+overridden by their synthetic header. This removes the local-preflight blocker
+only for proposing a small live sample. The probe still cannot prove freshness
+or diagnose silently stale initialized subscriptions. Quiet feeds can yield no
+useful samples.
 
 `tests/recording_load.rs` now measures local receive/enqueue, queue, owner,
 recorder callback and destination-call spans separately, with explicit oracle
