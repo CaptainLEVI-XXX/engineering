@@ -21,7 +21,7 @@ def fixture():
                              dict(event_type="book", asset_id="A", timestamp="50",
                                   bids=[], asks=[]),
                              dict(event_type="tick_size_change", asset_id="A",
-                                  new_tick_size="0.01")]))
+                                  timestamp="50", new_tick_size="0.01")]))
                     )
     rows.append(dict(type="measurement_schedule", start_mono_ns=1_000_000_000))
     ordinals = [1, 1]
@@ -66,6 +66,31 @@ class Audit(unittest.TestCase):
         self.assertEqual(result["verified_pairs"], 1)
         self.assertEqual(result["change_observations"], 13)
         self.assertEqual(result["matched_change_fraction"], 2 / 13)
+
+    def test_unrequested_changes_are_validated_but_do_not_enter_the_sample(self):
+        rows = fixture()
+        for row in rows:
+            if row["type"] != "received":
+                continue
+            wire = json.loads(row["payload"])
+            if not isinstance(wire, dict) or wire.get("event_type") != "price_change":
+                continue
+            outside = dict(asset_id="B", side="SELL", price="0.875",
+                           size=str(31 + row["source"]))
+            wire["price_changes"].insert(0, outside)
+            row["payload"] = json.dumps([
+                dict(event_type="price_change", timestamp="9", price_changes=[outside]), wire])
+        result = self.check(rows)
+        self.assertEqual(result["verified_pairs"], 1)
+        self.assertEqual(result["change_observations"], 13)
+        self.assertEqual(result["matched_change_fraction"], 2 / 13)
+        corrupt = copy.deepcopy(rows)
+        receipt = next(row for row in corrupt if row.get("stamp", {}).get("mono_ns") == 1_120_000_000)
+        wire = json.loads(receipt["payload"])
+        wire[-1]["price_changes"][0]["size"] = "0.0000001"
+        receipt["payload"] = json.dumps(wire)
+        with self.assertRaisesRegex(ValueError, "inexact"):
+            self.check(corrupt)
 
     def test_renewal_starts_new_guards_and_requires_a_fresh_generation_baseline(self):
         rows = fixture()

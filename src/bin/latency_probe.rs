@@ -469,9 +469,14 @@ fn canonicalize(
                 ensure!(!changes.is_empty(), "empty price_changes");
                 total_entries += changes.len();
                 for change in changes {
-                    ensure!(assets.contains(&change.asset_id), "unexpected change asset");
                     ensure!(
-                        seen.contains(&change.asset_id),
+                        !change.asset_id.is_empty()
+                            && change.asset_id.len() <= limits.identity_bytes,
+                        "invalid change asset identity"
+                    );
+                    let requested = assets.contains(&change.asset_id);
+                    ensure!(
+                        !requested || seen.contains(&change.asset_id),
                         "change before snapshot: coverage degraded"
                     );
                     let side = match change.side.as_str() {
@@ -485,6 +490,13 @@ fn canonicalize(
                         quantity: parse_scaled(&change.size)?,
                         hash: checked_hash(change.hash)?,
                     };
+                    // The venue can batch another token with a requested one.
+                    // Validate it and charge its entries, but do not expand the
+                    // sample or require an unrequested initialization snapshot.
+                    // Probe::input has already retained the entire raw message.
+                    if !requested {
+                        continue;
+                    }
                     let index = *indices.entry(change.asset_id.clone()).or_insert_with(|| {
                         events.push(Canonical {
                             asset: change.asset_id,
@@ -1269,7 +1281,9 @@ fn report<W: EvidenceSink>(probe: &mut Probe<W>, status: &str, cutoff: Stamp) ->
         Renewal cutoff/ready monotonic ns: {:?}/{:?}.\n\n\
         ## Configuration\n\n```json\n{}\n```\n\n\
         ## Strata (snapshot kinds never pooled with changes)\n\n\
-        Matched fraction is matched observations / all measured canonical observations, including censored. \
+        Every price-change entry is validated; only requested assets enter matching and initialization. \
+        Unrequested change entries remain in raw evidence, outside the sample denominator. \
+        Matched fraction is matched observations / all measured requested canonical observations, including censored. \
         Counts below are [A,B]; each pair contributes one observation to each side.\n\n",
         probe.config.trial,
         probe.config.cohort,
@@ -1374,6 +1388,7 @@ async fn main() -> Result<()> {
         "crate_version":env!("CARGO_PKG_VERSION"), "sample_cap":SAMPLE_CAP,
         "input_queue":8, "max_message_bytes":MESSAGE_BYTES, "treatment_source":config.treatment(),
         "policy":{"matcher":"three-block-full-content-v1", "matcher_advance_logged":true, "financial_scale":1_000_000,
+            "change_scope":"validate all entries; match requested assets only; retain complete raw messages",
             "guard_blocks":3, "init_deadline_seconds":30, "connect_deadline_seconds":15,
             "send_deadline_seconds":5, "local_stall_limit_ns":1_000_000_000,
             "report_byte_cap":REPORT_BYTES, "dns_answer_cap":64, "tail_minimum_matches":100_000,
@@ -1692,6 +1707,63 @@ mod tests {
     }
 
     #[test]
+    fn sample_filter_preserves_requested_history_and_validates_excluded_changes() {
+        // Actual V1 pilot payload, retained unchanged except the file newline.
+        // Only the first token was subscribed; the other had no initial book.
+        let native =
+            "100353087113074450324456811106016314839007387223599641723313349068598740344021";
+        let requested = HashSet::from([native.to_owned()]);
+        let captured = include_str!("../../tests/fixtures/polymarket-probe-mixed-change.json");
+        let observed = canonicalize(captured, &requested, &requested).unwrap();
+        assert_eq!(
+            observed,
+            vec![Canonical {
+                asset: native.into(),
+                kind: Kind::Change,
+                exchange_us: 1_793_218_055_234_000,
+                hash: None,
+                entries: vec![Entry {
+                    side: 0,
+                    price: 953_000,
+                    quantity: 491_000_000,
+                    hash: Some("791502d163ccb8f586dae349781c0a7cb126ba51".into())
+                }],
+            }]
+        );
+        let assets = HashSet::from(["A".into()]);
+        let text = r#"{"event_type":"price_change","timestamp":"2","price_changes":[{"asset_id":"B","side":"SELL","price":"0.3","size":"17"},{"asset_id":"A","side":"BUY","price":"0.7","size":"9"},{"asset_id":"B","side":"SELL","price":"0.3","size":"0"},{"asset_id":"A","side":"BUY","price":"0.7","size":"0"}]}"#;
+        let events = canonicalize(text, &assets, &assets).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].asset, "A");
+        assert_eq!(events[0].exchange_us, 2000);
+        assert_eq!(
+            events[0]
+                .entries
+                .iter()
+                .map(|e| (e.side, e.price, e.quantity))
+                .collect::<Vec<_>>(),
+            [(0, 700_000, 9_000_000), (0, 700_000, 0)]
+        );
+        assert!(canonicalize(text, &assets, &HashSet::new()).is_err());
+        assert!(
+            canonicalize(&text.replace("\"A\"", "\"B\""), &assets, &HashSet::new())
+                .unwrap()
+                .is_empty()
+        );
+        for (old, new) in [
+            ("\"SELL\"", "\"invalid\"".to_owned()),
+            ("\"17\"", "\"0.0000001\"".to_owned()),
+            ("\"0.3\"", "\"1.1\"".to_owned()),
+            ("\"B\"", "\"\"".to_owned()),
+            ("\"B\"", format!("\"{}\"", "B".repeat(257))),
+        ] {
+            assert!(canonicalize(&text.replace(old, &new), &assets, &assets).is_err());
+        }
+        let late_bad = format!("[{text},{}]", text.replace("\"17\"", "\"bad\""));
+        assert!(canonicalize(&late_bad, &assets, &assets).is_err());
+    }
+
+    #[test]
     fn evidence_is_create_new_bounded_and_has_reserved_termination() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("raw.jsonl");
@@ -1966,15 +2038,30 @@ mod tests {
             b.send(Message::Text("PONG".into())).await.unwrap();
             // Middle of the [200,400)ms block; a full guard on either side.
             sleep(Duration::from_millis(300)).await;
+            // Polymarket can include an unrequested token in the same batch.
+            // Different excluded quantities on A/B must not affect matching A.
+            let mixed = |quantity: &str, outside: &str| {
+                let mut event = change(quantity);
+                event["price_changes"].as_array_mut().unwrap().insert(
+                    0,
+                    json!({"asset_id":"B","side":"SELL","price":"0.5","size":outside}),
+                );
+                event
+            };
             a.send(Message::Text(
-                json!([change("7.0000000"), change("8"), change("8"), change("9")])
-                    .to_string()
-                    .into(),
+                json!([
+                    mixed("7.0000000", "11"),
+                    change("8"),
+                    change("8"),
+                    change("9")
+                ])
+                .to_string()
+                .into(),
             ))
             .await
             .unwrap();
             b.send(Message::Text(
-                json!([change("7"), change("8.0")]).to_string().into(),
+                json!([mixed("7", "23"), change("8.0")]).to_string().into(),
             ))
             .await
             .unwrap();
@@ -1994,6 +2081,16 @@ mod tests {
         assert_eq!(counts(&probe.matcher, "A").unmatched, [1, 0]);
         let rows = raw(&probe);
         complete(&rows, true);
+        assert!(probe.matcher.counts.keys().all(|(asset, _)| asset == "A"));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["type"] == "received"
+                    && row["payload"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("\"asset_id\":\"B\"")))
+                .count(),
+            2
+        );
         assert_eq!(rows[0]["policy"]["matcher_advance_logged"], true);
         let advances: Vec<_> = rows
             .iter()

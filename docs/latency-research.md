@@ -3,10 +3,13 @@
 ## Status and authorization
 
 **Implemented; local socket/failure preflight and independent capture audit now
-executed.** The probe has 30 regular cases and one opt-in local load case; the
-executed evidence and limitations are below. No live paired-feed trial or
-connection-treatment experiment has run.
-There are **no live arrival-latency results** or evidence of a reliable
+executed.** The probe has 31 regular cases and one opt-in local load case. The
+first approved V1 baseline attempt stopped after 32.9 seconds, before measurement:
+a price-change batch included both the requested token and an unrequested token
+under the same market. Both sockets had initialized, but the probe's strict
+membership check rejected the batch. The sample-filter correction below is
+locally verified; no fresh live attempt has run with it.
+There are **no valid live arrival-latency results** or evidence of a reliable
 improvement. R7's live-research acceptance gate remains open. Local synthetic
 pipeline measurements belong in `docs/revision-check.md`, not this live gate.
 
@@ -113,7 +116,12 @@ lockfile with a campaign when the revision is not a clean reproducible commit.
    not the subtraction clock; clock jumps cannot reverse the reported sign.
 2. Retain the original complete text as a JSON string before decoding. JSON
    escapes round-trip original whitespace and batching. Validate the whole
-   message before changing the probe's initialization state.
+   message before changing the probe's initialization state. Price-change
+   batches may include tokens outside the requested sample: validate their
+   identities, sides, prices, quantities and hashes, and count all entries
+   against input limits, then exclude unrequested entries from canonical
+   matching. They remain in raw evidence. Do not expand the sample or require
+   unrequested snapshots; sample denominators include requested observations only.
 3. Canonical content is exact asset ID, event kind, exchange timestamp converted
    from digit-string milliseconds to checked reader-compatible microseconds,
    ordered levels/entries and every available book/event/entry hash. V1 and V2
@@ -130,8 +138,9 @@ lockfile with a campaign when the revision is not a clean reproducible commit.
 6. Initial snapshots (per generation), later replacement snapshots and ordinary
    changes are distinct strata. Trades, BBO, lifecycle, ticks and PONGs are not
    L2 change matches; raw evidence retains them. Ticks validate their relevant
-   fields but do not count as progress. Unexpected assets, pre-snapshot changes,
-   malformed financial fields and unknown event types stop the trial.
+   fields but do not count as progress. Unexpected snapshot/tick assets,
+   requested changes before their baseline, malformed financial fields (including
+   excluded change entries) and unknown event types still stop the trial.
 
 The matcher uses a conservative **three-block guard window**, not eager pairing:
 

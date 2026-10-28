@@ -51,10 +51,6 @@ def canonical_events(payload, assets, initialized):
         event_hash = checked_hash(message.get("hash"))
         if kind in {"last_trade_price", "best_bid_ask", "new_market", "market_resolved"}:
             continue
-        if kind == "tick_size_change":
-            require(message["asset_id"] in assets and
-                    scaled(message["new_tick_size"], price=True) > 0, "invalid tick")
-            continue
         stamp = message["timestamp"]
         require(isinstance(stamp, str) and re.fullmatch(r"[0-9]+", stamp),
                 "invalid exchange time")
@@ -79,13 +75,20 @@ def canonical_events(payload, assets, initialized):
             require(message["price_changes"], "empty change batch")
             for change in message["price_changes"]:
                 asset = change["asset_id"]
-                require(asset in assets and asset in seen, "change before requested baseline")
+                require(isinstance(asset, str) and 0 < len(asset.encode()) <= 256,
+                        "invalid change asset identity")
+                require(asset not in assets or asset in seen, "change before requested baseline")
                 require(change["side"] in {"BUY", "SELL"}, "invalid side")
-                grouped.setdefault(asset, []).append([
+                entry = [
                     int(change["side"] == "SELL"), scaled(change["price"], price=True),
-                    scaled(change["size"]), checked_hash(change.get("hash"))])
+                    scaled(change["size"]), checked_hash(change.get("hash"))]
+                if asset in assets:
+                    grouped.setdefault(asset, []).append(entry)
             events.extend([asset, "Change", exchange, event_hash, entries]
                           for asset, entries in grouped.items())
+        elif kind == "tick_size_change":
+            require(message["asset_id"] in assets and
+                    scaled(message["new_tick_size"], price=True) > 0, "invalid tick")
         else:
             raise ValueError(f"unknown event type: {kind}")
     initialized.clear()

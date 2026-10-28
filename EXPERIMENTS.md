@@ -1778,3 +1778,51 @@ passed; `cargo test --locked` and `cargo test --locked --release` each passed
 as described above. Python discovery passed all 18 tool tests. See
 `integrated-final-checks.log`, `python-checks-final.log` and
 `probe-final-manifest.txt`. All changes remain local, uncommitted and unpushed.
+
+## V1 live pilot and probe sample filtering (2026-10-28)
+
+The preceding collector/probe baseline was subsequently committed and pushed as
+`1b7e394` on `harness-latency`. The approved single-asset, two-socket baseline
+pilot used 60s warmup plus 300s measurement, an eight-minute wall budget, 256MiB
+raw cap and monitored 1GiB RSS ceiling. Both initial books arrived, but the probe
+stopped at 32.872s with `unexpected change asset`, before measurement. Six frames
+were retained, zero pairs matched and no resource reset occurred. Sampled peak
+RSS was 5,828,608 bytes. No live latency or live collector-redundancy qualification
+can be inferred. Evidence: `.amp/in/artifacts/live-v1-baseline-01/`.
+
+The final frame contains the subscribed token and a second token under the same
+market. `tests/fixtures/polymarket-probe-mixed-change.json` preserves the exact
+received payload plus a final newline (verified against source 0, ordinal 5 in
+`trial/raw.jsonl`). This is a real public V1 fixture, not a synthetic identity
+replacement. Official market-channel documentation describes an array of
+per-asset changes but does not establish exclusive single-token delivery; the
+capture disproves the probe's assumption for this attempt.
+
+The probe now validates every price-change identity/side/price/quantity/hash and
+charges all entries to input bounds before excluding unrequested entries from
+matching. It preserves full raw messages, requested entry order and repeated
+quantities; requested changes still require a baseline. No extra instrument is
+initialized/subscribed or added to the sample denominator. Unexpected snapshot
+and tick assets remain terminal. The collector's separate known-unrequested vs
+unknown-identity contract is unchanged. The independent Python auditor applies
+the same sample definition with its own Decimal/grouping implementation; its tick
+timestamp check now also matches the Rust contract.
+
+The strengthened local two-socket fixture failed on the old code with the same
+`unexpected change asset` error, then passed with differing excluded-token
+quantities on the two feeds. Independent audit verified exactly one requested
+pair from six requested observations, with the repeated/unmatched controls
+unchanged and both excluded entries still in raw evidence. Regression checks
+also cover the captured native-ID frame, interleaved repeated-price/delete
+entries, outside-only input, missing requested initialization, invalid excluded
+amounts/sides/identities and late malformed entries.
+
+Validation: 31 probe cases passed in both debug and release (one opt-in load
+case not rerun); all-target check, strict Clippy and 19 Python tool tests passed.
+Release collector/dual-feed/recording tests and the real alternate-protocol
+worker-to-reader case also passed. Logs: `.amp/in/artifacts/probe-scope-fix/`
+(`before.log`, `audit-before.log`, `checks.log`, `python.log`, `after.log`,
+`after-audit.json`, `acceptance.log`). The original live capture still fails audit
+as incomplete; no replacement live attempt was run. This follow-up changes only
+the research probe/auditor, tests and documentation; it is not a collector
+latency optimization or production Kalshi implementation.
