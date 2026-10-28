@@ -88,6 +88,38 @@ automatic source-selection optimization. It requires explicit live approval and
 a fixed sample. See [the research protocol](docs/latency-research.md); no live
 performance improvement is claimed merely because the probe is implemented.
 
+For local optimization experiments, use the [bounded latency harness](EXPERIMENTS.md).
+It compares explicit commits (or preserved source patches) with the existing replay
+oracle in isolated worktrees, requires research evidence for candidates, and never
+automatically promotes code. Shared test patches keep measurement changes identical
+on both arms; the caller's uncommitted work is never silently included.
+Ingress benchmarks use a dedicated sleeping producer with absolute deadlines;
+socket benchmarks retain Tokio's millisecond-granularity timers. Both report
+actual offered lag and interarrival gaps: equal average rates do not guarantee
+equivalent arrival patterns. Changing the pacer establishes a new measurement
+baseline, not a collector speedup.
+The independent reference books and expected SBE stream are reconstructed after
+output drain, from bounded input timestamps and periodic capture cutoffs. Exact
+record-by-record checking remains mandatory. Timing and metadata instrumentation
+still perturb the run; reference generation time is reported separately.
+The [research ledger](RESEARCH.md) and [hypothesis backlog](HYPOTHESES.md) separate
+observed costs from ideas that still need investigation.
+Optimization decisions separate computational efficiency, bounded load response
+and tail latency. The harness can reuse equivalent release builds across
+`--rates 1000 3000 5000` and compare the same public decoder API with
+`--decoder-profile`. Use `--baseline-patch` to compare a previous experimental
+candidate against a combination without committing either. Optional
+`--allocation-profile` captures a fixed small heaptrack replay after all timing;
+instrumented timing is never included in latency comparisons. These are
+experimental screens, not automatic promotion:
+promising local savings retain any unresolved pipeline-regression warning until
+the integrated collector passes qualification.
+Shape-specific owner and recorder spans distinguish replacement arrays from
+1/4/16-entry updates. Snapshot-neighborhood queue groups separately report the
+first three affected and unrelated updates behind an array, based on offered
+identities/ordinals. These diagnose head-of-line delay; they do not establish its
+cause or maximum sustainable capacity. Empty groups have null quantiles.
+
 ```sh
 cargo fmt --all -- --check
 cargo check --locked --all-targets

@@ -41,6 +41,11 @@ impl SessionDecoder for Decoder {
     ) -> Result<(), VisitError> {
         match self {
             Self::Polymarket => {
+                if text.trim_start().starts_with('{') {
+                    let event =
+                        polymarket::decode_object(text, limits).map_err(VisitError::Envelope)?;
+                    return emit(event).map_err(VisitError::Sink);
+                }
                 for raw in envelope(text, limits).map_err(VisitError::Envelope)? {
                     emit(decode(raw, limits)).map_err(VisitError::Sink)?;
                 }

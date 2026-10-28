@@ -364,6 +364,34 @@ fn invalid_snapshot_and_inactive_peer_have_different_failure_scopes() {
     send(&mut p, data(s, 4, book("A", json!([]))), &mut trace);
     assert!(p.replica(s.adapter, "A", 0).unwrap().book.is_empty());
     assert_eq!(p.replica(s.adapter, "A", 0).unwrap().state, Validity::Live);
+
+    // Zero-sized entries still participate in duplicate validation, on either
+    // side and even when the equal prices are separated in the wire order.
+    let mut ordinal = 5;
+    for side in ["bids", "asks"] {
+        for sizes in [["0", "7"], ["7", "0"], ["0", "0"], ["3", "7"]] {
+            send(
+                &mut p,
+                data(s, ordinal, book("A", json!([{"price":"0.4","size":"11"}]))),
+                &mut trace,
+            );
+            ordinal += 1;
+            trace.clear();
+            let mut invalid = book("A", json!([]));
+            invalid[side] = json!([
+                {"price":"0.4","size":sizes[0]},
+                {"price":"0.2","size":"8"},
+                {"price":"0.40","size":sizes[1]}
+            ]);
+            send(&mut p, data(s, ordinal, invalid), &mut trace);
+            ordinal += 1;
+            let replica = p.replica(s.adapter, "A", 0).unwrap();
+            assert_eq!(replica.state, Validity::Stale);
+            assert_eq!(replica.book.best(Side::Buy).unwrap().1.value(), 11000000);
+            assert!(replica.book.best(Side::Sell).is_none());
+            assert_eq!(trace, ["invalid:A"], "no partial snapshot may escape");
+        }
+    }
 }
 
 #[test]
@@ -404,6 +432,119 @@ fn replacement_budget_includes_old_and_new_books() {
         } else {
             result.unwrap();
             assert_eq!(levels, vec![(300000, 7000000), (200000, 3000000)]);
+        }
+    }
+}
+
+#[test]
+fn occupancy_limits_match_ordered_array_oracle_for_repeated_multi_asset_changes() {
+    // Include positive replacement, absent-zero, remove/reinsert, both sides,
+    // and competing assets. Exhaust all length-four combinations. The oracle
+    // recounts a tiny array after EVERY entry, independently of C4 scratch maps.
+    let operations = [
+        (0, 0, 0, 0),
+        (0, 0, 0, 2),
+        (0, 0, 1, 3),
+        (1, 1, 0, 0),
+        (1, 1, 0, 4),
+        (1, 0, 0, 5),
+        (0, 1, 1, 0),
+    ];
+    for (side_limit, total_limit) in [(1, 2), (2, 2), (2, 3), (2, 4)] {
+        for case in 0..7_usize.pow(4) {
+            let mut p = Processor::new(Config {
+                levels_per_side: side_limit,
+                total_levels: total_limit,
+                ..Config::default()
+            })
+            .unwrap();
+            let s = session(0);
+            let mut trace = vec![];
+            subscribe(&mut p, s, 0, 1, &mut trace);
+            send(
+                &mut p,
+                data(s, 1, book("A", json!([{"price":"0.1","size":"7"}]))),
+                &mut trace,
+            );
+            let mut b = book("B", json!([]));
+            b["asks"] = json!([{"price":"0.1","size":"11"}]);
+            send(&mut p, data(s, 2, b), &mut trace);
+            trace.clear();
+            let initial = [[[7, 0], [0, 0]], [[0, 0], [11, 0]]];
+            let mut expected = initial;
+            let mut accepted = true;
+            let mut inputs = Vec::new();
+            let mut outputs = Vec::new();
+            let mut code = case;
+            for _ in 0..4 {
+                let (asset, side, price, quantity) = operations[code % 7];
+                code /= 7;
+                let name = ["A", "B"][asset];
+                inputs.push(json!({"asset_id":name,"side":(["BUY","SELL"][side]),
+                    "price":(["0.1","0.2"][price]),"size":quantity.to_string()}));
+                expected[asset][side][price] = quantity;
+                accepted &= expected.iter().all(|book| {
+                    book.iter()
+                        .all(|levels| levels.iter().filter(|q| **q != 0).count() <= side_limit)
+                });
+                accepted &= expected
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|q| **q != 0)
+                    .count()
+                    <= total_limit;
+                outputs.push(format!(
+                    "level:{name}:{}:{}:{}",
+                    [Side::Buy, Side::Sell][side],
+                    (price + 1) * 100_000,
+                    quantity * 1_000_000
+                ));
+            }
+            let result = p.process(
+                &data(
+                    s,
+                    3,
+                    json!({"event_type":"price_change",
+                "timestamp":"44","price_changes":inputs}),
+                ),
+                Duration::ZERO,
+                &mut |o| sink(o, &mut trace),
+            );
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "case {case}, limits {side_limit}/{total_limit}"
+            );
+            if accepted {
+                assert_eq!(
+                    trace, outputs,
+                    "every no-op and intermediate value must be emitted"
+                );
+            } else {
+                expected = initial;
+                assert!(trace.is_empty(), "no partial output on a capacity failure");
+            }
+            for (asset, name) in ["A", "B"].iter().enumerate() {
+                let replica = p.replica(s.adapter, name, 0).unwrap();
+                for (side, direction) in [Side::Buy, Side::Sell].iter().enumerate() {
+                    let mut actual: Vec<_> = replica
+                        .book
+                        .levels(*direction)
+                        .map(|(price, quantity)| (price.value(), quantity.value()))
+                        .collect();
+                    actual.sort_unstable();
+                    let levels: Vec<_> = expected[asset][side]
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, q)| **q != 0)
+                        .map(|(price, quantity)| {
+                            (((price + 1) * 100_000) as i64, quantity * 1_000_000)
+                        })
+                        .collect();
+                    assert_eq!(actual, levels, "case {case}, {name}/{direction}");
+                }
+            }
         }
     }
 }
@@ -478,4 +619,106 @@ fn signed_polymarket_size_rejects_the_whole_event_without_partial_mutation() {
         assert_eq!(replica.book.best(Side::Buy).unwrap().1.value(), 7_000_000);
         assert_eq!(p.stats().rejected, 1);
     }
+}
+
+#[test]
+fn requested_identity_lookup_preserves_namespace_and_unknown_scope() {
+    let mut p = Processor::new(Config::default()).unwrap();
+    let v1 = session(0);
+    let v2 = Session {
+        adapter: AdapterId::PolymarketV2,
+        slot: 0,
+        ..session(1)
+    };
+    let mut trace = vec![];
+    for (s, assets, quantities) in [
+        (v1, ["0007", "7"], [11, 13]),
+        (v2, ["0007", "only-v2"], [17, 19]),
+    ] {
+        send(&mut p, Message::Started(s), &mut trace);
+        send(
+            &mut p,
+            Message::SubscriptionsRequested {
+                session: s,
+                revisions: vec![1, 1],
+                add: assets.map(str::to_owned).to_vec(),
+                remove: vec![],
+            },
+            &mut trace,
+        );
+        let snapshots: Vec<_> = assets
+            .into_iter()
+            .zip(quantities)
+            .map(|(asset, quantity)| {
+                book(asset, json!([{"price":"0.4","size":quantity.to_string()}]))
+            })
+            .collect();
+        send(&mut p, data(s, 1, json!(snapshots)), &mut trace);
+    }
+    assert_eq!(
+        p.replica(v1.adapter, "0007", 0)
+            .unwrap()
+            .book
+            .best(Side::Buy)
+            .unwrap()
+            .1
+            .value(),
+        11_000_000
+    );
+    assert_eq!(
+        p.replica(v2.adapter, "0007", 0)
+            .unwrap()
+            .book
+            .best(Side::Buy)
+            .unwrap()
+            .1
+            .value(),
+        17_000_000
+    );
+    send(
+        &mut p,
+        Message::SubscriptionsRequested {
+            session: v1,
+            revisions: vec![2],
+            add: vec![],
+            remove: vec!["0007".into()],
+        },
+        &mut trace,
+    );
+    trace.clear();
+    send(
+        &mut p,
+        data(
+            v1,
+            2,
+            json!({"event_type":"price_change","timestamp":"41",
+        "price_changes":[change("0007","0.4","99")]}),
+        ),
+        &mut trace,
+    );
+    assert!(trace.is_empty(), "known unrequested input is ignored");
+    assert_eq!(p.replica(v1.adapter, "7", 0).unwrap().state, Validity::Live);
+    send(
+        &mut p,
+        data(
+            v1,
+            3,
+            json!({"event_type":"price_change","timestamp":"40",
+        "price_changes":[change("only-v2","0.4","101")]}),
+        ),
+        &mut trace,
+    );
+    assert_eq!(trace, ["invalid:7"], "unknown in V1 invalidates V1, not V2");
+    let remaining = p.replica(v1.adapter, "7", 0).unwrap();
+    assert_eq!(remaining.state, Validity::Stale);
+    assert_eq!(
+        remaining.book.best(Side::Buy).unwrap().1.value(),
+        13_000_000
+    );
+    for (asset, quantity) in [("0007", 17_000_000), ("only-v2", 19_000_000)] {
+        let replica = p.replica(v2.adapter, asset, 0).unwrap();
+        assert_eq!(replica.state, Validity::Live);
+        assert_eq!(replica.book.best(Side::Buy).unwrap().1.value(), quantity);
+    }
+    assert_eq!(p.take_recovery(), [v1]);
 }

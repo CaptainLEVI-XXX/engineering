@@ -843,17 +843,18 @@ impl Processor {
         Ok(())
     }
     fn resolve(&self, session: Session, asset: &str) -> Result<Option<Binding>> {
-        let Some(id) = self
-            .by_adapter
-            .get(&session.adapter)
-            .and_then(|m| m.get(asset))
-        else {
-            anyhow::bail!("unknown book asset");
-        };
         let Some(binding) = self.sources[&session.worker].requested.get(asset).copied() else {
+            // A known but unrequested identity is ignored; an unknown one still
+            // invalidates this source. Keep that distinction on the miss path.
+            ensure!(
+                self.by_adapter
+                    .get(&session.adapter)
+                    .is_some_and(|m| m.contains_key(asset)),
+                "unknown book asset"
+            );
             return Ok(None);
         };
-        let replica = &self.books[id.0 as usize].replicas[&binding.session.slot];
+        let replica = &self.books[binding.book.0 as usize].replicas[&binding.session.slot];
         Ok((replica.binding == binding && replica.state != Validity::Inactive).then_some(binding))
     }
     fn invalidate(

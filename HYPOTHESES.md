@@ -1,0 +1,236 @@
+# Research-gated hypothesis backlog
+
+**Frozen at the user's request after E21.** Further optimization and experiment
+execution are paused. Preserve the current tested H15+H08+H05 implementation and
+all experiment evidence; H17 remains archived, not integrated. This freezes a
+correctness-tested baseline, not a qualified latency improvement. Historical
+"next" investigations below are backlog only until the user resumes research.
+
+H02 and H06 are parked; H07 is deferred after isolated cost measurement.
+E18 reopens H05 on top of H15+H08 after a fresh profile found resolution in
+65/420 Processor-containing samples. Post-change resolve samples fell to 30/390,
+but the favorable native-width 5k/s smoke failed longer confirmation. Retain the
+implementation experimentally with unresolved regressions; no broader promotion
+or fourth stacked change is justified by these results.
+E06 reduced generator interference but A/A noise remains. H08 was parked after
+both pipeline screens failed despite confirmed optional-string allocation reduction.
+Under the adopted three-dimension workflow, E17 restored it experimentally:
+3,215 removed allocations reproduced alone and alongside H15, but isolated
+decoder time and pipeline tails did not consistently improve. The combined
+H15+H08 campaign matched 8,318,106 records; no promotion on allocation counts.
+E11 reopened H02 after horizontal research and stage attribution; burst gains
+repeated, but mixed p99 regressed in every pair, so it remains parked.
+E13 corrected pacing and E14 moved reference reconstruction after drain; neither
+stabilized identical-binary wall-time tails. E14's switch trace does not support
+blaming guest task descheduling for most processing tails. Hardware instruction
+counters are unavailable here. Resolve measurement sensitivity before promotion.
+H15 is now implemented locally at the user's request: direct object decoding and
+reuse of parsed error context. E16 confirmed lower decoder cost through equivalent
+release builds and passed its 1k/s tail screen, but 3k/s and 5k/s regression guards
+still failed. Retained as a promising computational improvement with unresolved
+tail regressions, not an accepted overall latency improvement.
+A mechanism in another implementation is necessary evidence, not sufficient
+proof that our workload benefits. Unknown costs stay unknown; don't manufacture
+an expected speedup.
+
+Before marking `ready-for-experiment`, record: the current measured cost and
+source path; the external implementation/mechanism; why its assumptions fit;
+the smallest proposed change; failure risks; the falsifier; exact correctness
+and performance checks. The agent/reviewer judges substance. The runner checks
+that this record exists, not that the research is intellectually sound.
+
+## Ranked investigations
+
+| Priority / ID | Question | Expected benefit if confirmed | Risk / complexity | Current decision |
+|---|---|---|---|---|
+| 0 / H00 | Can unchanged code generate an apparent latency win? | Prevent accepting noise | No production risk; low | Confirmed repeatedly: E14 identical-binary p99 ranged 32.870–56.064µs after pacing/oracle corrections; no improvement accepted |
+| 1 / H01 | Are repeated JSON traversal and bounded-vector allocations material in current decode time? | Less per-message parsing/allocation work | High malformed-input/lifetime risk; medium-high | E01: retained delta decode+envelope median 1.588µs; four-snapshot array 138.639µs. Parser rewrite deferred; allocations still unattributed |
+| 2 / H02 | Does validated bulk snapshot construction outperform repeated tree insertion at observed depths? | Reduce snapshot burst interference | Duplicate validation and replacement peak; medium | Parked: E11 researched retest improved burst p99 19–23% but regressed mixed p99 10–15%, with all mixed guards failing. Node-comparison counts confirm an update-cost tradeoff but do not establish the timing regression's cause |
+| 3 / H03 | Is the queue tail mostly scheduling/oracle interference rather than queue operations? | Avoid unnecessary queue rewrite; possibly reduce wakeup delays | Ordering/arbitration risk if architecture changes; high | Research separates Tokio and Crossbeam mechanisms; attribution missing |
+| 4 / H04 | Does batch policy delay consumer-visible records under realistic output stalls? | Improve visibility without losing accepted history | Output failure/framing risk; high | Existing write-call measurements cannot answer; need consumer measurement |
+| 5 / H05 | Can existing Binding.book avoid hashing each accepted asset twice? | Remove redundant string lookup without new state | Identity/namespace and stale binding semantics; low-medium | Parked: isolated lookup gain, but both native-ID and mixed paired pipeline screens failed; candidate removed |
+| 6 / H06 | Does Entry reduce numeric preparation get-then-insert cost? | Hash/probe once per provisional quantity | Repeated-key, zero, relative arithmetic and event atomicity; low-medium | Parked: isolated fragment gains, but both E04 paired pipeline screens failed; candidate removed |
+| 7 / H07 | Does fused digit validation avoid a redundant decimal pass? | Remove a short byte traversal | Exact arithmetic/grammar and diagnostic precedence; medium | Deferred: isolated saving about 1–10ns/value is too small for current pipeline sensitivity; no production change |
+| 8 / H08 | Are optional annotated Cow strings actually borrowed? | Avoid unnecessary ownership allocation while preserving escapes | Lifetimes, absent/null fields and decode failure scope; low-medium | Parked: eliminated 3,215 mixed/5,450 burst string allocations, but both paired latency screens failed. Candidate and its borrowing-only assertion removed; evidence retained |
+| 9 / H09 | Would consecutive-entry identity caching help real batches? | Avoid repeating resolution within one event | Cache scope, stale bindings, preserved feed order; low-medium | Not justified by the retained trace: 31 two-asset batches, 62 entries, zero adjacent repeated IDs. Do not generalize this small trace to all exchange traffic |
+| 10 / H10 | Does retired-book health work remain on the critical path? | Reduce unnecessary background checks | Quiet live books must still be monitored; medium | E08 confirmed 6,000/3,000/0 checks for 100/50/0 desired books over equal logical intervals. Retirement work already expires; quiet live peers stayed valid. No scheduler rewrite justified |
+| 11 / H11 | Is decoder-list reuse worth changing Event ownership? | Remove vector growth/drop allocations | Borrowed frame lifetimes, bounded parsing and whole-event rejection; medium-high | E09 saved 21–52ns for two-entry changes; larger cases were mixed/regressed. Failed the 10% + 0.5µs applicability screen; no ownership rewrite |
+| 12 / H12 | Can successful single-object decoding avoid a separate whole-envelope scan? | Remove measured repeated parsing and a one-element Vec | Malformed-tail atomicity, error scope and cold-path fallback cost; medium | Parked: processing p99 improved in 8/9 pairs, but short and long native-ID campaigns each failed a guard. Full correctness passed; production patch removed. E13 addresses a demonstrated producer-pacing flaw before any retest |
+| 13 / H15 | Can direct object parsing and reused error context remove traversal without full-error retries? | Less valid-object and semantic-error decoding work | Envelope/event error distinction, retained identities and malformed tails; medium | Implemented locally, not qualified: 43,827 differential cases and full suites passed; isolated valid-object cost fell 30.91%, but mixed p99 worsened in 3/3 pairs and native-ID results failed guards in 2/3. No overall speedup claim or promotion |
+
+## First three experiments
+
+1. **E00 — unchanged-code A/A calibration.** Same commit, toolchain, fixture and
+   copied binary; three alternating five-second pairs. Require exact replay and
+   complete accounting. Always report `control_only`, even if one label appears
+   faster. Record per-pair variation to inform—not retroactively tune—later gates.
+2. **E01 — attribute decoding before changing it.** Inspect the locked serde
+   implementation, then time 10k–50k decode operations across the retained V1
+   trace and asymmetric shallow/deep inputs. Keep malformed-tail, overflow and
+   event-atomicity checks. Use independent expected values and separately measure
+   instrumentation overhead. A parser/allocation change remains blocked if its
+   cost is small or observations cannot distinguish it from other owner work.
+3. **E02 — isolate replacement construction.** Measure replacement-only cost by
+   depth; compare standard bulk construction only after explicit duplicate checks
+   are proven, including duplicate-zero cases and budgets. Retain BTreeMap if
+   sorting/validation/allocation eliminates the benefit. Any new benchmark must
+   be established identically on baseline and candidate before comparison.
+
+E01/E02 are diagnostic experiment specifications, not authorized performance
+claims or permission to skip research gates. Architecture/concurrency/recovery
+changes require integration/fault qualification before latency screening can
+support promotion. No guessed dead-code removal: prove unused paths and preserve
+public behavior; a compiler warning alone is not a performance bottleneck.
+
+## Record passed to the runner
+
+Use `--hypothesis path.json` for different source trees. Fill this template from
+actual evidence, then deliberately change status only when the gate is satisfied:
+
+```json
+{
+  "id": "H01",
+  "status": "research-needed",
+  "observed_cost": "",
+  "implementation_evidence": "",
+  "references": [],
+  "applicability": "",
+  "change": "",
+  "correctness_risks": "",
+  "falsifier": "",
+  "verification": ""
+}
+```
+
+No runner output automatically authorizes a commit, push or merge. Promotion
+requires repeated evidence on representative data, not only three favorable
+small samples. Failed ideas stay in `EXPERIMENTS.md`; reopen them only with new
+evidence. Use the same threshold and primary metric declared before the run.
+
+## Reclassification under the adopted three-dimension workflow
+
+The historical table above records decisions made under the original p99 screen.
+This table separates mechanism evidence from the still-binding regression flags;
+it does not retroactively change a failed result or restore deleted candidates.
+
+| Candidate | Computational evidence | Capacity / tail evidence | Current treatment |
+|---|---|---|---|
+| H15 direct object parsing | E16 equivalent-build retained-update median cost fell 26.75–35.25% in all three pairs | Exact output at 1k/3k/5k; no capacity limit established; 1k tail screen passed, 3k and 5k guards failed | Promising computational improvement, unresolved tail regression; retained locally, not promoted |
+| H08 optional Cow borrowing | E17 reproduced 3,215 fewer mixed allocations alone and combined; decoder time mixed | Allocation-only and combined tail screens failed | Retained experimentally alongside H15; allocation benefit, unresolved latency warning, not production accepted |
+| H05 repeated identity lookup | E03 isolated savings; E18 resolve samples fell 65/420 → 30/390 | E18 mixed/low-rate screens failed; native-width 5k smoke passed but longer confirmation failed | Retained experimentally with unresolved regressions; no new cache/hasher or promotion |
+| H06 repeated numeric lookup | Isolated preparation fragments improved | Both E04 workload screens failed | Archived; no new evidence supporting a combination yet |
+| H02 bulk snapshot construction | Replacement throughput improved; tree shape changes later update work | Burst benefit with repeated mixed regression | Regression warning; hold out of combinations pending attribution |
+| H07 decimal pass fusion / H11 scratch reuse | Tiny or inconsistent isolated savings | No convincing applicability evidence | Defer, not rejected merely for noisy p99; lower value than current candidates |
+| H09 consecutive-ID cache / H10 retired health pruning | Retained data has no adjacent repeated IDs; retired work already expires | Proposed redundancy not established | Do not implement without new workload evidence |
+
+## Next five ranked hypotheses
+
+1. **H15 / equivalent-build parser efficiency and load response.** The scan saving
+   should persist when both arms call the same public API from equivalent release
+   builds. Test 1k/3k/5k messages/s, per-shape service tails and chronological queue
+   age. Falsifier: no stable decoder saving, or an attributable material regression.
+   **Executed E16:** decoder saving confirmed; all 8,318,106 output records matched.
+   Tail qualification remains open at 3k/s and 5k/s; do not repeat unchanged trials.
+2. **H08 / borrow optional wire strings alongside the parser candidate.** Avoid
+   already-counted allocations without changing lifetimes beyond a message. First
+   recover and measure the allocation candidate alone under equivalent builds;
+   only then test the pair. Keep escaped strings and error identities exact.
+   **E17 allocation-only completed:** 12.10% fewer Processor-stack allocations,
+   all 1,765,230 replay records matched, mixed decoder-time/tail results. Combined
+   H15 → H15+H08 removed 15.63% of these allocations and matched 8,318,106 records,
+   but failed queue/p99.9 guards. E18 profiles the remainder and isolates H05's
+   existing-ID lookup on top of that pair. Its longer confirmation also failed;
+   preserve computational evidence and regression warnings separately. Do not
+   repeat unchanged trials or stack a fourth change.
+3. **Snapshot interference and update layout.** Measure whether replacement bursts
+   or subsequent tree updates account for service-time spikes. Separate those
+   paths before changing BTreeMap construction/layout; fail on duplicate-level,
+   replacement, memory-budget or mixed-update regressions.
+4. **Ingress wakeup versus owner saturation.** A bounded load curve may distinguish
+   scheduling overhead at low load from sustained queue growth at high load.
+   Research the measured regime, not a preferred queue implementation. Sharding
+   remains blocked until single-owner saturation and identity-order preservation
+   are demonstrated; the first 5k/s screen may not reach saturation at all.
+5. **SBE batch visibility versus throughput.** Measure a real downstream reader's
+   first decodable record and complete accepted-prefix drain under healthy and
+   stalled sinks. Writer-call latency alone cannot justify batch-policy changes.
+
+These are investigations, not five promised rewrites. Each needs its own research
+and correctness evidence before implementation; maintain a fixed time/resource
+budget and deliver qualified collector changes, not speculative infrastructure.
+
+### E19 diagnostic prerequisite
+
+The requested bounded replay proved that sample-vector growth and first-touch
+faults contaminate timed publication. Same-binary off/on/on/off controls removed
+the repeated capacity-crossing spikes, but did not explain the remaining tail or
+turn E18 into a pass. Retain the harness-only preallocation/page-touch correction;
+production candidates and their unresolved regression status are unchanged.
+
+Before another optimization or confirmation, distinguish actual owner CPU work
+from wall-time inflation in the remaining decode-heavy outliers using the repaired
+measurement source. Control diagnostic clock overhead and preserve unchanged-code
+controls. Guest switch records alone were insufficient: 325 of 327 slow prepared
+samples had neither a minor fault nor guest descheduling. Do not infer a queue,
+parser, allocator or cache redesign from that absence of attribution.
+
+### H16 / E20 — specialize the nested change list
+
+The user's later specialization directive authorizes a horizontal audit and a
+bounded mechanism experiment, not promotion of another production change.
+RESEARCH.md E20 ranks C1–C5 opportunities by frequency, removable work, actual
+workload fit, risk and memory. The highest-ranked new experiment is typed
+`price_changes` during Wire parsing, eliminating its RawValue rescan. Static
+keyword hashing ranks low: Serde already emits fixed matches, and an equivalent
+release match already compiled to length dispatch and safe SIMD comparisons.
+
+**Executed, archived, not integrated.** 51,040 differential cases and 1,765,230
+SBE oracle records matched. Equivalent-build 16-entry decoder loop elapsed time
+fell 22.70–29.75% and 64-entry time 27.02–33.69% across three pairs. Smaller
+retained deltas and snapshot controls were mixed/adverse. All-error fallback
+raised malformed-tail cost about 2.4×. Pipeline regression guards failed at both
+1k/s and 5k/s, including a final 5k/s processing-p99 regression of 18.60%.
+
+No promotion or unchanged rerun follows. To revisit this candidate, first show
+bounded runtime-limit parsing and error-scope preservation without speculative
+full failure reparsing, then discriminate remaining pipeline regressions using
+the repaired harness. The independent alternative is to profile C4 event-local
+numeric preparation before choosing a small-index representation; do not stack
+that change on H16. Keep the new opt-in batch-width cases in the harness.
+
+## H17–H19 — C4 occupancy work and snapshot traversal (E21)
+
+**H17 tested in isolation, retained as an experiment, not integrated:** skip
+the side-count lookup and capacity check only when old/new occupancy agree.
+Every transition still checks intermediate side/global limits before mutation.
+Existing provisional quantity semantics, all observations, source validity and
+snapshot construction peaks remain unchanged. Hypothesis/patches and build
+identities are archived in `e21/`; production source hash remains E20's baseline.
+
+The independent array oracle checked 9,604 four-entry, two-asset/both-side traces
+across four budget configurations. Existing signed-relative/negative/overflow
+conformance and exact SBE output comparisons passed. For predecoded 16-entry
+nontransition batches, total measured event time improved 5.8–11.9% for Set and
+7.6–11.6% for Add. However, all-transition 16-entry controls regressed in every
+pair (Set 7.7–54.3%, Add 7.4–36.5%). Do not label this uniformly cheaper.
+
+Pipeline screens: mixed failed at both 1k and 5k/s; snapshot-burst failed at 1k/s
+and passed the short screen at 5k/s only. Mixed 5k pair 2 processing p99 rose
+20.666→28.498µs, with slower owner and recorder tails; no unique machine-level
+cause established. Allocations were unchanged. **Do not promote from the one
+favorable workload/rate or retry these runs until they pass.** A controlled
+hash-seed/code-layout and CPU-time diagnostic would discriminate remaining
+causes better than adding another optimization on top.
+
+**H18, next independent C4 candidate:** remember whether snapshot insertion saw
+any zero, skipping the final tree-wide retain only for all-positive sides.
+Keep duplicate checks, insertion order, old-book lifetime and peak limits.
+Current deep-snapshot attribution gives construction only 15–16% of total array
+time; the removable retain pass is a subset of that, not a 70% opportunity.
+Validate empty/zero-heavy/duplicate snapshots and later mixed updates before
+claiming any win. Not implemented in E21.
+
+**H19, deferred:** bounded event-local side counts with existing HashMap fallback.
+Do not add persistent epochs or assume a two-asset feed. First establish the
+remaining count cost and binding distribution; fallback must migrate provisional
+counts and preserve intermediate peaks. No implementation or speed claim.

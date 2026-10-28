@@ -68,13 +68,22 @@ pub fn envelope<'a>(text: &'a str, limits: &Limits) -> Result<Vec<&'a RawValue>>
     }
 }
 
+fn optional_text<'de, D: de::Deserializer<'de>>(d: D) -> Result<Option<Cow<'de, str>>, D::Error> {
+    // Serde's borrow specialization applies to a direct Cow, not Option<Cow>.
+    // The transparent wrapper also preserves owned strings for JSON escapes.
+    #[derive(Deserialize)]
+    #[serde(transparent)]
+    struct Text<'a>(#[serde(borrow)] Cow<'a, str>);
+    Option::<Text<'de>>::deserialize(d).map(|value| value.map(|text| text.0))
+}
+
 #[derive(Deserialize)]
 struct Wire<'a> {
     #[serde(borrow)]
     event_type: Cow<'a, str>,
-    #[serde(borrow)]
+    #[serde(borrow, default, deserialize_with = "optional_text")]
     asset_id: Option<Cow<'a, str>>,
-    #[serde(borrow)]
+    #[serde(borrow, default, deserialize_with = "optional_text")]
     timestamp: Option<Cow<'a, str>>,
     #[serde(borrow)]
     bids: Option<&'a RawValue>,
@@ -144,16 +153,63 @@ fn time(text: Option<&str>) -> Result<u64> {
 }
 
 pub fn decode<'a>(raw: &'a RawValue, limits: &Limits) -> Result<Event<'a>, DecodeError> {
+    if raw.get().len() > limits.message_bytes {
+        return Err(DecodeError {
+            assets: None,
+            resource: true,
+            reason: "resource limit: event bytes".into(),
+        });
+    }
+    let wire = serde_json::from_str(raw.get()).map_err(|error| DecodeError {
+        assets: None,
+        resource: false,
+        reason: error.to_string(),
+    })?;
+    decode_wire(wire, limits)
+}
+
+/// Decode Wire and check the input's end before exposing an event. Only a
+/// typed-field failure needs a syntax-only scan to distinguish a malformed
+/// envelope from a valid object with invalid fields.
+pub(super) fn decode_object<'a>(
+    text: &'a str,
+    limits: &Limits,
+) -> Result<Result<Event<'a>, DecodeError>> {
+    ensure!(
+        text.len() <= limits.message_bytes,
+        "resource limit: message bytes"
+    );
+    ensure!(limits.events > 0, "expected object or array");
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    match Wire::deserialize(&mut deserializer) {
+        Ok(wire) => {
+            // Once the object is decoded, a trailing-input failure is known to
+            // be an envelope error. No second scan is needed to classify it.
+            deserializer.end()?;
+            Ok(decode_wire(wire, limits))
+        }
+        Err(error) => {
+            let raw = serde_json::from_str::<&RawValue>(text)?;
+            if text.starts_with([' ', '\t', '\r', '\n']) {
+                // Preserve RawValue-relative typed-field error positions. Only
+                // this whitespace-prefixed failure needs another typed parse.
+                return Ok(decode(raw, limits));
+            }
+            Ok(Err(DecodeError {
+                assets: None,
+                resource: false,
+                reason: error.to_string(),
+            }))
+        }
+    }
+}
+
+fn decode_wire<'a>(mut wire: Wire<'a>, limits: &Limits) -> Result<Event<'a>, DecodeError> {
     let result = (|| -> Result<Event<'a>> {
-        ensure!(
-            raw.get().len() <= limits.message_bytes,
-            "resource limit: event bytes"
-        );
-        let wire: Wire = serde_json::from_str(raw.get())?;
         match wire.event_type.as_ref() {
             "book" => {
-                let asset = wire.asset_id.context("missing asset_id")?;
-                identity(&asset, limits)?;
+                let asset = wire.asset_id.as_deref().context("missing asset_id")?;
+                identity(asset, limits)?;
                 let bids: Vec<Level> =
                     list(wire.bids.context("missing bids")?.get(), limits.entries)?;
                 let asks: Vec<Level> = list(
@@ -166,9 +222,10 @@ pub fn decode<'a>(raw: &'a RawValue, limits: &Limits) -> Result<Event<'a>, Decod
                         .all(|l| l.price.value() <= 1_000_000),
                     "price outside probability range"
                 );
+                let exchange_us = Some(time(wire.timestamp.as_deref())?);
                 Ok(Event::Snapshot {
-                    asset,
-                    exchange_us: Some(time(wire.timestamp.as_deref())?),
+                    asset: wire.asset_id.take().unwrap(),
+                    exchange_us,
                     bids,
                     asks,
                 })
@@ -191,17 +248,18 @@ pub fn decode<'a>(raw: &'a RawValue, limits: &Limits) -> Result<Event<'a>, Decod
                 })
             }
             "tick_size_change" => {
-                let asset = wire.asset_id.context("missing asset_id")?;
-                identity(&asset, limits)?;
+                let asset = wire.asset_id.as_deref().context("missing asset_id")?;
+                identity(asset, limits)?;
                 let tick: Price =
                     serde_json::from_str(wire.new_tick_size.context("missing tick")?.get())?;
                 ensure!(
                     tick.value() > 0 && tick.value() <= 1_000_000,
                     "invalid probability tick size"
                 );
+                let exchange_us = Some(time(wire.timestamp.as_deref())?);
                 Ok(Event::Tick {
-                    asset,
-                    exchange_us: Some(time(wire.timestamp.as_deref())?),
+                    asset: wire.asset_id.take().unwrap(),
+                    exchange_us,
                     tick,
                 })
             }
@@ -242,18 +300,14 @@ pub fn decode<'a>(raw: &'a RawValue, limits: &Limits) -> Result<Event<'a>, Decod
     result.map_err(|error| {
         let reason = error.to_string();
         DecodeError {
-            assets: scope(raw, limits),
+            assets: scope(wire, limits),
             resource: reason.starts_with("resource limit:"),
             reason,
         }
     })
 }
 
-fn scope(raw: &RawValue, limits: &Limits) -> Option<Vec<String>> {
-    if raw.get().len() > limits.message_bytes {
-        return None;
-    }
-    let wire: Wire = serde_json::from_str(raw.get()).ok()?;
+fn scope(wire: Wire<'_>, limits: &Limits) -> Option<Vec<String>> {
     let assets = match wire.event_type.as_ref() {
         "book" | "tick_size_change" => vec![wire.asset_id?.into_owned()],
         "price_change" => list::<Identity>(wire.price_changes?.get(), limits.entries)
