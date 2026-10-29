@@ -363,3 +363,22 @@ unchanged from the first to the bound-th identity, and the bound still rejects.
 Gates: fmt, strict clippy, debug and release 210 passed / 0 failed / 12
 ignored. Not yet re-measured: the offline owner-capacity test with the orb's
 instrumentation (`engineering/test`, bcadca6) is the A/B.
+
+## H30 — 1 ms publish/flush cadence (default changed, not yet measured)
+
+r2 steady state: ~6 ms p50 end to end, of which S6 (writer received → flushed)
+was 3.3 ms p50 and the rest mostly batch aging; S3 processing 6.9 µs. Defaults
+`publish_age` and `flush_age` are now 1 ms (minimum the config admits). Expected
+p50 ~1–2 ms; cost ~5× more publish/flush calls. Receive timestamps unchanged.
+
+Pool left at 16 × 4 MiB. Correction to H20's earlier "64 × 1 MiB" suggestion:
+`recording::channel` requires a batch to hold the largest admitted snapshot
+plus its 8 KiB sidecar slot (~2.1 MB at 65,535 levels/side), so 1 MiB batches
+fail at startup. Also, a shorter age shortens only the first part of the stall
+tolerance (slots × age: 80 → 16 ms); the retained last batch still fills its
+4 MiB before the fail-closed acquire, so total tolerance stays near one batch
+fill (~1 s at r2's ~4.4 MB/s), not 16 ms.
+
+A/B caution: arms that differ in these defaults are not comparable on batch
+age, S4–S7 or recorder metrics. Compare the H28/H29 stall fixes on S2 and
+owner-operation timings, or pin both arms to the same cadence.

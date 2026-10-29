@@ -36,9 +36,12 @@ impl Default for Config {
             batch_bytes: 4 << 20,
             entries: 4096,
             publish_bytes: 256 << 10,
-            publish_age: Duration::from_millis(5),
+            // 1 ms bounds output visibility; live r2 at 5 ms spent ~95% of its
+            // ~6 ms p50 end-to-end time waiting here. 1 ms is the floor the
+            // millisecond config admits. Receive timestamps are unaffected.
+            publish_age: Duration::from_millis(1),
             buffer_bytes: 256 << 10,
-            flush_age: Duration::from_millis(5),
+            flush_age: Duration::from_millis(1),
             chunk_age: Duration::from_secs(60),
         }
     }
