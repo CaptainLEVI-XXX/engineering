@@ -125,6 +125,26 @@ pub enum Event<'a> {
     NonBook,
 }
 
+/// Bounded decoding refused input before materializing it. Distinct from a
+/// grammar or semantic failure: the input may be valid but exceeds a budget.
+#[derive(Debug)]
+pub struct ResourceLimit(pub String);
+impl ResourceLimit {
+    pub(crate) fn check(within: bool, what: &str) -> anyhow::Result<()> {
+        if within {
+            Ok(())
+        } else {
+            Err(Self(format!("resource limit: {what}")).into())
+        }
+    }
+}
+impl std::fmt::Display for ResourceLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for ResourceLimit {}
+
 #[derive(Debug)]
 pub struct DecodeError {
     /// None means the affected source scope cannot be safely narrowed.

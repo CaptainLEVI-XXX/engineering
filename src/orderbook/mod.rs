@@ -176,6 +176,9 @@ pub enum InvalidationCause {
     AssignmentReplaced,
     Retired,
     PolicySuspension,
+    /// A configured book/decoder budget rejected exchange input. Only the
+    /// affected scope degrades; the process and unrelated books continue.
+    ResourceLimit,
 }
 pub enum ObservationKind<'a> {
     /// Validated standby state; provenance only, never a financial output record.
@@ -224,4 +227,5 @@ pub struct Stats {
     pub renewal_deferred: u64,
     pub renewals_granted: u64,
     pub lifecycle_hints_dropped: u64,
+    pub resource_quarantines: u64,
 }

@@ -1,4 +1,4 @@
-use super::{Change, DecodeError, Event, Level, Limits, Price, QuantityChange};
+use super::{Change, DecodeError, Event, Level, Limits, Price, QuantityChange, ResourceLimit};
 use crate::Side;
 use anyhow::{Context, Result, ensure};
 use serde::{
@@ -6,19 +6,21 @@ use serde::{
     de::{self, DeserializeSeed, SeqAccess, Visitor},
 };
 use serde_json::value::RawValue;
-use std::{borrow::Cow, fmt, marker::PhantomData};
+use std::{borrow::Cow, cell::Cell, fmt, marker::PhantomData};
 
-struct List<T> {
+struct List<'c, T> {
     max: usize,
+    /// Set when the bound, not the input grammar, rejected the array.
+    exceeded: &'c Cell<bool>,
     marker: PhantomData<T>,
 }
-impl<'de, T: Deserialize<'de>> DeserializeSeed<'de> for List<T> {
+impl<'de, T: Deserialize<'de>> DeserializeSeed<'de> for List<'_, T> {
     type Value = Vec<T>;
     fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Vec<T>, D::Error> {
         d.deserialize_seq(self)
     }
 }
-impl<'de, T: Deserialize<'de>> Visitor<'de> for List<T> {
+impl<'de, T: Deserialize<'de>> Visitor<'de> for List<'_, T> {
     type Value = Vec<T>;
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("a bounded array")
@@ -28,6 +30,7 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for List<T> {
         loop {
             if values.len() == self.max {
                 if seq.next_element::<de::IgnoredAny>()?.is_some() {
+                    self.exceeded.set(true);
                     return Err(de::Error::custom("resource limit: array entries"));
                 }
                 break;
@@ -41,22 +44,29 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for List<T> {
     }
 }
 fn list<'a, T: Deserialize<'a>>(text: &'a str, max: usize) -> Result<Vec<T>> {
+    let exceeded = Cell::new(false);
     let mut d = serde_json::Deserializer::from_str(text);
     let result = List {
         max,
+        exceeded: &exceeded,
         marker: PhantomData,
     }
-    .deserialize(&mut d)?;
+    .deserialize(&mut d)
+    .map_err(|error| {
+        // Keep serde's positioned message; classify by type, not by text.
+        if exceeded.get() {
+            anyhow::Error::new(ResourceLimit(error.to_string()))
+        } else {
+            error.into()
+        }
+    })?;
     d.end()?;
     Ok(result)
 }
 
 /// Full syntactic validation precedes exposing any top-level event to a caller.
 pub fn envelope<'a>(text: &'a str, limits: &Limits) -> Result<Vec<&'a RawValue>> {
-    ensure!(
-        text.len() <= limits.message_bytes,
-        "resource limit: message bytes"
-    );
+    ResourceLimit::check(text.len() <= limits.message_bytes, "message bytes")?;
     if text.trim_start().starts_with('[') {
         list(text, limits.events)
     } else {
@@ -175,10 +185,7 @@ pub(super) fn decode_object<'a>(
     text: &'a str,
     limits: &Limits,
 ) -> Result<Result<Event<'a>, DecodeError>> {
-    ensure!(
-        text.len() <= limits.message_bytes,
-        "resource limit: message bytes"
-    );
+    ResourceLimit::check(text.len() <= limits.message_bytes, "message bytes")?;
     ensure!(limits.events > 0, "expected object or array");
     let mut deserializer = serde_json::Deserializer::from_str(text);
     match Wire::deserialize(&mut deserializer) {
@@ -297,13 +304,10 @@ fn decode_wire<'a>(mut wire: Wire<'a>, limits: &Limits) -> Result<Event<'a>, Dec
             _ => anyhow::bail!("unknown event type"),
         }
     })();
-    result.map_err(|error| {
-        let reason = error.to_string();
-        DecodeError {
-            assets: scope(wire, limits),
-            resource: reason.starts_with("resource limit:"),
-            reason,
-        }
+    result.map_err(|error| DecodeError {
+        assets: scope(wire, limits),
+        resource: error.is::<ResourceLimit>(),
+        reason: error.to_string(),
     })
 }
 

@@ -339,11 +339,8 @@ async fn full_output_fails_the_run_and_preserves_the_accepted_prefix() {
 }
 
 #[tokio::test]
-async fn binary_and_oversized_data_fail_closed() {
-    for invalid in [
-        Message::Binary(vec![1].into()),
-        Message::Text("x".repeat(513).into()),
-    ] {
+async fn binary_data_fails_closed() {
+    for invalid in [Message::Binary(vec![1].into())] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config = config(format!("ws://{}", listener.local_addr().unwrap()));
         Arc::make_mut(&mut config).max_message_bytes = 512;
@@ -393,6 +390,81 @@ async fn binary_and_oversized_data_fail_closed() {
         peer.abort();
         let _ = peer.await;
     }
+}
+
+#[tokio::test]
+async fn oversized_message_ends_only_its_session_and_reconnects() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = config(format!("ws://{}", listener.local_addr().unwrap()));
+    Arc::make_mut(&mut config).max_message_bytes = 512;
+    let (_tx, commands) = mpsc::channel(8);
+    let (output, received) = output::channel(64, 1 << 20).unwrap();
+    let (stop, _) = watch::channel(false);
+    let worker = tokio::spawn(run_worker(
+        0,
+        AdapterId::PolymarketV1,
+        vec!["A".into()],
+        commands,
+        output,
+        config,
+        stop.clone(),
+    ));
+    let (socket, _) = listener.accept().await.unwrap();
+    let mut ws = accept_async(socket).await.unwrap();
+    ws.next().await.unwrap().unwrap();
+    ws.send(Message::Text("x".repeat(513).into()))
+        .await
+        .unwrap();
+    // A fresh session replaces the one that received the oversized frame.
+    let (socket, _) = timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .expect("worker reconnects after an oversized message")
+        .unwrap();
+    let mut second = accept_async(socket).await.unwrap();
+    second.next().await.unwrap().unwrap();
+    assert!(!*stop.borrow(), "oversize must not stop the transport");
+    stop.send_replace(true);
+    drop(ws);
+    let peer = tokio::spawn(async move {
+        while let Some(Ok(message)) = second.next().await {
+            if matches!(message, Message::Close(_)) {
+                let _ = second.flush().await;
+                break;
+            }
+        }
+    });
+    timeout(Duration::from_secs(2), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    peer.abort();
+    let _ = peer.await;
+    let messages: Vec<_> = received.try_iter().map(|e| e.message).collect();
+    assert!(
+        !messages
+            .iter()
+            .any(|m| matches!(m, OutputMessage::Data { .. })),
+        "the oversized message is never handed off"
+    );
+    let ended: Vec<_> = messages
+        .iter()
+        .filter_map(|m| match m {
+            OutputMessage::Ended { session, reason } => Some((session.generation, reason.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        ended
+            .first()
+            .is_some_and(|(generation, reason)| *generation == 1
+                && reason.starts_with("message exceeded transport limit")),
+        "{ended:?}"
+    );
+    assert!(
+        ended.iter().any(|(generation, _)| *generation == 2),
+        "{ended:?}"
+    );
 }
 
 #[tokio::test]

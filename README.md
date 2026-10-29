@@ -119,9 +119,9 @@ production ingress item limit and unchanged 64 MiB accounted-byte limit.
 these tolerances do not turn the 10s target into an exact real-time guarantee.
 
 ```sh
-OWNER_BOOKS=550000 OWNER_RATE=100000 OWNER_SECONDS=70 cargo test --locked --release --bin engineering-challenge production_owner_capacity -- --ignored --nocapture
+OWNER_BOOKS=550000 OWNER_RATE=100000 OWNER_SECONDS=70 cargo test --locked --release --lib production_owner_capacity -- --ignored --nocapture
 # Small dual-feed smoke before the expensive full-population replay:
-OWNER_BOOKS=1000 OWNER_REPLICAS=2 OWNER_RATE=10000 OWNER_SECONDS=3 OWNER_CHECK_HEALTH=1 cargo test --locked --release --bin engineering-challenge production_owner_capacity -- --ignored --nocapture
+OWNER_BOOKS=1000 OWNER_REPLICAS=2 OWNER_RATE=10000 OWNER_SECONDS=3 OWNER_CHECK_HEALTH=1 cargo test --locked --release --lib production_owner_capacity -- --ignored --nocapture
 ```
 
 `cargo test --locked --test dual_feed` exercises real localhost WebSocket workers,
@@ -177,6 +177,17 @@ cargo test --locked --test discovery_http live_discovery_coverage -- --ignored -
 The original schema, generated codecs and reader remain unchanged. The supplied
 writer now separates physical flushing from chunk completion. See [the C5 plan](5.md),
 [protocol contracts](docs/protocol.md) and [remaining checks](docs/revision-check.md).
+
+### Where the code lives
+
+| Component | Files |
+|---|---|
+| Entry point | `src/main.rs` (runtime + exit status only); `src/collector/` wires C1–C5 and owns ordered shutdown: `options.rs` (CLI), `owner.rs` (the market-data owner thread) |
+| C1 discovery | `src/discovery/` |
+| C2 ingestion | `src/websocket/` (`manager.rs` assignments, `worker.rs` one socket per task, `ingress.rs` bounded handoff) |
+| C3 decoding | `src/market_data/` (`decimal.rs` exact scaling, `polymarket.rs` bounded parsing; `ResourceLimit` marks budget rejections) |
+| C4 books | `src/orderbook/` — `book.rs` levels; `store/` the single-owner `Processor`: `apply.rs` events, `subscription.rs`, `desired.rs` reconciliation, `invalidation.rs`, `selection.rs`, `schedule.rs` timers, `slots.rs` replicas; `health.rs` policy |
+| C5 recording | `src/recording/` |
 
 This repo uses the [FIX SBE standard](https://fixtrading.org/packages/simple-binary-encoding-technical-specification-v2-rc2/)
 for its binary output. The supplied Rust helpers abstract encoding and decoding.

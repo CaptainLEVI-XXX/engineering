@@ -512,3 +512,51 @@ fn profile_decoder_stages_against_retained_oracle() {
         });
     }
 }
+
+#[test]
+fn budget_rejections_are_typed_and_keep_their_positioned_reason() {
+    use engineering_challenge::market_data::{Decoder, ResourceLimit, SessionDecoder, VisitError};
+    let limits = Limits {
+        entries: 1,
+        events: 1,
+        message_bytes: 512,
+        ..Limits::default()
+    };
+    // Entry budget on a book: a scoped, typed resource rejection.
+    let text = r#"{"event_type":"book","asset_id":"A","timestamp":"1","bids":[{"price":"0.1","size":"1"},{"price":"0.2","size":"2"}],"asks":[]}"#;
+    let error = decode(envelope(text, &limits).unwrap()[0], &limits).unwrap_err();
+    assert!(error.resource);
+    assert_eq!(error.assets.as_deref(), Some(&["A".to_string()][..]));
+    assert!(
+        error
+            .reason
+            .starts_with("resource limit: array entries at line 1"),
+        "{}",
+        error.reason
+    );
+    // Same shape but invalid grammar: not a budget rejection.
+    let text = r#"{"event_type":"book","asset_id":"A","timestamp":"1","bids":[{"price":"x","size":"1"}],"asks":[]}"#;
+    assert!(
+        !decode(envelope(text, &limits).unwrap()[0], &limits)
+            .unwrap_err()
+            .resource
+    );
+    // Envelope budgets (events, bytes) are typed on the envelope error.
+    for text in [
+        "[{}, {}]".to_string(),
+        format!(r#"{{"event_type":"{}"}}"#, "x".repeat(600)),
+    ] {
+        let result = Decoder::Polymarket.visit(&text, &limits, &mut |_| Ok(()));
+        let Err(VisitError::Envelope(error)) = result else {
+            panic!("expected envelope rejection for {text:.40}");
+        };
+        assert!(error.is::<ResourceLimit>(), "{error}");
+    }
+    // A malformed envelope is not mistaken for a budget rejection.
+    let Err(VisitError::Envelope(error)) =
+        Decoder::Polymarket.visit("[{", &limits, &mut |_| Ok(()))
+    else {
+        panic!("expected envelope rejection");
+    };
+    assert!(!error.is::<ResourceLimit>());
+}

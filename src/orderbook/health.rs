@@ -355,6 +355,7 @@ impl Health {
         };
         if let Some(reason) = reason {
             let first = *self.relative_since.get_or_insert(now);
+            // `check_now` orders evaluations, so `first` is never after `now`.
             if now - first >= CONFIRMATION_INTERVAL {
                 Assessment::Suspect(reason)
             } else {

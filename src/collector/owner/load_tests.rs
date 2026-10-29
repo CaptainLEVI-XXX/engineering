@@ -1,7 +1,8 @@
 //! Opt-in capacity diagnostic through the actual production owner loop and C5.
 //! Synthetic independent arrivals; no REST, socket parsing or exchange coverage claim.
 use super::*;
-use engineering_challenge::{
+use crate::collector::DEFAULT_QUEUE_ITEMS;
+use crate::{
     Side,
     discovery::AdapterId,
     util::{AlignedSbeReader, OrderbookSchema, dtos::challenge_orderbook::*},

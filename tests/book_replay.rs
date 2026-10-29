@@ -186,7 +186,7 @@ fn malformed_event_invalidates_its_source_but_independent_event_can_commit() {
 }
 
 #[test]
-fn budget_preflight_rejects_intermediate_peak_and_sink_failure_is_terminal() {
+fn budget_preflight_quarantines_intermediate_peak_and_sink_failure_is_terminal() {
     let mut p = Processor::new(Config {
         levels_per_side: 1,
         ..Config::default()
@@ -200,18 +200,51 @@ fn budget_preflight_rejects_intermediate_peak_and_sink_failure_is_terminal() {
         data(s, 1, book("A", json!([{"price":"0.4","size":"10"}]))),
         &mut trace,
     );
-    let result=p.process(&data(s,2,json!({"event_type":"price_change","timestamp":"44","price_changes":[change("A","0.3","2"),change("A","0.4","0")]})),Duration::ZERO,&mut |o|sink(o,&mut trace));
-    assert!(result.is_err());
+    send(
+        &mut p,
+        data(s, 2, book("B", json!([{"price":"0.2","size":"5"}]))),
+        &mut trace,
+    );
+    trace.clear();
+    // The final state fits, but the intermediate peak does not: nothing from
+    // the event is applied or emitted, and only A degrades.
+    let result=p.process(&data(s,3,json!({"event_type":"price_change","timestamp":"44","price_changes":[change("A","0.3","2"),change("A","0.4","0")]})),Duration::ZERO,&mut |o|sink(o,&mut trace));
+    result.unwrap();
+    assert_eq!(trace, ["invalid:A"]);
+    let a = p.replica(AdapterId::PolymarketV1, "A", 0).unwrap();
+    assert_eq!(a.state, Validity::Stale);
+    assert!(a.book.is_empty(), "quarantined levels release budget");
+    assert_eq!(p.stats().resource_quarantines, 1);
+    assert!(
+        p.take_recovery().is_empty(),
+        "a resend would not fit either"
+    );
+    // The neighbor keeps recording, and A recovers on a snapshot that fits.
+    trace.clear();
+    send(
+        &mut p,
+        data(
+            s,
+            4,
+            json!({"event_type":"price_change","timestamp":"45","price_changes":[change("B","0.2","6")]}),
+        ),
+        &mut trace,
+    );
+    send(
+        &mut p,
+        data(s, 5, book("A", json!([{"price":"0.3","size":"2"}]))),
+        &mut trace,
+    );
     assert_eq!(
-        p.replica(AdapterId::PolymarketV1, "A", 0)
-            .unwrap()
-            .book
-            .levels(Side::Buy)
-            .next()
-            .unwrap()
-            .0
-            .value(),
-        400000
+        trace,
+        [
+            "level:B:Buy:200000:6000000",
+            "snapshot:A:[(300000, 2000000)]"
+        ]
+    );
+    assert_eq!(
+        p.replica(AdapterId::PolymarketV1, "A", 0).unwrap().state,
+        Validity::Live
     );
     let mut p = Processor::new(Config::default()).unwrap();
     subscribe(&mut p, s, 0, 1, &mut trace);
@@ -427,8 +460,13 @@ fn replacement_budget_includes_old_and_new_books() {
             .map(|(p, q)| (p.value(), q.value()))
             .collect();
         if limit == 2 {
-            assert!(result.is_err());
-            assert_eq!(levels, vec![(400000, 10000000)]);
+            result.unwrap();
+            assert_eq!(trace.last().unwrap(), "invalid:A");
+            assert_eq!(p.replica(s.adapter, "A", 0).unwrap().state, Validity::Stale);
+            assert!(
+                levels.is_empty(),
+                "superseded book is released, never kept live"
+            );
         } else {
             result.unwrap();
             assert_eq!(levels, vec![(300000, 7000000), (200000, 3000000)]);
@@ -511,19 +549,28 @@ fn occupancy_limits_match_ordered_array_oracle_for_repeated_multi_asset_changes(
                 Duration::ZERO,
                 &mut |o| sink(o, &mut trace),
             );
-            assert_eq!(
-                result.is_ok(),
-                accepted,
-                "case {case}, limits {side_limit}/{total_limit}"
-            );
+            result
+                .unwrap_or_else(|e| panic!("case {case}, limits {side_limit}/{total_limit}: {e}"));
             if accepted {
                 assert_eq!(
                     trace, outputs,
                     "every no-op and intermediate value must be emitted"
                 );
             } else {
+                // No partial output: every book the event names is quarantined
+                // and empty; any book it does not name is untouched.
                 expected = initial;
-                assert!(trace.is_empty(), "no partial output on a capacity failure");
+                let mut invalid = Vec::new();
+                for (asset, name) in ["A", "B"].iter().enumerate() {
+                    if inputs.iter().any(|i| i["asset_id"] == *name) {
+                        expected[asset] = [[0, 0], [0, 0]];
+                        invalid.push(format!("invalid:{name}"));
+                    }
+                }
+                assert_eq!(
+                    trace, invalid,
+                    "case {case}, limits {side_limit}/{total_limit}"
+                );
             }
             for (asset, name) in ["A", "B"].iter().enumerate() {
                 let replica = p.replica(s.adapter, name, 0).unwrap();
