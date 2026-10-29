@@ -387,7 +387,7 @@ async fn collector_records_or_validates_and_bounds_stalled_output_shutdown() {
             let file = directory.path().join("collector.yaml");
             std::fs::write(
                 &file,
-                "books:\n  levels_per_side: 1\n  total_levels: 12345\n",
+                "books:\n  levels_per_side: 1\n  total_levels: 12345\nrecording:\n  latency_histograms: true\n",
             )
             .unwrap();
             command.arg("--config").arg(&file);
@@ -475,6 +475,52 @@ async fn collector_records_or_validates_and_bounds_stalled_output_shutdown() {
                 .lines()
                 .map(|line| serde_json::from_str(line).unwrap())
                 .collect();
+            let latency: Vec<&Value> = rows
+                .iter()
+                .filter(|r| r["kind"] == "control" && r["event"]["kind"] == "latency")
+                .map(|r| &r["event"])
+                .collect();
+            if budget {
+                // Owner path: every data message has S1-S3; every record
+                // here derives from one (no minute elapsed), so S4/S7 count
+                // exactly the confirmed records. Final rows close each thread.
+                let sum = |thread: &str, stage: &str| {
+                    latency
+                        .iter()
+                        .filter(|r| r["thread"] == thread)
+                        .map(|r| r["stages"][stage]["count"].as_u64().unwrap())
+                        .sum::<u64>()
+                };
+                let messages = sum("owner", "s1_receive_to_enqueue");
+                assert!(messages > 0);
+                assert_eq!(sum("owner", "s2_queue_wait"), messages);
+                assert_eq!(sum("owner", "s3_dequeue_to_processed"), messages);
+                assert_eq!(sum("owner", "s4_receive_to_batch_published"), 6);
+                assert_eq!(sum("writer", "s7_receive_to_flushed"), 6);
+                // Each session start is timed in both processing and provenance.
+                let ops = |name: &str| {
+                    latency
+                        .iter()
+                        .filter(|r| r["thread"] == "owner")
+                        .map(|r| r["operations"][name]["count"].as_u64().unwrap())
+                        .sum::<u64>()
+                };
+                assert_eq!(ops("process.started"), 2);
+                assert_eq!(ops("record_control.started"), 2);
+                assert!(ops("maintain") > 0 && ops("capture_due") > 0);
+                for thread in ["owner", "writer"] {
+                    assert_eq!(
+                        latency
+                            .iter()
+                            .filter(|r| r["thread"] == thread && r["window"]["last"] == true)
+                            .count(),
+                        1,
+                        "{thread}"
+                    );
+                }
+            } else {
+                assert!(latency.is_empty(), "{mode}: diagnostics are opt-in");
+            }
             if budget {
                 for version in ["v1", "v2"] {
                     assert_eq!(

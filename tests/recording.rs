@@ -955,3 +955,175 @@ fn upstream_failure_is_incomplete_without_inventing_a_recorder_failure_position(
     assert_eq!(footer["producer"]["input_complete"], false);
     assert_eq!(footer["producer"]["failure_input"], serde_json::Value::Null);
 }
+
+/// Opt-in stage histograms: disabled writes no latency rows; enabled writes
+/// one final row per thread with sample counts tied to the records actually
+/// written. Either way the SBE bytes are identical.
+#[test]
+fn latency_histograms_are_sidecar_only_and_leave_sbe_bytes_unchanged() {
+    use engineering_challenge::recording;
+    use serde_json::Value;
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/polymarket-v1-trace.json")).unwrap();
+    let session = Session {
+        adapter: AdapterId::PolymarketV1,
+        worker: 0,
+        generation: 1,
+        slot: 0,
+    };
+    let run = |enabled: bool| {
+        let config = Config::default();
+        let (mut recorder, output) = recording::channel(
+            recording::Config {
+                latency_histograms: enabled,
+                ..Default::default()
+            },
+            &config,
+        )
+        .unwrap();
+        assert_eq!(recorder.latency_enabled(), enabled);
+        let mut processor = Processor::new(config).unwrap();
+        let assets: Vec<String> = serde_json::from_value(fixture["assets"].clone()).unwrap();
+        let mut messages = vec![
+            Message::Started(session),
+            Message::SubscriptionsRequested {
+                session,
+                revisions: vec![1; assets.len()],
+                add: assets,
+                remove: vec![],
+            },
+        ];
+        for row in fixture["messages"].as_array().unwrap() {
+            messages.push(Message::Data {
+                session,
+                ordinal: row["ordinal"].as_u64().unwrap(),
+                received_at: row["received_at"].as_str().unwrap().parse().unwrap(),
+                received_mono: Instant::now(),
+                payload: row["text"].as_str().unwrap().to_owned().into(),
+            });
+        }
+        let data = messages.len() - 2;
+        messages.push(Message::Ended {
+            session,
+            reason: "fixture end".into(),
+        });
+        for message in &messages {
+            let queued = Instant::now();
+            let dequeued = Instant::now();
+            if let Message::Data { received_mono, .. } = message {
+                recorder.begin_message(Some(*received_mono));
+            }
+            processor
+                .process(message, Duration::ZERO, &mut |o| recorder.observe(o))
+                .unwrap();
+            if let Message::Data { received_mono, .. } = message {
+                recorder.end_message(*received_mono, queued, dequeued, Instant::now());
+            }
+        }
+        // Operation timing and capped S3 attribution (no-ops when disabled):
+        // below threshold writes nothing; 1,001 slow ones keep exactly 1,000.
+        recorder.latency_op(
+            engineering_challenge::recording::latency::DEPTH,
+            Duration::from_millis(3),
+            0,
+        );
+        recorder
+            .s3_outlier(0, Duration::from_millis(4), || serde_json::json!({}))
+            .unwrap();
+        for i in 0..1001 {
+            recorder
+                .s3_outlier(0, Duration::from_millis(6), || serde_json::json!({"i": i}))
+                .unwrap();
+        }
+        recorder.finish(processor.finish()).unwrap();
+        let archive = tempfile::NamedTempFile::new().unwrap();
+        let sidecar = tempfile::NamedTempFile::new().unwrap();
+        let (approve, approval) = crossbeam::channel::bounded(1);
+        approve.send(true).unwrap();
+        let report = output.run(
+            archive.reopen().unwrap(),
+            sidecar.reopen().unwrap(),
+            "latency fixture",
+            || {},
+            approval,
+        );
+        assert!(report.error.is_none(), "{report:?}");
+        let rows: Vec<Value> = std::fs::read_to_string(sidecar.path())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.last().unwrap()["kind"], "run_end");
+        let outliers = rows
+            .iter()
+            .filter(|r| r["kind"] == "control" && r["event"]["kind"] == "s3_outlier")
+            .count();
+        let latency: Vec<Value> = rows
+            .into_iter()
+            .filter(|r| r["kind"] == "control" && r["event"]["kind"] == "latency")
+            .map(|r| r["event"].clone())
+            .collect();
+        (
+            std::fs::read(archive.path()).unwrap(),
+            latency,
+            data,
+            report.records_written,
+            outliers,
+        )
+    };
+    let (off, off_rows, _, _, off_outliers) = run(false);
+    let (on, on_rows, data, records, on_outliers) = run(true);
+    assert_eq!((off_outliers, on_outliers), (0, 1000));
+    assert!(records > 0 && !off.is_empty());
+    assert_eq!(off, on, "instrumentation changed SBE output");
+    assert!(off_rows.is_empty());
+    let [owner, writer] = &on_rows[..] else {
+        panic!("expected one final row per thread: {on_rows:?}")
+    };
+    assert_eq!(
+        (&owner["thread"], &writer["thread"]),
+        (&"owner".into(), &"writer".into())
+    );
+    let count = |row: &Value, stage: &str| {
+        let h = &row["stages"][stage];
+        // Well-formed: buckets sum to count; quantiles ordered and capped.
+        let buckets: u64 = h["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_u64().unwrap())
+            .sum();
+        assert_eq!(buckets, h["count"].as_u64().unwrap(), "{stage}: {h}");
+        let q: Vec<u64> = ["min", "p50", "p90", "p99", "p999", "max"]
+            .iter()
+            .map(|k| h[k].as_u64().unwrap_or_else(|| panic!("{stage} {k}: {h}")))
+            .collect();
+        assert!(q.windows(2).all(|w| w[0] <= w[1]), "{stage}: {h}");
+        h["count"].as_u64().unwrap()
+    };
+    for stage in [
+        "s1_receive_to_enqueue",
+        "s2_queue_wait",
+        "s3_dequeue_to_processed",
+    ] {
+        assert_eq!(count(owner, stage), data as u64, "{stage}");
+    }
+    // Every record here derives from a data message: no periodic captures.
+    assert_eq!(count(owner, "s4_receive_to_batch_published"), records);
+    assert_eq!(count(writer, "s7_receive_to_flushed"), records);
+    let batches = count(writer, "s5_batch_published_to_writer");
+    assert!(batches > 0);
+    assert_eq!(count(writer, "s6_writer_received_to_written"), batches);
+    assert_eq!(count(writer, "s6_writer_received_to_flushed"), batches);
+    assert_eq!(writer["unmeasured_records"], 0);
+    assert_eq!(owner["snapshot_slices"]["duration_ns"]["count"], 0);
+    assert!(owner["window"]["last"] == true && writer["window"]["last"] == true);
+    assert_eq!(owner["s3_outlier_rows_total"], 1000);
+    assert_eq!(owner["s3_outliers_dropped_total"], 1);
+    let depth = &owner["operations"]["depth_sample"];
+    assert_eq!(depth["count"], 1);
+    assert_eq!(depth["max"], 3_000_000);
+    assert!(depth["max_end_us"].is_i64());
+    assert_eq!(owner["operations"]["tick"]["count"], 0);
+    assert!(owner["operations"]["tick"]["max_end_us"].is_null());
+}

@@ -63,3 +63,4 @@ recording:
   buffer_bytes: 262144
   flush_age_ms: 5
   chunk_age_ms: 60000
+  latency_histograms: false

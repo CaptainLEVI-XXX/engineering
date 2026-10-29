@@ -85,7 +85,15 @@ fn production_owner_capacity_preserves_every_record() {
         snapshot_interval: Some(Duration::from_secs(60)),
         ..Default::default()
     };
-    let (recorder, output) = recording::channel(recording::Config::default(), &config).unwrap();
+    // Opt-in stage/operation histograms in the sidecar (H28 attribution).
+    let (recorder, output) = recording::channel(
+        recording::Config {
+            latency_histograms: number("OWNER_LATENCY", 0) != 0,
+            ..Default::default()
+        },
+        &config,
+    )
+    .unwrap();
     let (approval, approved) = crossbeam::channel::bounded(1);
     let file = std::fs::File::create(&archive).unwrap();
     let metadata = std::fs::File::create(&sidecar).unwrap();
@@ -394,6 +402,12 @@ fn production_owner_capacity_preserves_every_record() {
         max_offer_lag < Duration::from_secs(1),
         "producer could not sustain offered workload"
     );
+    if number("OWNER_LATENCY", 0) != 0 {
+        // Keep the diagnostic rows: the temporary directory is deleted on drop.
+        if let Ok(path) = std::env::var("OWNER_SIDECAR_COPY") {
+            std::fs::copy(&sidecar, path).unwrap();
+        }
+    }
     if number("OWNER_CHECK_HEALTH", 0) != 0 {
         let summary = std::fs::read_to_string(&sidecar)
             .unwrap()

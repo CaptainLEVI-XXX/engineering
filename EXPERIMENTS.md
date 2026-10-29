@@ -1826,3 +1826,106 @@ worker-to-reader case also passed. Logs: `.amp/in/artifacts/probe-scope-fix/`
 as incomplete; no replacement live attempt was run. This follow-up changes only
 the research probe/auditor, tests and documentation; it is not a collector
 latency optimization or production Kalshi implementation.
+
+## Stage latency histograms, Phase 1 (2026-10-29)
+
+Opt-in diagnostics answering "receive to stdout, where does the time go", not an
+optimization. Off by default (`recording.latency_histograms`, or
+`--latency-histograms BOOL`). Each stage has one owning thread, so no merging:
+
+| Stage | Thread | Sample | Boundary |
+|---|---|---|---|
+| S1 | owner | data message | `queued_at - received_mono` |
+| S2 | owner | data message | ingress enqueue to owner dequeue |
+| S3 | owner | data message | dequeue to `process` + control provenance returned |
+| S4 | owner | data-derived SBE record | receive to its batch's publication |
+| S5 | writer | batch | publication to writer receipt (`max_batch_age` used creation) |
+| S6 | writer | batch | writer receipt to all entries written / to next flush returned |
+| S7 | writer | data-derived SBE record | receive to the first flush returning after its write |
+| slices | owner | `capture_due` call with captures | duration, levels, snapshots |
+
+Histograms are log-linear (16 sub-buckets per power of two, at most 6.25%
+bucket width) in a fixed `[u64; 976]` allocated before intake. Each thread writes
+one `{"kind":"control","event":{"kind":"latency",...}}` sidecar row per 60s
+window plus a final `last:true` row, with dense bucket counts so windows can be
+merged exactly. Periodic snapshot records carry no receive instant and are absent
+from S4/S7. Owner rows are deferred, never fatal, when the output pool lacks space.
+The writer's pending-flush instants are preallocated; overflow is counted as
+`unmeasured_*`, not grown. Disabled cost: one branch per hook. `Entry` grew 16→32
+bytes, so the default pool reports 69,206,016 instead of 68,157,440 bytes.
+
+Tests: the bucket math is checked against an exact sorted-sample oracle (200
+heavy-tailed cases). Off and on produce byte-identical SBE, with zero latency
+rows when off, and the enabled rows are well-formed with counts tied to records.
+The executable `books-budget` test enables the rows through the config file and
+checks S1–S3 per message and S4/S7 equal to the 6 confirmed records. Other modes
+must emit no rows.
+
+Overhead: one release `recording_load` binary toggled by `C5_LATENCY`. The
+harness cannot toggle it because flipping the code default breaks the
+config-drift test, and the harness strips `C5_*`. Runs were 5k msg/s, 10s,
+ingress/file, three alternating pairs of A/A (off/off) and A/B (off/on) per
+workload, 50,000 samples per run, with no other process above 20% CPU. Median
+pairwise change in processing-including-recorder p99:
+
+| Workload | A/A pairs (%) | A/B pairs (%) | A/B median p99 / p50 / CPU |
+|---|---|---|---|
+| mixed | +13.6, −28.3, −9.8 | +5.8, −42.9, −0.9 | −0.9% / +3.8% / +3.8% |
+| snapshot-burst | +5.4, +25.0, +8.1 | −6.7, +7.8, −10.1 | −6.7% / −2.1% / −4.0% |
+
+The A/B effect is inside A/A noise. A possible ~0.2µs p50 cost for mixed cannot
+be separated from noise. Evidence: `.amp/in/artifacts/latency-p1/overhead-quiet/`.
+
+**Contaminated first attempt, retained:** `latency-p1/overhead/` ran while Amp's
+change capture hashed the untracked 5.8GB `runs/r1` sidecar (`git hash-object`
+at ~100% CPU plus disk writes). One burst-on run failed with
+`output pool exhausted`; another showed queue p99 16ms. On the quiet host, all 24
+campaign runs plus 5 extra burst-on repeats passed (queue p99 0.51–0.57ms). The
+contention is a likely cause, **not a proven one**. It does show that a writer
+stall exhausts the fixed pool, which is the existing terminal policy. Local
+`.git/info/exclude` now ignores `runs/` and `collector.yaml`.
+
+Phase 0 (HEAD `5269cf6`, smoke, 3 pairs, 1k/s, 5s, 5,000 samples per run; quiet
+reruns `harness/p0-aa-{mixed,burst}-quiet/`, contaminated first runs retained).
+Medians of run quantiles in µs (p50/p95/p99/p99.9/max; the harness reports p95,
+not p90):
+
+| Workload | processing incl. recorder | ingress age | encode callback |
+|---|---|---|---|
+| mixed | 13.0/30.0/37.9/63.5/109 | 52.9/116.9/158.1/340.7/589 | 0.1/1.0/1.9/4.3/36.5 |
+| snapshot-burst | 14.2/105.4/646.8/1012.5/1196 | 54.4/124.8/216.7/610.2/1820 | 0.1/3.8/9.3/21.6/68.1 |
+
+Both were `control_only`. A/A p99 pairs were +6.0/−36.4/−3.4% (mixed) and
+−7.8/+28.4/−10.1% (burst), which sets the noise floor of 5-second screens. No live
+run; Phase 2 awaits approval.
+
+### Phase 2 live run (2026-10-29)
+
+25-minute full-universe run on defaults plus `latency_histograms: true`. Exit 0
+and `success=true`, with 35,141,365 records and peak RSS 2,496,856 KiB. No pool
+exhaustion, so there is no H20 evidence. Steady state (11 windows): S7
+receive→flush p50/p99/max 6.0/11.0/58.8 ms. S2 owner queue wait p99/max
+2.4/130.5 ms. S5 publish→writer p99 0.26 ms. S6 received→flushed p99 5.8 ms.
+`nr_throttled_written` stayed 0 and `nr_dirty` peaked at 77k of about 778k
+pages. The ~100 ms tail is an owner-thread stall: S2/S4/S7 and `max_batch_age`
+114.8 ms coincide, while the writer, disk and writer CPU are clear. The stalling
+operation is not identified, because non-message owner work is unmeasured. The
+per-minute depth sample is a hypothesis for the 24–40 ms per-window floor. Owner
+CPU mean/max-10s was 20.6/33.2% of a core. Report and evidence:
+`.amp/in/artifacts/live-latency-p2/REPORT.md`. `runs/r2/` keeps run.sbe and the
+sidecar locally.
+
+### Phase 3 owner-operation attribution (2026-10-29)
+
+Added opt-in per-operation owner histograms (with max wall time) and capped
+`s3_outlier` rows (≤1,000 per run) behind `latency_histograms`. Offline H28 (550k
+books, 120 s) passed its oracle. The depth sample takes ~50 ms per minute, and a
+`DesiredChunk` took 115 ms. Live r3 (25 min) attributes the steady ~50 ms S2 floor
+to `DepthSummary::of`: it matches S2 max within ~1 ms in 6 of 11 steady windows.
+The ramp spikes up to 112 ms match slow `process.desired_chunk`, whose chunk
+times roughly double (5→117 ms), so container growth is hypothesised (H29). The
+last-window ~100 ms spike is only partly attributed, with ~37 ms residual. r3
+ended `success=false` (exit 1) because worker 77 failed a heartbeat write during
+shutdown. Recording was clean with 38,338,474 confirmed records. Network
+interruptions numbered 164 (r2: 4). Report:
+`.amp/in/artifacts/live-latency-p3/REPORT.md`. No fixes applied.

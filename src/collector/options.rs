@@ -3,7 +3,7 @@
 use super::config::CollectorConfig;
 use anyhow::{Context, Result, ensure};
 
-const USAGE: &str = "options require a value: --config FILE --seconds N --integrity-path FILE --transport-only BOOL; overrides: --gamma-url URL --ws-url URL --assets-per-socket N --max-sockets N --replicas-per-market N --lifecycle-hints BOOL --monitoring BOOL --queue-items N --queue-bytes N";
+const USAGE: &str = "options require a value: --config FILE --seconds N --integrity-path FILE --transport-only BOOL; overrides: --gamma-url URL --ws-url URL --assets-per-socket N --max-sockets N --replicas-per-market N --lifecycle-hints BOOL --monitoring BOOL --queue-items N --queue-bytes N --latency-histograms BOOL";
 
 #[derive(Debug)]
 pub struct Options {
@@ -36,7 +36,12 @@ impl Options {
             transport_only: false,
             integrity_path: None,
         };
-        let (run, transport, books) = (&mut config.run, &mut config.transport, &mut config.books);
+        let (run, transport, books, recording) = (
+            &mut config.run,
+            &mut config.transport,
+            &mut config.books,
+            &mut config.recording,
+        );
         for (arg, value) in pairs {
             match arg.as_str() {
                 "--config" => {}
@@ -52,6 +57,7 @@ impl Options {
                 "--replicas-per-market" => transport.replicas_per_market = value.parse()?,
                 "--lifecycle-hints" => transport.lifecycle_hints = value.parse()?,
                 "--monitoring" => books.monitoring = value.parse()?,
+                "--latency-histograms" => recording.latency_histograms = value.parse()?,
                 _ => anyhow::bail!("unknown option {arg}"),
             }
         }

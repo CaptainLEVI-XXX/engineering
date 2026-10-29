@@ -481,7 +481,16 @@ async fn mixed_recording_matches_every_oracle_record() {
         snapshot_interval: Some(Duration::from_secs(60)),
         ..Default::default()
     };
-    let (mut recorder, output) = recording::channel(recording::Config::default(), &config).unwrap();
+    // Opt-in stage histograms (sidecar only), for measuring their overhead.
+    let latency = std::env::var("C5_LATENCY").is_ok_and(|v| v == "1");
+    let (mut recorder, output) = recording::channel(
+        recording::Config {
+            latency_histograms: latency,
+            ..Default::default()
+        },
+        &config,
+    )
+    .unwrap();
     let (approval, approved) = crossbeam::channel::bounded(1);
     let mut pipe_consumer = None;
     let file: Box<dyn std::io::Write + Send> = if destination == "file" {
@@ -602,6 +611,11 @@ async fn mixed_recording_matches_every_oracle_record() {
                         };
                     }
                     let began = Instant::now();
+                    // Same hooks as the production owner, inside the timed span
+                    // so their cost is charged to processing.
+                    if let Message::Data { received_mono, .. } = &envelope.message {
+                        recorder.begin_message(Some(*received_mono));
+                    }
                     let mut owner_resumed = began;
                     let mut owner_ns = 0;
                     let mut recorder_ns = 0;
@@ -622,6 +636,14 @@ async fn mixed_recording_matches_every_oracle_record() {
                         Ok(())
                     })
                     .unwrap();
+                    if let Message::Data { received_mono, .. } = &envelope.message {
+                        recorder.end_message(
+                            *received_mono,
+                            envelope.queued_at,
+                            dequeued,
+                            Instant::now(),
+                        );
+                    }
                     let finished = Instant::now();
                     owner_ns += finished.duration_since(owner_resumed).as_nanos();
                     if measured {
@@ -636,6 +658,7 @@ async fn mixed_recording_matches_every_oracle_record() {
                 Err(crossbeam::channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
             }
+            let slice = Instant::now();
             p.capture_due(&mut || (start.elapsed(), Utc::now()), &mut |o| {
                 let began = Instant::now();
                 let ObservationKind::Snapshot {
@@ -659,6 +682,10 @@ async fn mixed_recording_matches_every_oracle_record() {
                 Ok(())
             })
             .unwrap();
+            recorder.end_slice(slice.elapsed());
+            recorder
+                .latency_due(p.input_cutoff(), Instant::now())
+                .unwrap();
             recorder.publish_due(Instant::now()).unwrap();
         }
         recorder.snapshot_stats(p.stats());

@@ -142,6 +142,8 @@ pub struct RecordingConfig {
     pub buffer_bytes: usize,
     pub flush_age_ms: u64,
     pub chunk_age_ms: u64,
+    /// Opt-in stage latency rows in the integrity sidecar (never stdout).
+    pub latency_histograms: bool,
 }
 impl Default for RecordingConfig {
     fn default() -> Self {
@@ -155,6 +157,7 @@ impl Default for RecordingConfig {
             buffer_bytes: c.buffer_bytes,
             flush_age_ms: ms(c.flush_age),
             chunk_age_ms: ms(c.chunk_age),
+            latency_histograms: c.latency_histograms,
         }
     }
 }
@@ -236,6 +239,7 @@ impl CollectorConfig {
             buffer_bytes: r.buffer_bytes,
             flush_age: d(r.flush_age_ms),
             chunk_age: d(r.chunk_age_ms),
+            latency_histograms: r.latency_histograms,
         }
     }
 

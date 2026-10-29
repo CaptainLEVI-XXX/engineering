@@ -4,6 +4,7 @@ use crate::{
     discovery::polymarket::Command,
     orderbook::{self, ObservationKind, Processor},
     recording,
+    recording::latency,
     websocket::{
         RecoveryRequest,
         ingress::{self, Message, Session},
@@ -171,6 +172,7 @@ pub(super) fn process_books(
     let mut sampled_at_stop = false;
     let mut invalidations = 0u64;
     let mut samples = Vec::new();
+    let latency = recorder.as_ref().is_some_and(|r| r.latency_enabled());
     let result: Result<()> = (|| {
         loop {
             if *stop.borrow() {
@@ -212,32 +214,102 @@ pub(super) fn process_books(
                     // books while every session is still live.
                     if !sampled_at_stop && *stop.borrow() {
                         sampled_at_stop = true;
+                        let began = latency.then(std::time::Instant::now);
                         depth = std::mem::take(&mut depth)
                             .deeper(DepthSummary::of(&processor, start.elapsed()));
+                        op(
+                            &mut recorder,
+                            began,
+                            latency::DEPTH,
+                            processor.input_cutoff(),
+                        );
+                    }
+                    // Dequeue is stamped after the depth sample so S2/S3 do
+                    // not absorb it; it has its own operation histogram.
+                    let dequeued = latency.then(std::time::Instant::now);
+                    let before = latency.then(|| {
+                        let s = processor.stats();
+                        (s.events, s.snapshots, s.changes)
+                    });
+                    if let Some(recorder) = &mut recorder {
+                        recorder.begin_message(match &envelope.message {
+                            Message::Data { received_mono, .. } => Some(*received_mono),
+                            _ => None,
+                        });
                     }
                     processor
                         .process(&envelope.message, start.elapsed(), &mut |o| {
                             sink(o, &mut recorder)
                         })
                         .context("C3/C4 processing failed; accepted tail incomplete")?;
-                    Some(envelope)
+                    if let Some(kind) = control_kind(&envelope.message) {
+                        op(
+                            &mut recorder,
+                            dequeued,
+                            latency::process_op(kind),
+                            processor.input_cutoff(),
+                        );
+                    }
+                    Some((envelope, dequeued, before))
                 }
                 Err(crossbeam::channel::RecvTimeoutError::Timeout) => None,
                 Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
             };
-            if let Some(envelope) = envelope
+            if let Some((envelope, dequeued, before)) = envelope
                 && let Some(recorder) = &mut recorder
             {
-                record_control(recorder, processor.input_cutoff(), &envelope.message)?;
+                let input = processor.input_cutoff();
+                let kind = control_kind(&envelope.message);
+                let began = (latency && kind.is_some()).then(std::time::Instant::now);
+                record_control(recorder, input, &envelope.message)?;
+                if let (Some(began), Some(kind)) = (began, kind) {
+                    recorder.latency_op(latency::record_op(kind), began.elapsed(), input);
+                }
+                if let (Some(dequeued), Some((events, snapshots, changes))) = (dequeued, before) {
+                    let processed = std::time::Instant::now();
+                    if let Message::Data { received_mono, .. } = &envelope.message {
+                        recorder.end_message(
+                            *received_mono,
+                            envelope.queued_at,
+                            dequeued,
+                            processed,
+                        );
+                    }
+                    let stats = processor.stats();
+                    let levels = recorder.message_levels();
+                    recorder.s3_outlier(input, processed - dequeued, || {
+                        outlier_row(
+                            &envelope.message,
+                            stats.events - events,
+                            stats.snapshots - snapshots,
+                            stats.changes - changes,
+                            levels,
+                        )
+                    })?;
+                }
             }
             if !*stop.borrow() {
                 let now = start.elapsed();
                 if now >= next_depth {
+                    let began = latency.then(std::time::Instant::now);
                     depth = std::mem::take(&mut depth).deeper(DepthSummary::of(&processor, now));
+                    op(
+                        &mut recorder,
+                        began,
+                        latency::DEPTH,
+                        processor.input_cutoff(),
+                    );
                     next_depth = now + DEPTH_SAMPLE_INTERVAL;
                 }
                 if now >= next_tick {
+                    let began = latency.then(std::time::Instant::now);
                     processor.tick(now)?;
+                    op(
+                        &mut recorder,
+                        began,
+                        latency::TICK,
+                        processor.input_cutoff(),
+                    );
                     // A tick is a bounded slice, not necessarily all due work.
                     // Leave ingress a turn before another slice; idle books do
                     // not require polling at this catch-up cadence.
@@ -249,15 +321,29 @@ pub(super) fn process_books(
                     };
                     next_tick = after + Duration::from_millis(delay_ms);
                 }
+                let began = latency.then(std::time::Instant::now);
                 processor.maintain(
                     start.elapsed(),
                     chrono::Utc::now(),
                     receiver.is_empty(),
                     &mut |o| sink(o, &mut recorder),
                 )?;
+                op(
+                    &mut recorder,
+                    began,
+                    latency::MAINTAIN,
+                    processor.input_cutoff(),
+                );
+                let slice = latency.then(std::time::Instant::now);
                 processor.capture_due(&mut || (start.elapsed(), chrono::Utc::now()), &mut |o| {
                     sink(o, &mut recorder)
                 })?;
+                if let (Some(slice), Some(recorder)) = (slice, &mut recorder) {
+                    let elapsed = slice.elapsed();
+                    recorder.end_slice(elapsed);
+                    recorder.latency_op(latency::CAPTURE, elapsed, processor.input_cutoff());
+                }
+                let began = latency.then(std::time::Instant::now);
                 while let Some((session, planned)) = processor.pending_recovery() {
                     match recovery.try_send(RecoveryRequest::Restart { session, planned }) {
                         Ok(()) => processor.recovery_delivered(session),
@@ -265,6 +351,13 @@ pub(super) fn process_books(
                         Err(error) => return Err(error).context("book recovery channel closed"),
                     }
                 }
+                op(
+                    &mut recorder,
+                    began,
+                    latency::RECOVERY,
+                    processor.input_cutoff(),
+                );
+                let began = latency.then(std::time::Instant::now);
                 let ready: Vec<_> = processor.initialized_sessions().collect();
                 for session in ready {
                     match recovery.try_send(RecoveryRequest::Initialized(session)) {
@@ -273,6 +366,13 @@ pub(super) fn process_books(
                         Err(error) => return Err(error).context("book readiness channel closed"),
                     }
                 }
+                op(
+                    &mut recorder,
+                    began,
+                    latency::READINESS,
+                    processor.input_cutoff(),
+                );
+                let began = latency.then(std::time::Instant::now);
                 if let Some(commands) = &discovery {
                     for _ in 0..64 {
                         let Some(key) = processor.pending_hint().cloned() else {
@@ -297,9 +397,17 @@ pub(super) fn process_books(
                         }
                     }
                 }
+                op(
+                    &mut recorder,
+                    began,
+                    latency::HINTS,
+                    processor.input_cutoff(),
+                );
             }
             if let Some(recorder) = &mut recorder {
-                recorder.publish_due(std::time::Instant::now())?;
+                let now = std::time::Instant::now();
+                recorder.latency_due(processor.input_cutoff(), now)?;
+                recorder.publish_due(now)?;
             }
         }
         processor.finish()
@@ -328,6 +436,77 @@ pub(super) fn process_books(
         messages: processor.stats().messages,
         diagnostics,
     })
+}
+
+/// Times one owner operation when diagnostics are enabled (`began` is Some).
+fn op(
+    recorder: &mut Option<recording::Recorder>,
+    began: Option<std::time::Instant>,
+    op: usize,
+    input: u64,
+) {
+    if let (Some(began), Some(recorder)) = (began, recorder) {
+        recorder.latency_op(op, began.elapsed(), input);
+    }
+}
+
+/// Index into `latency::KINDS`; data messages are timed by S3 instead.
+fn control_kind(message: &Message) -> Option<usize> {
+    Some(match message {
+        Message::Data { .. } => return None,
+        Message::Started(_) => 0,
+        Message::ReconcileBegin { .. } => 1,
+        Message::DesiredChunk { .. } => 2,
+        Message::ReconcileComplete { .. } => 3,
+        Message::SubscriptionsRequested { .. } => 4,
+        Message::RequestsComplete { .. } => 5,
+        Message::Ended { .. } => 6,
+    })
+}
+
+/// Attribution for one slow message. Counts are processor stat deltas
+/// across this message; `snapshot_levels` sums the committed levels of the
+/// exchange/selection snapshots it emitted.
+fn outlier_row(
+    message: &Message,
+    events: u64,
+    snapshots: u64,
+    changes: u64,
+    snapshot_levels: u64,
+) -> serde_json::Value {
+    use serde_json::json;
+    let (kind, session, ordinal, bytes, ids) = match message {
+        Message::Data {
+            session,
+            ordinal,
+            payload,
+            ..
+        } => ("data", Some(session), Some(*ordinal), payload.len(), 0),
+        Message::Started(s) => ("started", Some(s), None, 0, 0),
+        Message::ReconcileBegin { .. } => ("reconcile_begin", None, None, 0, 0),
+        Message::DesiredChunk { add, remove, .. } => {
+            ("desired_chunk", None, None, 0, add.len() + remove.len())
+        }
+        Message::ReconcileComplete { .. } => ("reconcile_complete", None, None, 0, 0),
+        Message::SubscriptionsRequested {
+            session,
+            add,
+            remove,
+            ..
+        } => (
+            "subscriptions_requested",
+            Some(session),
+            None,
+            0,
+            add.len() + remove.len(),
+        ),
+        Message::RequestsComplete { session } => ("requests_complete", Some(session), None, 0, 0),
+        Message::Ended { session, .. } => ("ended", Some(session), None, 0, 0),
+    };
+    json!({"message_kind": kind, "worker": session.map(|s| s.worker),
+        "generation": session.map(|s| s.generation), "ordinal": ordinal,
+        "payload_bytes": bytes, "identities": ids, "events": events,
+        "snapshots": snapshots, "level_changes": changes, "snapshot_levels": snapshot_levels})
 }
 
 fn record_control(recorder: &mut recording::Recorder, input: u64, message: &Message) -> Result<()> {

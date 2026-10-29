@@ -12,6 +12,9 @@ pub(super) enum Kind {
 pub(super) struct Entry {
     pub end: usize,
     pub kind: Kind,
+    /// Receive instant of the data message behind this SBE record; only set
+    /// when latency histograms are enabled.
+    pub received: Option<Instant>,
 }
 pub(super) struct Batch {
     pub bytes: Vec<u8>,
@@ -19,6 +22,8 @@ pub(super) struct Batch {
     pub first_record: u64,
     pub created_at: Instant,
     pub publish_at: Instant,
+    /// Set at publication only when latency histograms are enabled.
+    pub published_at: Instant,
 }
 #[derive(serde::Serialize)]
 pub(super) struct Outcome {
@@ -116,6 +121,10 @@ impl Output {
         let mut scratch = [0; INTEGRITY_BYTES];
         let mut sidecar_ok = true;
         let mut outcome = None;
+        let mut stages = self
+            .config
+            .latency_histograms
+            .then(|| latency::WriterStages::new(self.config.batches * self.config.entries, 4096));
         let result: Result<()> = (|| {
             let start = json!({"kind":"run_start", "format_version":1, "label":label, "pid":std::process::id(), "start_us":chrono::Utc::now().timestamp_micros(), "schema_id":SCHEMA_ID, "schema_version":SCHEMA_VERSION, "chunk_bytes":CHUNK_BYTES, "symbol":"polymarket:v{1|2}:<exact-id>", "config":self.config, "pool_bytes":self.pool_bytes, "timestamp_semantics":"UTC microseconds; generated snapshots use capture time; file order authoritative", "cadence":"60s after authoritative snapshot; actual lateness reported", "durability":"flush is not fsync or consumer acknowledgement"});
             let n = json_line(&mut scratch, &start)?;
@@ -135,15 +144,30 @@ impl Output {
                     writer.finish_chunk()?;
                     report.records_confirmed = report.records_written;
                     chunk_started = None;
+                    if let Some(stages) = &mut stages {
+                        stages.flushed();
+                    }
                 }
                 if now.duration_since(last_flush) >= self.config.flush_age {
                     writer.flush_bytes()?;
                     report.records_confirmed = report.records_written;
+                    if let Some(stages) = &mut stages {
+                        stages.flushed();
+                    }
                     if let Err(e) = sidecar.flush() {
                         sidecar_ok = false;
                         return Err(e.into());
                     }
                     last_flush = Instant::now();
+                }
+                if let Some(stages) = &mut stages
+                    && stages.window.due(now)
+                {
+                    let row = stages.take_row(false);
+                    if let Err(e) = latency_row(&mut sidecar, report.records_written, &row) {
+                        sidecar_ok = false;
+                        return Err(e);
+                    }
                 }
                 let deadline = chunk_started
                     .map(|t| t + self.config.chunk_age)
@@ -157,10 +181,16 @@ impl Output {
                     Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
                     Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
                 };
+                let received = Instant::now();
                 ensure!(
                     batch.first_record == report.records_written,
                     "output ordinal discontinuity"
                 );
+                if let Some(stages) = &mut stages {
+                    stages
+                        .publish_to_receive
+                        .duration(received.saturating_duration_since(batch.published_at));
+                }
                 report.batches += 1;
                 report.max_batch_bytes = report.max_batch_bytes.max(batch.bytes.len());
                 report.max_batch_age_us = report
@@ -174,6 +204,9 @@ impl Output {
                                 && entry.end - begin > CHUNK_BYTES - 8 - writer.offset();
                             writer.write_encoded(&batch.bytes[begin..entry.end])?;
                             report.records_written += 1;
+                            if let (Some(stages), Some(at)) = (&mut stages, entry.received) {
+                                stages.written(at);
+                            }
                             if rotate || chunk_started.is_none() {
                                 chunk_started = Some(Instant::now());
                             }
@@ -192,16 +225,25 @@ impl Output {
                         writer.finish_chunk()?;
                         report.records_confirmed = report.records_written;
                         chunk_started = None;
+                        if let Some(stages) = &mut stages {
+                            stages.flushed();
+                        }
                     }
                     if now.duration_since(last_flush) >= self.config.flush_age {
                         writer.flush_bytes()?;
                         report.records_confirmed = report.records_written;
+                        if let Some(stages) = &mut stages {
+                            stages.flushed();
+                        }
                         if let Err(e) = sidecar.flush() {
                             sidecar_ok = false;
                             return Err(e.into());
                         }
                         last_flush = Instant::now();
                     }
+                }
+                if let Some(stages) = &mut stages {
+                    stages.batch_written(received);
                 }
                 batch.bytes.clear();
                 batch.entries.clear();
@@ -211,6 +253,9 @@ impl Output {
             outcome = Some(self.producer.recv().context("missing producer outcome")?);
             writer.finish()?;
             report.records_confirmed = report.records_written;
+            if let Some(stages) = &mut stages {
+                stages.flushed();
+            }
             ensure!(
                 approval.recv().unwrap_or(false),
                 "upstream intake/drain incomplete"
@@ -233,6 +278,15 @@ impl Output {
         drop(self._alive);
         // A stdout error does not prevent a best-effort failure footer on a
         // healthy sidecar. A sidecar error is never retried.
+        if sidecar_ok && let Some(stages) = &mut stages {
+            let row = stages.take_row(true);
+            if let Err(e) = latency_row(&mut sidecar, report.records_written, &row) {
+                sidecar_ok = false;
+                report
+                    .error
+                    .get_or_insert_with(|| format!("latency row failed: {e}"));
+            }
+        }
         if sidecar_ok {
             let footer = json!({"kind":"run_end", "success":report.error.is_none(), "output":report, "producer":outcome});
             let result = json_line(&mut scratch, &footer).and_then(|n| {
@@ -248,4 +302,15 @@ impl Output {
         }
         report
     }
+}
+
+/// Writer-owned diagnostic row, written between batches so it never splits
+/// another sidecar line. `next_ordinal` is the writer's record position.
+fn latency_row(sidecar: &mut impl Write, next_ordinal: u64, row: &serde_json::Value) -> Result<()> {
+    serde_json::to_writer(
+        &mut *sidecar,
+        &json!({"kind":"control","input":null,"next_ordinal":next_ordinal,"event":row}),
+    )?;
+    sidecar.write_all(b"\n")?;
+    Ok(())
 }

@@ -1,5 +1,6 @@
 //! Selected book recording. Book/source ownership stays in `orderbook`.
 pub mod encode;
+pub mod latency;
 mod output;
 use crate::{
     orderbook::{self, Binding, Observation, ObservationKind, SnapshotOrigin},
@@ -17,6 +18,9 @@ use std::{
 
 pub const CHUNK_BYTES: usize = 64 << 20;
 const INTEGRITY_BYTES: usize = 8192;
+/// Reserved per owner latency row: 28 histograms of at most 976 counts of at
+/// most 20 digits each (<21 KB each) plus fixed fields.
+const LATENCY_ROW_BYTES: usize = 1 << 20;
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Config {
@@ -28,6 +32,8 @@ pub struct Config {
     pub buffer_bytes: usize,
     pub flush_age: Duration,
     pub chunk_age: Duration,
+    /// Opt-in per-stage latency rows in the integrity sidecar. Never stdout.
+    pub latency_histograms: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -40,6 +46,7 @@ impl Default for Config {
             buffer_bytes: 256 << 10,
             flush_age: Duration::from_millis(5),
             chunk_age: Duration::from_secs(60),
+            latency_histograms: false,
         }
     }
 }
@@ -79,6 +86,10 @@ pub fn channel(config: Config, books: &orderbook::Config) -> Result<(Recorder, O
             && !config.chunk_age.is_zero(),
         "invalid recording budgets"
     );
+    ensure!(
+        !config.latency_histograms || LATENCY_ROW_BYTES <= config.batch_bytes,
+        "latency rows do not fit batch"
+    );
     let (ready_send, ready) = bounded(config.batches);
     let (recycle, free) = bounded(config.batches);
     let mut pool_bytes = 0;
@@ -89,6 +100,7 @@ pub fn channel(config: Config, books: &orderbook::Config) -> Result<(Recorder, O
             first_record: 0,
             created_at: Instant::now(),
             publish_at: Instant::now(),
+            published_at: Instant::now(),
         };
         pool_bytes +=
             batch.bytes.capacity() + batch.entries.capacity() * std::mem::size_of::<Entry>();
@@ -113,6 +125,9 @@ pub fn channel(config: Config, books: &orderbook::Config) -> Result<(Recorder, O
             late_snapshots: 0,
             max_snapshot_lateness_us: 0,
             snapshots_due_at_cutoff: 0,
+            latency: config
+                .latency_histograms
+                .then(|| Box::new(latency::OwnerStages::new())),
         },
         Output {
             config,
@@ -141,6 +156,7 @@ pub struct Recorder {
     late_snapshots: u64,
     max_snapshot_lateness_us: u128,
     snapshots_due_at_cutoff: usize,
+    latency: Option<Box<latency::OwnerStages>>,
 }
 impl Recorder {
     pub fn check_output(&self) -> Result<()> {
@@ -179,10 +195,19 @@ impl Recorder {
         Ok(())
     }
     fn publish(&mut self) -> Result<()> {
-        if let Some(batch) = self.current.take() {
+        if let Some(mut batch) = self.current.take() {
             if batch.entries.is_empty() {
                 self.current = Some(batch);
                 return Ok(());
+            }
+            if let Some(stages) = &mut self.latency {
+                let now = Instant::now();
+                batch.published_at = now;
+                for received in batch.entries.iter().filter_map(|e| e.received) {
+                    stages
+                        .receive_to_publish
+                        .duration(now.saturating_duration_since(received));
+                }
             }
             self.ready
                 .try_send(batch)
@@ -250,6 +275,14 @@ impl Recorder {
                 "source_ordinal":o.metadata.map(|m| m.cursor.ordinal),"source_event":o.metadata.map(|m| m.cursor.event)})),
             ),
             ObservationKind::Snapshot { book, origin } => {
+                if let Some(stages) = &mut self.latency {
+                    if let SnapshotOrigin::Periodic { .. } = origin {
+                        stages.slice_open.0 += 1;
+                        stages.slice_open.1 += book.len() as u64;
+                    } else {
+                        stages.message_levels += book.len() as u64;
+                    }
+                }
                 let m = o.metadata.context("snapshot has no source metadata")?;
                 let (name, at, due) = match origin {
                     SnapshotOrigin::Exchange => ("exchange", m.received_at, None),
@@ -378,12 +411,14 @@ impl Recorder {
             batch.entries.push(Entry {
                 end: begin + size,
                 kind: Kind::Sbe,
+                received: self.latency.as_ref().and_then(|l| l.received),
             });
         }
         if n > 0 {
             batch.entries.push(Entry {
                 end: begin + size + n,
                 kind: Kind::Integrity,
+                received: None,
             });
         }
         self.ordinal = next;
@@ -405,12 +440,15 @@ impl Recorder {
     /// Ordered, bounded control provenance. It never writes binary stdout or
     /// advances the financial record ordinal.
     pub fn control(&mut self, input: u64, value: &Value) -> Result<()> {
+        self.control_sized(input, value, INTEGRITY_BYTES)
+    }
+    fn control_sized(&mut self, input: u64, value: &Value, bytes: usize) -> Result<()> {
         self.input = input;
         let result = (|| {
-            self.reserve(INTEGRITY_BYTES, 1)?;
+            self.reserve(bytes, 1)?;
             let batch = self.current.as_mut().unwrap();
             let start = batch.bytes.len();
-            batch.bytes.resize(start + INTEGRITY_BYTES, 0);
+            batch.bytes.resize(start + bytes, 0);
             let encoded = json_line(
                 &mut batch.bytes[start..],
                 &json!({
@@ -423,6 +461,7 @@ impl Recorder {
                     batch.entries.push(Entry {
                         end: start + len,
                         kind: Kind::Integrity,
+                        received: None,
                     });
                 }
                 Err(error) => {
@@ -443,9 +482,113 @@ impl Recorder {
         }
         result
     }
+    pub fn latency_enabled(&self) -> bool {
+        self.latency.is_some()
+    }
+    /// Attribute the SBE records produced next to this data message's receive.
+    pub fn begin_message(&mut self, received: Option<Instant>) {
+        if let Some(stages) = &mut self.latency {
+            stages.received = received;
+            stages.message_levels = 0;
+        }
+    }
+    /// Committed levels in the snapshots observed for the current message.
+    pub fn message_levels(&self) -> u64 {
+        self.latency.as_ref().map_or(0, |l| l.message_levels)
+    }
+    /// S1 receive->enqueue, S2 enqueue->dequeue, S3 dequeue->processed.
+    pub fn end_message(
+        &mut self,
+        received: Instant,
+        queued: Instant,
+        dequeued: Instant,
+        processed: Instant,
+    ) {
+        if let Some(stages) = &mut self.latency {
+            stages.received = None;
+            stages
+                .receive_to_enqueue
+                .duration(queued.saturating_duration_since(received));
+            stages
+                .queue_wait
+                .duration(dequeued.saturating_duration_since(queued));
+            stages
+                .processing
+                .duration(processed.saturating_duration_since(dequeued));
+        }
+    }
+    /// Close one `capture_due` call; records it only if it captured anything.
+    pub fn end_slice(&mut self, elapsed: Duration) {
+        if let Some(stages) = &mut self.latency
+            && stages.slice_open.0 > 0
+        {
+            let (snapshots, levels) = std::mem::take(&mut stages.slice_open);
+            stages.slice_ns.duration(elapsed);
+            stages.slice_levels.record(levels);
+            stages.slice_snapshots.record(snapshots);
+        }
+    }
+    /// One owner operation outside data processing; no-op when disabled.
+    pub fn latency_op(&mut self, op: usize, elapsed: Duration, input: u64) {
+        if let Some(stages) = &mut self.latency {
+            stages.op(op, elapsed, input);
+        }
+    }
+    /// One attribution row for a message whose dequeue->processed time reached
+    /// `latency::OUTLIER`, at most `latency::OUTLIER_ROWS` per run. Skipped
+    /// (and counted) rather than consuming the last free output batch.
+    pub fn s3_outlier(
+        &mut self,
+        input: u64,
+        elapsed: Duration,
+        row: impl FnOnce() -> Value,
+    ) -> Result<()> {
+        if elapsed < latency::OUTLIER {
+            return Ok(());
+        }
+        let fits = self.latency_row_fits();
+        let Some(stages) = &mut self.latency else {
+            return Ok(());
+        };
+        if stages.outlier_rows >= latency::OUTLIER_ROWS || !fits {
+            stages.outliers_dropped += 1;
+            return Ok(());
+        }
+        stages.outlier_rows += 1;
+        let mut value = row();
+        value["kind"] = json!("s3_outlier");
+        value["ns"] = json!(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+        value["end_us"] = json!(chrono::Utc::now().timestamp_micros());
+        self.control(input, &value)
+    }
+    /// Emit the owner window row when due. Diagnostic only.
+    /// Deferred, never fatal for lack of space: a diagnostic row must not
+    /// exhaust the pool that market records need.
+    pub fn latency_due(&mut self, input: u64, now: Instant) -> Result<()> {
+        if self.latency.as_ref().is_some_and(|l| l.window.due(now)) && self.latency_row_fits() {
+            let row = self.latency.as_mut().unwrap().take_row(false);
+            self.control_sized(input, &row, LATENCY_ROW_BYTES)?;
+        }
+        Ok(())
+    }
+    fn latency_row_fits(&self) -> bool {
+        !self.free.is_empty()
+            || self.current.as_ref().is_some_and(|b| {
+                b.bytes.len() + LATENCY_ROW_BYTES <= self.config.batch_bytes
+                    && b.entries.len() < self.config.entries
+            })
+    }
     /// Success here is handoff only; `Output::run` establishes physical completion.
     pub fn finish(mut self, input_result: Result<()>) -> Result<()> {
-        let publication = self.publish();
+        // Publish first so the final batch's S4 samples enter the last row.
+        let publication = self.publish().and_then(|()| {
+            if self.latency.is_some() && self.failed.is_none() && self.latency_row_fits() {
+                let row = self.latency.as_mut().unwrap().take_row(true);
+                self.control_sized(self.input, &row, LATENCY_ROW_BYTES)?;
+                self.publish()?;
+            }
+            Ok(())
+        });
         if publication.is_err() {
             self.failed.get_or_insert(self.input);
         }
