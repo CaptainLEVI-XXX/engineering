@@ -758,3 +758,27 @@ fn hundred_churn_cycles_retain_identity_but_release_books_and_repair_work() {
     processor.finish().unwrap();
     assert_eq!(snapshots, 100);
 }
+
+#[test]
+fn identity_map_is_reserved_once_up_to_the_bound() {
+    let instruments = 5000;
+    let mut processor = Processor::new(Config {
+        instruments,
+        ..Default::default()
+    })
+    .unwrap();
+    processor.instrument_id(ADAPTER, "00000").unwrap();
+    let reserved = processor.by_adapter[&ADAPTER].capacity();
+    assert!(reserved >= instruments);
+    for i in 1..instruments {
+        processor
+            .instrument_id(ADAPTER, &format!("{i:05}"))
+            .unwrap();
+    }
+    let map = &processor.by_adapter[&ADAPTER];
+    // No resize (and so no rehash of every identity) happened on the way.
+    assert_eq!(map.capacity(), reserved);
+    // Exact identities, leading zeros preserved, and the bound still enforced.
+    assert_eq!(map["00042"], BookId(42));
+    assert!(processor.instrument_id(ADAPTER, "extra").is_err());
+}

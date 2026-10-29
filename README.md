@@ -42,7 +42,8 @@ replica, including the old+new peak while a snapshot replaces a book (roughly
 than truncated or crashing the process. Size it from a sampled run: the shutdown
 summary and the integrity file's `owner_summary` report `peak_levels`,
 `resource_quarantines` and a `depth` sample (live replicas, levels, p50/p95/p99/max
-per replica; the deepest of one sample per minute and one at stop). Set
+per replica, sampled once at stop: a per-minute walk of every replica stalled
+ingress by 50–92 ms at full-universe size). Set
 `total_levels` comfortably above the observed peak for the replicas you run, and
 budget disk for minute snapshots (about 36 + 16 × levels + ~90 symbol bytes per
 selected book per minute).

@@ -245,9 +245,9 @@ impl Recorder {
         let (size, metadata) = match &o.kind {
             ObservationKind::StandbyBaseline => (
                 0,
-                Some(json!({"kind":"standby_baseline",
+                Some(Row::Json(json!({"kind":"standby_baseline",
                 "input":o.input,"next_ordinal":self.ordinal,"symbol":symbol,"binding":binding(o.binding),
-                "source_ordinal":o.metadata.map(|m| m.cursor.ordinal),"source_event":o.metadata.map(|m| m.cursor.event)})),
+                "source_ordinal":o.metadata.map(|m| m.cursor.ordinal),"source_event":o.metadata.map(|m| m.cursor.event)}))),
             ),
             ObservationKind::Snapshot { book, origin } => {
                 let m = o.metadata.context("snapshot has no source metadata")?;
@@ -277,9 +277,20 @@ impl Recorder {
                 };
                 (
                     record.encoded_length_with_header()?,
-                    Some(
-                        json!({"kind":"snapshot", "ordinal":self.ordinal, "symbol":symbol, "binding":binding(o.binding), "origin":name, "selection":selection, "input":o.input, "source_ordinal":m.cursor.ordinal, "source_event":m.cursor.event, "source_entry":m.cursor.entry, "received_us":at.timestamp_micros(), "source_received_us":m.received_at.timestamp_micros(), "exchange_us":m.exchange_us, "due_us":due}),
-                    ),
+                    Some(Row::Snapshot(SnapshotFields {
+                        binding: o.binding,
+                        due_us: due,
+                        exchange_us: m.exchange_us,
+                        input: o.input,
+                        ordinal: self.ordinal,
+                        origin: name,
+                        received_us: at.timestamp_micros(),
+                        selection,
+                        source_entry: m.cursor.entry,
+                        source_event: m.cursor.event,
+                        source_ordinal: m.cursor.ordinal,
+                        source_received_us: m.received_at.timestamp_micros(),
+                    })),
                 )
             }
             ObservationKind::Level { .. } => (45 + symbol.len(), None),
@@ -289,9 +300,9 @@ impl Recorder {
                 output_binding,
             } => (
                 0,
-                Some(
+                Some(Row::Json(
                     json!({"kind":if output_binding.is_some() {"unavailable"} else {"replica_unavailable"}, "next_ordinal":self.ordinal, "symbol":symbol, "binding":binding(output_binding.unwrap_or(o.binding)), "input":o.input, "cause":cause, "reason":reason.chars().take(128).collect::<String>(), "detected_us":chrono::Utc::now().timestamp_micros()}),
-                ),
+                )),
             ),
         };
         let next = if size > 0 {
@@ -359,8 +370,12 @@ impl Recorder {
                 ObservationKind::Invalidated { .. } | ObservationKind::StandbyBaseline => 0,
             };
             ensure!(encoded == size, "record length mismatch");
-            let n = if let Some(value) = &metadata {
-                json_line(&mut batch.bytes[begin + size..], value)?
+            let n = if let Some(row) = &metadata {
+                let slot = &mut batch.bytes[begin + size..];
+                match row {
+                    Row::Json(value) => json_line(slot, value)?,
+                    Row::Snapshot(fields) => json_line(slot, &SnapshotRow { fields, symbol })?,
+                }
             } else {
                 0
             };
@@ -478,6 +493,77 @@ impl Recorder {
         Ok(())
     }
 }
+/// A sidecar row awaiting its slot. Snapshot rows are typed: they are one per
+/// snapshot record (every live book, every minute), and building them as a
+/// `Value` cost several times the SBE encoding itself.
+enum Row {
+    Json(Value),
+    Snapshot(SnapshotFields),
+}
+struct SnapshotFields {
+    binding: Binding,
+    due_us: Option<u128>,
+    exchange_us: Option<u64>,
+    input: u64,
+    ordinal: u64,
+    origin: &'static str,
+    received_us: i64,
+    selection: Option<Value>,
+    source_entry: Option<usize>,
+    source_event: usize,
+    source_ordinal: u64,
+    source_received_us: i64,
+}
+/// Serializes exactly as the former `json!` snapshot row: serde_json's map
+/// orders keys alphabetically, so fields are written in that order.
+struct SnapshotRow<'a> {
+    fields: &'a SnapshotFields,
+    symbol: &'a str,
+}
+impl serde::Serialize for SnapshotRow<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let f = self.fields;
+        let mut row = serializer.serialize_struct("SnapshotRow", 14)?;
+        row.serialize_field("binding", &BindingRow(f.binding))?;
+        row.serialize_field("due_us", &f.due_us)?;
+        row.serialize_field("exchange_us", &f.exchange_us)?;
+        row.serialize_field("input", &f.input)?;
+        row.serialize_field("kind", "snapshot")?;
+        row.serialize_field("ordinal", &f.ordinal)?;
+        row.serialize_field("origin", f.origin)?;
+        row.serialize_field("received_us", &f.received_us)?;
+        row.serialize_field("selection", &f.selection)?;
+        row.serialize_field("source_entry", &f.source_entry)?;
+        row.serialize_field("source_event", &f.source_event)?;
+        row.serialize_field("source_ordinal", &f.source_ordinal)?;
+        row.serialize_field("source_received_us", &f.source_received_us)?;
+        row.serialize_field("symbol", self.symbol)?;
+        row.end()
+    }
+}
+/// The `binding()` object, in the same key order, without allocating.
+struct BindingRow(Binding);
+impl serde::Serialize for BindingRow {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        struct Debug(crate::discovery::AdapterId);
+        impl serde::Serialize for Debug {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_str(&format_args!("{:?}", self.0))
+            }
+        }
+        let b = self.0;
+        let mut row = serializer.serialize_struct("Binding", 6)?;
+        row.serialize_field("adapter", &Debug(b.session.adapter))?;
+        row.serialize_field("book", &b.book.0)?;
+        row.serialize_field("generation", &b.session.generation)?;
+        row.serialize_field("revision", &b.revision)?;
+        row.serialize_field("slot", &b.session.slot)?;
+        row.serialize_field("worker", &b.session.worker)?;
+        row.end()
+    }
+}
 fn binding(b: Binding) -> Value {
     json!({"book":b.book.0, "slot":b.session.slot, "revision":b.revision, "worker":b.session.worker, "generation":b.session.generation, "adapter":format!("{:?}", b.session.adapter)})
 }
@@ -486,4 +572,132 @@ fn json_line(buffer: &mut [u8], value: &impl serde::Serialize) -> Result<usize> 
     serde_json::to_writer(&mut cursor, value)?;
     cursor.write_all(b"\n")?;
     Ok(cursor.position() as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{discovery::AdapterId, orderbook::BookId, websocket::ingress::Session};
+
+    /// The former row construction, kept verbatim as the byte oracle.
+    fn oracle(f: &SnapshotFields, symbol: &str) -> Value {
+        json!({"kind":"snapshot", "ordinal":f.ordinal, "symbol":symbol, "binding":binding(f.binding), "origin":f.origin, "selection":f.selection, "input":f.input, "source_ordinal":f.source_ordinal, "source_event":f.source_event, "source_entry":f.source_entry, "received_us":f.received_us, "source_received_us":f.source_received_us, "exchange_us":f.exchange_us, "due_us":f.due_us})
+    }
+
+    #[test]
+    fn typed_snapshot_row_is_byte_identical_to_the_json_row() {
+        let symbols = [
+            "polymarket:v1:71321045679252212594626385532706912750332728571942532289631379312455583992563",
+            "polymarket:v2:0",
+            "",
+            "quote\" back\\slash /",
+            "control \u{0} \u{1f} \n \t \r",
+            "unicode é ✓ 🚀 \u{2028}",
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (mut a, mut b) = (vec![0; INTEGRITY_BYTES], vec![0; INTEGRITY_BYTES]);
+        for case in 0..5000 {
+            let pick = |r: u64, edge: [u64; 4]| {
+                if r.is_multiple_of(3) {
+                    edge[(r as usize / 3) % 4]
+                } else {
+                    r
+                }
+            };
+            let r = next();
+            let fields = SnapshotFields {
+                binding: Binding {
+                    book: BookId(pick(next(), [0, 1, u32::MAX as u64, 7]) as u32),
+                    revision: pick(next(), [0, 1, u64::MAX, 42]),
+                    session: Session {
+                        worker: pick(next(), [0, 1, usize::MAX as u64, 3]) as usize,
+                        generation: pick(next(), [0, 1, u64::MAX, 9]),
+                        adapter: if r & 1 == 0 { AdapterId::PolymarketV1 } else { AdapterId::PolymarketV2 },
+                        slot: pick(next(), [0, 1, u16::MAX as u64, 2]) as u16,
+                    },
+                },
+                // The former `json!` row panicked above u64::MAX (serde_json Value has
+                // no u128); microseconds since start cannot get there. The oracle
+                // covers the whole range it supported.
+                due_us: (r & 2 != 0).then(|| u128::from(next() >> (r % 64))),
+                exchange_us: (r & 4 != 0).then(|| pick(next(), [0, 1, u64::MAX, 5])),
+                input: next(),
+                ordinal: pick(next(), [0, 1, u64::MAX, 11]),
+                origin: ["exchange", "selection", "periodic"][case % 3],
+                received_us: pick(next(), [0, i64::MAX as u64, i64::MIN as u64, u64::MAX]) as i64,
+                selection: (r & 8 != 0).then(|| {
+                    json!({"previous":(r & 16 != 0).then(|| binding(Binding {
+                        book: BookId(3), revision: 4,
+                        session: Session { worker: 5, generation: 6, adapter: AdapterId::PolymarketV1, slot: 1 },
+                    })), "reason":"failover \"quoted\"", "freshness":r % 7, "receive_age_us":(r & 32 != 0).then_some(u128::from(u64::MAX))})
+                }),
+                source_entry: (r & 64 != 0).then(|| pick(next(), [0, 1, usize::MAX as u64, 13]) as usize),
+                source_event: pick(next(), [0, 1, usize::MAX as u64, 17]) as usize,
+                source_ordinal: next(),
+                source_received_us: next() as i64,
+            };
+            let symbol = symbols[case % symbols.len()];
+            let n = json_line(
+                &mut a,
+                &SnapshotRow {
+                    fields: &fields,
+                    symbol,
+                },
+            )
+            .unwrap();
+            let m = json_line(&mut b, &oracle(&fields, symbol)).unwrap();
+            assert_eq!(
+                a[..n],
+                b[..m],
+                "case {case}: {}",
+                String::from_utf8_lossy(&b[..m])
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_typed_row_fails_like_the_json_row() {
+        let fields = SnapshotFields {
+            binding: Binding {
+                book: BookId(1),
+                revision: 1,
+                session: Session {
+                    worker: 0,
+                    generation: 0,
+                    adapter: AdapterId::PolymarketV1,
+                    slot: 0,
+                },
+            },
+            due_us: None,
+            exchange_us: Some(1),
+            input: 0,
+            ordinal: 0,
+            origin: "periodic",
+            received_us: 0,
+            selection: None,
+            source_entry: None,
+            source_event: 0,
+            source_ordinal: 0,
+            source_received_us: 0,
+        };
+        let symbol = "x".repeat(INTEGRITY_BYTES);
+        let mut slot = vec![0; INTEGRITY_BYTES];
+        assert!(
+            json_line(
+                &mut slot,
+                &SnapshotRow {
+                    fields: &fields,
+                    symbol: &symbol
+                }
+            )
+            .is_err()
+        );
+        assert!(json_line(&mut slot, &oracle(&fields, &symbol)).is_err());
+    }
 }

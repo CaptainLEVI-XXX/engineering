@@ -21,6 +21,14 @@ tempfile = "3"
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 
+# Release stays unchanged: enabling debug info measurably changed the generated
+# code (__text +0.25% on aarch64-apple-darwin), so profiling uses its own
+# profile and its results need confirming against plain release. Optionally
+# RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+
 [build-dependencies]
 ergo-sbe = "=0.1.16"
 indexmap = { version = "2", features = ["serde"] }

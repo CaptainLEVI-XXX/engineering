@@ -100,21 +100,40 @@ pub(super) struct DepthSummary {
 }
 impl DepthSummary {
     /// Nearest-rank percentiles over levels per live replica.
-    pub(super) fn from_levels(mut levels: Vec<usize>) -> Self {
-        levels.sort_unstable();
+    /// A count per depth replaces collecting and sorting every replica: depth is
+    /// bounded by two SBE u16 sides, so the table stays small.
+    pub(super) fn from_levels(levels: impl IntoIterator<Item = usize>) -> Self {
+        let mut counts: Vec<usize> = Vec::new();
+        let (mut replicas, mut total) = (0, 0);
+        for depth in levels {
+            if depth >= counts.len() {
+                counts.resize(depth + 1, 0);
+            }
+            counts[depth] += 1;
+            replicas += 1;
+            total += depth;
+        }
         // Nearest rank: the smallest value with at least p% of samples <= it.
-        let rank = |p: usize| match levels.len() {
-            0 => 0,
-            n => levels[(n * p).div_ceil(100).max(1) - 1],
+        let rank = |p: usize| {
+            let target = (replicas * p).div_ceil(100).max(1);
+            let mut seen = 0;
+            counts
+                .iter()
+                .position(|&c| {
+                    seen += c;
+                    seen >= target
+                })
+                .unwrap_or(0)
         };
         Self {
             sampled_at_ms: 0,
-            live_replicas: levels.len(),
-            levels: levels.iter().sum(),
+            live_replicas: replicas,
+            levels: total,
             p50: rank(50),
             p95: rank(95),
             p99: rank(99),
-            max: levels.last().copied().unwrap_or(0),
+            // The table ends at the deepest observed replica.
+            max: counts.len().saturating_sub(1),
         }
     }
     fn of(processor: &Processor, at: Duration) -> Self {
@@ -122,26 +141,27 @@ impl DepthSummary {
             processor
                 .coverage()
                 .filter(|r| r.state == orderbook::Validity::Live)
-                .map(|r| r.levels)
-                .collect(),
+                .map(|r| r.levels),
         );
         sample.sampled_at_ms = u64::try_from(at.as_millis()).unwrap_or(u64::MAX);
         sample
     }
-    /// Keep whichever sample held more committed levels; on a tie the newer
-    /// one, so an idle run still reports its live replica count.
-    fn deeper(self, newer: Self) -> Self {
-        if newer.levels >= self.levels {
-            newer
-        } else {
-            self
-        }
-    }
 }
 
-/// One owner-thread scan of every replica per interval: the same cadence and
-/// order of cost as the minute snapshots, absorbed by the bounded ingress.
-const DEPTH_SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
+/// The depth sample walks every replica (~1.3 KB stride each) on the owner
+/// thread: measured 50-92 ms at ~517k books, which stalled ingress every
+/// minute. It is taken once, at stop; `peak_levels` stays exact all run.
+fn sample_depth_at_stop(
+    sampled: &mut bool,
+    stop: &watch::Receiver<bool>,
+    processor: &Processor,
+    at: Duration,
+) -> Option<DepthSummary> {
+    (!*sampled && *stop.borrow()).then(|| {
+        *sampled = true;
+        DepthSummary::of(processor, at)
+    })
+}
 
 pub(super) fn process_books(
     receiver: crossbeam::channel::Receiver<ingress::Envelope>,
@@ -167,7 +187,6 @@ pub(super) fn process_books(
     let mut processor = Processor::with_receive_clock(config, start)?;
     let mut next_tick = Duration::ZERO;
     let mut depth = DepthSummary::default();
-    let mut next_depth = DEPTH_SAMPLE_INTERVAL;
     let mut sampled_at_stop = false;
     let mut invalidations = 0u64;
     let mut samples = Vec::new();
@@ -210,10 +229,13 @@ pub(super) fn process_books(
                     // Workers send shutdown boundaries only after observing
                     // stop, so checking here, before processing, samples the
                     // books while every session is still live.
-                    if !sampled_at_stop && *stop.borrow() {
-                        sampled_at_stop = true;
-                        depth = std::mem::take(&mut depth)
-                            .deeper(DepthSummary::of(&processor, start.elapsed()));
+                    if let Some(sample) = sample_depth_at_stop(
+                        &mut sampled_at_stop,
+                        &stop,
+                        &processor,
+                        start.elapsed(),
+                    ) {
+                        depth = sample;
                     }
                     processor
                         .process(&envelope.message, start.elapsed(), &mut |o| {
@@ -222,7 +244,18 @@ pub(super) fn process_books(
                         .context("C3/C4 processing failed; accepted tail incomplete")?;
                     Some(envelope)
                 }
-                Err(crossbeam::channel::RecvTimeoutError::Timeout) => None,
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                    // A quiet feed delivers no envelope after stop.
+                    if let Some(sample) = sample_depth_at_stop(
+                        &mut sampled_at_stop,
+                        &stop,
+                        &processor,
+                        start.elapsed(),
+                    ) {
+                        depth = sample;
+                    }
+                    None
+                }
                 Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
             };
             if let Some(envelope) = envelope
@@ -232,10 +265,6 @@ pub(super) fn process_books(
             }
             if !*stop.borrow() {
                 let now = start.elapsed();
-                if now >= next_depth {
-                    depth = std::mem::take(&mut depth).deeper(DepthSummary::of(&processor, now));
-                    next_depth = now + DEPTH_SAMPLE_INTERVAL;
-                }
                 if now >= next_tick {
                     processor.tick(now)?;
                     // A tick is a bounded slice, not necessarily all due work.
@@ -378,19 +407,50 @@ mod tests {
         // Small samples: p95 of [1, 2, 3] is the largest value, p50 the middle.
         let few = DepthSummary::from_levels(vec![3, 1, 2]);
         assert_eq!((few.p50, few.p95, few.max), (2, 3, 3));
-        // Deepest sample wins; ties (including empty books) take the newer.
-        let mut empty_live = DepthSummary::from_levels(vec![0, 0]);
-        empty_live.sampled_at_ms = 9;
-        let kept = DepthSummary::default().deeper(empty_live);
-        assert_eq!((kept.live_replicas, kept.sampled_at_ms), (2, 9));
-        let deep = DepthSummary::from_levels(vec![5]);
-        assert_eq!(deep.deeper(DepthSummary::from_levels(vec![1, 1])).levels, 5);
+        // Empty live books still count as live replicas.
+        let empty_live = DepthSummary::from_levels(vec![0, 0]);
+        assert_eq!((empty_live.live_replicas, empty_live.levels), (2, 0));
         // 1..=100 in reverse: ranks are exact, order of input is irrelevant.
-        let d = DepthSummary::from_levels((1..=100).rev().collect());
+        let d = DepthSummary::from_levels((1..=100).rev());
         assert_eq!(
             (d.live_replicas, d.levels, d.p50, d.p95, d.p99, d.max),
             (100, 5050, 50, 95, 99, 100)
         );
+    }
+
+    #[test]
+    fn depth_histogram_matches_sorted_nearest_rank_oracle() {
+        let oracle = |mut v: Vec<usize>| {
+            v.sort_unstable();
+            let rank = |p: usize| v[(v.len() * p).div_ceil(100).max(1) - 1];
+            (
+                v.len(),
+                v.iter().sum::<usize>(),
+                rank(50),
+                rank(95),
+                rank(99),
+                *v.last().unwrap(),
+            )
+        };
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        for case in 0..500 {
+            let len = 1 + case % 257;
+            let spread = [1, 3, 40, 400, 131_070][case % 5];
+            let levels: Vec<usize> = (0..len)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed % spread as u64) as usize
+                })
+                .collect();
+            let d = DepthSummary::from_levels(levels.clone());
+            assert_eq!(
+                (d.live_replicas, d.levels, d.p50, d.p95, d.p99, d.max),
+                oracle(levels),
+                "case {case}"
+            );
+        }
     }
 
     #[test]

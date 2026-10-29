@@ -556,14 +556,23 @@ pub async fn run_manager(
     control_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut repair = 5;
     let mut recovery_open = true;
+    let mut stopped_first = vec![];
     let result: Result<()> = async {
         loop {
             tokio::select! {
                 biased;
                 _ = stopping(&mut shutdown) => return Ok(()),
                 finished = workers.join_next(), if !workers.is_empty() => {
-                    finished.context("worker set ended")???;
-                    anyhow::bail!("worker exited before shutdown");
+                    let report = finished.context("worker set ended")???;
+                    // A worker exits cleanly only after observing stop, yet r3
+                    // joined one before the stop branch above fired. Read the
+                    // flag itself: a clean exit after stop is shutdown, not a
+                    // failure, and its report is kept with the others.
+                    if *shutdown.borrow() {
+                        stopped_first.push(report);
+                        return Ok(());
+                    }
+                    anyhow::bail!("worker exited before shutdown: {report:?}");
                 },
                 _ = control_tick.tick() => flush_controls(&mut controls, &commands)?,
                 _ = tick.tick() => {
@@ -657,7 +666,7 @@ pub async fn run_manager(
         }
     }
     let joined = timeout(config.shutdown_timeout, async {
-        let mut reports = vec![];
+        let mut reports = stopped_first;
         let mut error = None;
         while let Some(result) = workers.join_next().await {
             match result {
