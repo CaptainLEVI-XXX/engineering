@@ -336,9 +336,19 @@ impl Recorder {
                 output_binding,
             } => (
                 0,
-                Some(Row::Json(
-                    json!({"kind":if output_binding.is_some() {"unavailable"} else {"replica_unavailable"}, "next_ordinal":self.ordinal, "symbol":symbol, "binding":binding(output_binding.unwrap_or(o.binding)), "input":o.input, "cause":cause, "reason":reason.chars().take(128).collect::<String>(), "detected_us":chrono::Utc::now().timestamp_micros()}),
-                )),
+                Some(Row::Invalidation(InvalidationFields {
+                    binding: output_binding.unwrap_or(o.binding),
+                    cause: *cause,
+                    detected_us: chrono::Utc::now().timestamp_micros(),
+                    input: o.input,
+                    kind: if output_binding.is_some() {
+                        "unavailable"
+                    } else {
+                        "replica_unavailable"
+                    },
+                    next_ordinal: self.ordinal,
+                    reason: first_chars(reason, 128),
+                })),
             ),
         };
         let next = if size > 0 {
@@ -411,6 +421,9 @@ impl Recorder {
                 match row {
                     Row::Json(value) => json_line(slot, value)?,
                     Row::Snapshot(fields) => json_line(slot, &SnapshotRow { fields, symbol })?,
+                    Row::Invalidation(fields) => {
+                        json_line(slot, &InvalidationRow { fields, symbol })?
+                    }
                 }
             } else {
                 0
@@ -641,10 +654,49 @@ impl Recorder {
 }
 /// A sidecar row awaiting its slot. Snapshot rows are typed: they are one per
 /// snapshot record (every live book, every minute), and building them as a
-/// `Value` cost several times the SBE encoding itself.
-enum Row {
+/// `Value` cost several times the SBE encoding itself. Invalidation rows are
+/// typed too: a session end writes one per assigned book (~1,000 at once).
+enum Row<'a> {
     Json(Value),
     Snapshot(SnapshotFields),
+    Invalidation(InvalidationFields<'a>),
+}
+struct InvalidationFields<'a> {
+    binding: Binding,
+    cause: orderbook::InvalidationCause,
+    detected_us: i64,
+    input: u64,
+    kind: &'static str,
+    next_ordinal: u64,
+    reason: &'a str,
+}
+/// Serializes exactly as the former `json!` invalidation row (keys in
+/// serde_json's alphabetical map order).
+struct InvalidationRow<'a> {
+    fields: &'a InvalidationFields<'a>,
+    symbol: &'a str,
+}
+impl serde::Serialize for InvalidationRow<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let f = self.fields;
+        let mut row = serializer.serialize_struct("InvalidationRow", 8)?;
+        row.serialize_field("binding", &BindingRow(f.binding))?;
+        row.serialize_field("cause", &f.cause)?;
+        row.serialize_field("detected_us", &f.detected_us)?;
+        row.serialize_field("input", &f.input)?;
+        row.serialize_field("kind", f.kind)?;
+        row.serialize_field("next_ordinal", &f.next_ordinal)?;
+        row.serialize_field("reason", f.reason)?;
+        row.serialize_field("symbol", self.symbol)?;
+        row.end()
+    }
+}
+/// The first `n` characters, borrowed (`chars().take(n)` without the copy).
+fn first_chars(text: &str, n: usize) -> &str {
+    text.char_indices()
+        .nth(n)
+        .map_or(text, |(end, _)| &text[..end])
 }
 struct SnapshotFields {
     binding: Binding,
@@ -805,6 +857,79 @@ mod tests {
                 String::from_utf8_lossy(&b[..m])
             );
         }
+    }
+
+    #[test]
+    fn typed_invalidation_row_is_byte_identical_to_the_json_row() {
+        use crate::orderbook::InvalidationCause::*;
+        let long = "é✓🚀\"\\\n".repeat(40);
+        let reasons = [
+            "",
+            "remote close",
+            "quote\" back\\slash",
+            long.as_str(),
+            &"x".repeat(127),
+            &"x".repeat(129),
+        ];
+        let causes = [
+            SourceEnded,
+            InvalidData,
+            AssignmentReplaced,
+            Retired,
+            PolicySuspension,
+            ResourceLimit,
+        ];
+        let (mut a, mut b) = (vec![0; INTEGRITY_BYTES], vec![0; INTEGRITY_BYTES]);
+        for case in 0..600 {
+            let reason = reasons[case % reasons.len()];
+            let selected = case % 2 == 0;
+            let fields = InvalidationFields {
+                binding: Binding {
+                    book: BookId(case as u32 * 7919),
+                    revision: [0, 1, u64::MAX][case % 3],
+                    session: Session {
+                        worker: case,
+                        generation: [0, 9, u64::MAX][case % 3],
+                        adapter: if case % 4 < 2 {
+                            AdapterId::PolymarketV1
+                        } else {
+                            AdapterId::PolymarketV2
+                        },
+                        slot: (case % 2) as u16,
+                    },
+                },
+                cause: causes[case % causes.len()],
+                detected_us: [0, -1, i64::MAX, 1_761_700_000_000_000][case % 4],
+                input: case as u64 * 1_000_003,
+                kind: if selected {
+                    "unavailable"
+                } else {
+                    "replica_unavailable"
+                },
+                next_ordinal: [0, u64::MAX, 42][case % 3],
+                reason: first_chars(reason, 128),
+            };
+            let symbol = ["polymarket:v1:00123", "", "control \u{1}\n"][case % 3];
+            // The former construction, verbatim except for its fields' source.
+            let oracle = json!({"kind":fields.kind, "next_ordinal":fields.next_ordinal, "symbol":symbol, "binding":binding(fields.binding), "input":fields.input, "cause":fields.cause, "reason":reason.chars().take(128).collect::<String>(), "detected_us":fields.detected_us});
+            let n = json_line(
+                &mut a,
+                &InvalidationRow {
+                    fields: &fields,
+                    symbol,
+                },
+            )
+            .unwrap();
+            let m = json_line(&mut b, &oracle).unwrap();
+            assert_eq!(
+                a[..n],
+                b[..m],
+                "case {case}: {}",
+                String::from_utf8_lossy(&b[..m])
+            );
+        }
+        assert_eq!(first_chars("ab", 128), "ab");
+        assert_eq!(first_chars("é✓🚀x", 3), "é✓🚀");
     }
 
     #[test]

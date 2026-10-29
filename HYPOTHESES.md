@@ -382,3 +382,21 @@ fill (~1 s at r2's ~4.4 MB/s), not 16 ms.
 A/B caution: arms that differ in these defaults are not comparable on batch
 age, S4–S7 or recorder metrics. Compare the H28/H29 stall fixes on S2 and
 owner-operation timings, or pin both arms to the same cadence.
+
+## H31 — typed invalidation rows (done)
+
+A session end invalidates ~1,000 books at once, each writing an
+`unavailable`/`replica_unavailable` sidecar row built with `json!` plus an
+owned `chars().take(128)` reason copy. These rows are now a typed
+`InvalidationFields` serialized in serde_json's alphabetical key order, with
+the reason truncated by borrowing (`first_chars`). Oracle: 600 generated cases
+(every cause, both kinds, >128-character multi-byte/escaped reasons, integer
+extremes, empty/control symbols) byte-identical to the former construction.
+Not separately timed; same mechanism as H27 (~2 µs → ~0.5 µs per row
+expected), i.e. ~1.5 ms off a 1,000-book `ended`. Gates: 211 passed / 0 failed
+/ 12 ignored in debug and release; fmt and strict clippy clean.
+
+Offline A/B of perf-local vs bcadca6 (550k books, 70 s, A/B/A/B, orb): running
+window S2 max 126.2/109.7 → 11.1/10.3 ms; desired_chunk max 120.9/104.3 →
+5.6/4.9 ms; 1,660,000 records matched per run; slow S3 messages were on-CPU work
+(perf sched run-delay overlap ≤0.06 ms), so "descheduled" was refuted.

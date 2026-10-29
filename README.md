@@ -101,6 +101,58 @@ This absorbs temporary bursts, not sustained overload, and does not make each
 message faster. Queue-slot allocation adds memory outside the accounted-byte
 limit. See the full-owner evidence in [EXPERIMENTS.md](EXPERIMENTS.md).
 
+### Full-universe results and latency
+
+Measured on an 8-vCPU (Xeon 2.6 GHz) / 16 GB Linux VM, rustc 1.93.0, single
+replica, default limits, public read-only Polymarket feed. r1 ran `5269cf6`;
+r2/r3 ran it plus opt-in stage/operation timers (`latency_histograms`).
+
+| Run | Duration | Records written = confirmed | Output | Notes |
+|---|---|---|---|---|
+| r1 | 30 min | 40,301,598 | 7.58 GB SBE, 113 complete 64 MiB chunks | 516,858 desired, 514,075 selected live, 1,785 coverage-overdue at end; 527 sockets; peak 5.72M levels, 0 quarantines |
+| r2 | 25 min | 35,141,365 | 6.58 GB SBE + 5.07 GB sidecar | peak RSS 2.50 GB; stage timings below |
+| r3 | 25 min | 38,338,474 | — | owner-operation attribution; 164 network interruptions (r2: 4) |
+
+Per-replica depth at r1's stop: p50 6, p95 40, p99 86, max 329 levels.
+
+**Where a message's time goes** (r2 steady state, 11 one-minute windows):
+
+| Stage | p50 | p99 | max |
+|---|---:|---:|---:|
+| Receive → ingress | 0.3 µs | 1.4 µs | 3.0 ms |
+| Ingress wait for the owner | 26 µs | 2.4 ms | 130.5 ms |
+| Decode + book + encode (owner) | 6.9 µs | 27.6 µs | 49.8 ms |
+| Published → writer | 74 µs | 262 µs | 18.1 ms |
+| Writer received → flushed | 3.3 ms | 5.8 ms | 22.3 ms |
+| **Receive → flushed** | **6.0 ms** | **11.0 ms** | 58.8 ms |
+
+Processing is microseconds; at the then-default 5 ms cadence ~95% of the
+end-to-end p50 was deliberate batching. The owner averaged 21% of one core
+(10 s peak 33%), each of four Tokio workers ~13%, the writer 2.6%; no dirty-page
+throttling occurred. Receive timestamps are taken before parsing, so none of
+these delays changes recorded times.
+
+**Tail causes found and fixed** (branch `perf-local`; details in
+[HYPOTHESES.md](HYPOTHESES.md) H20–H31):
+
+| Cause (attributed in r3) | Stall | Fix | Evidence |
+|---|---|---|---|
+| Per-minute depth walk over every ~1.3 KB replica | 50–92 ms each minute | Sampled once at stop | Removed code path; stop-time walk 20–23 ms offline |
+| Asset-ID `HashMap` rehash during ramp | doubling to 106–121 ms | Reserve `instruments` once | Offline A/B: running-window owner wait max 110–126 → 10–11 ms; 1,660,000 records matched the oracle in each of 4 runs |
+| `json!` sidecar rows per snapshot / invalidation | ~2.1 µs per snapshot row (8× its SBE encoding) | Typed rows, byte-identical | 5,000 + 600 generated-case byte oracles; ~3.7× cheaper per snapshot row |
+| 5 ms publish/flush cadence | ~5 ms of p50 | 1 ms default | Writer CPU ~2× offline (still ~8% of a core); live p50 not yet re-measured |
+| Clean worker exit joined before the manager saw stop | false `success=false` (r3) | Read the stop flag; keep the report | Root cause of the ordering not proven |
+
+Remaining, measured but accepted: initial 1,000-book subscription arrays take
+~5–10 ms of real owner work (whole-event validation is not split); a session end
+invalidating 1,000 books takes ~5–14 ms; the stop boundary has ~20–60 ms of
+one-time work (depth sample, untimed snapshot-schedule teardown).
+
+**Not established:** a live run of the fixed branch (expected: no per-minute
+stall, ~1–2 ms end-to-end p50); exchange/network latency; exchange-wide
+losslessness (the feed has no replay/sequence guarantee); two-replica
+full-universe operation.
+
 ### Opt-in extensions and acceptance limits
 
 Two-replica mode uses independent worker generations and automatic, sticky source
@@ -120,8 +172,9 @@ make an upstream-missing book available.
 556,974 desired assets, requiring 1,116 packed two-replica sockets, above the
 configured 1,024 limit. Discovery also retained 44 unresolved V1 identities.
 Capacity rejection names unadmitted identities rather than silently sampling.
-Current validation prioritizes small deterministic workloads; full-universe
-capacity, 30-minute live coverage and live latency research remain separate gates.
+Single-replica full-universe capacity, 30-minute live coverage and live stage
+latency were measured; see [Full-universe results](#full-universe-results-and-latency).
+Two-replica full-universe operation remains a separate gate.
 See [the requirement/evidence ledger](docs/revision-check.md).
 
 `latency_probe` is an isolated, bounded two-feed research executable, not an
@@ -234,7 +287,3 @@ If you're curious to see the YAML schema, take a look at [challenge_orderbook.ya
 We also use a custom timestamp field, so that the Rust struct can use
 `chrono::DateTime` in the generated struct, and in SBE schema, it is a uint64
 representing the timestamp as the number of microseconds since unix epoch.
-
-
-
-you are staff system engineer specializes in building low latency and acuurate system and have indepth understabding od rust its compiler and bytes level optmization without loosing any data(accurancy is important) ...what i want you to do write an AGENT.md file specializes in system engineering , building High freequcny based system and extracting the langauage core for follwoing the best engineering practices......so do a proper research on how we build HFT based system in rust and we are trying to https://voluntas.io/engineering-challenge do this ....but before this I want you write an proper Agent.md file that can understand about the first the problem we are tryting to solve and give us all the langauage and design features to solve that ......we will be using polymarket instead of kalshi ....did you get the requirement ....before writing the AGENT.md ...tll how will do you research first
