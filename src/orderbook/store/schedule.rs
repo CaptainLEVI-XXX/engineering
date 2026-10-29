@@ -275,9 +275,12 @@ impl Processor {
                 .iter()
                 .take_while(|(due, _)| *due <= now)
                 .count();
-            for (_, id) in &self.snapshot_due {
-                self.books[id.0 as usize].snapshot_due = None;
-            }
+            // Per-book `snapshot_due` fields are left stale on purpose: every
+            // reader takes the field and removes that key from this set, a
+            // no-op once cleared, and with no interval nothing reschedules.
+            // Resetting them touched ~510k scattered ~1.3 KB instruments on
+            // the owner thread at cutoff: the likely source of r4's untimed
+            // ~210 ms stop-window stall (not separately measured).
             self.snapshot_due.clear();
         }
     }

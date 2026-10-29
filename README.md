@@ -105,17 +105,21 @@ limit. See the full-owner evidence in [EXPERIMENTS.md](EXPERIMENTS.md).
 
 Measured on an 8-vCPU (Xeon 2.6 GHz) / 16 GB Linux VM, rustc 1.93.0, single
 replica, default limits, public read-only Polymarket feed. r1 ran `5269cf6`;
-r2/r3 ran it plus opt-in stage/operation timers (`latency_histograms`).
+r2/r3 ran it plus opt-in stage/operation timers (`latency_histograms`, `bcadca6`);
+r4 ran the fixed code with the same timers (`c5c6bc5` = `perf-local` 144d6b5 +
+`bcadca6`).
 
 | Run | Duration | Records written = confirmed | Output | Notes |
 |---|---|---|---|---|
 | r1 | 30 min | 40,301,598 | 7.58 GB SBE, 113 complete 64 MiB chunks | 516,858 desired, 514,075 selected live, 1,785 coverage-overdue at end; 527 sockets; peak 5.72M levels, 0 quarantines |
 | r2 | 25 min | 35,141,365 | 6.58 GB SBE + 5.07 GB sidecar | peak RSS 2.50 GB; stage timings below |
-| r3 | 25 min | 38,338,474 | — | owner-operation attribution; 164 network interruptions (r2: 4) |
+| r3 | 25 min | 38,338,474 | — | owner-operation attribution; 164 network interruptions (r2: 4); false `success=false` at shutdown |
+| r4 | 25 min | 34,768,552 | 6.44 GB SBE + 4.58 GB sidecar | fixed code; `success=true`; peak RSS 2.53 GB |
 
 Per-replica depth at r1's stop: p50 6, p95 40, p99 86, max 329 levels.
 
-**Where a message's time goes** (r2 steady state, 11 one-minute windows):
+**Where a message's time goes** (r2 steady state, 11 one-minute windows, before
+the fixes):
 
 | Stage | p50 | p99 | max |
 |---|---:|---:|---:|
@@ -132,26 +136,39 @@ end-to-end p50 was deliberate batching. The owner averaged 21% of one core
 throttling occurred. Receive timestamps are taken before parsing, so none of
 these delays changes recorded times.
 
+**After the fixes** (steady state, r3 → r4):
+
+| | r3 | r4 |
+|---|---:|---:|
+| Receive → flushed p50 / p99 | 6.0 / 13.1 ms | **1.6 / 4.5 ms** |
+| Owner wait p99 / p99.9 | 5.8 / 44.0 ms | **2.0 / 31.5 ms** |
+| Owner wait per-minute max | 47–103 ms every minute | 14–38 ms in 6 of 8 minutes; 53, 70 ms in two; 259 ms in the stop window |
+| Depth walks | 25 (one per minute) | **1** (at stop) |
+| Owner / writer CPU (mean) | 22.5% / 2.9% | 21.7% / 7.3% |
+| `run_end.success` | false | **true** |
+
 **Tail causes found and fixed** (branch `perf-local`; details in
-[HYPOTHESES.md](HYPOTHESES.md) H20–H31):
+[HYPOTHESES.md](HYPOTHESES.md) H20–H32):
 
 | Cause (attributed in r3) | Stall | Fix | Evidence |
 |---|---|---|---|
-| Per-minute depth walk over every ~1.3 KB replica | 50–92 ms each minute | Sampled once at stop | Removed code path; stop-time walk 20–23 ms offline |
+| Per-minute depth walk over every ~1.3 KB replica | 50–92 ms each minute | Sampled once at stop | r4: one walk, at stop; per-minute 47–103 ms maxima gone |
 | Asset-ID `HashMap` rehash during ramp | doubling to 106–121 ms | Reserve `instruments` once | Offline A/B: running-window owner wait max 110–126 → 10–11 ms; 1,660,000 records matched the oracle in each of 4 runs |
 | `json!` sidecar rows per snapshot / invalidation | ~2.1 µs per snapshot row (8× its SBE encoding) | Typed rows, byte-identical | 5,000 + 600 generated-case byte oracles; ~3.7× cheaper per snapshot row |
-| 5 ms publish/flush cadence | ~5 ms of p50 | 1 ms default | Writer CPU ~2× offline (still ~8% of a core); live p50 not yet re-measured |
-| Clean worker exit joined before the manager saw stop | false `success=false` (r3) | Read the stop flag; keep the report | Root cause of the ordering not proven |
+| 5 ms publish/flush cadence | ~5 ms of p50 | 1 ms default | r4 p50 6.0 → 1.6 ms; writer CPU 2.9% → 7.3% |
+| Clean worker exit joined before the manager saw stop | false `success=false` (r3) | Read the stop flag; keep the report | r4 `success=true`; root cause of the ordering not proven |
+| Stop-time reset of ~510k per-book deadlines | likely most of r4's ~210 ms untimed stop stall | Clear the deadline set only | Lifecycle test drains, replaces and retires after cutoff; **not yet measured live** |
 
-Remaining, measured but accepted: initial 1,000-book subscription arrays take
-~5–10 ms of real owner work (whole-event validation is not split); a session end
-invalidating 1,000 books takes ~5–14 ms; the stop boundary has ~20–60 ms of
-one-time work (depth sample, untimed snapshot-schedule teardown).
+Remaining, measured but accepted: initial subscription arrays take 25–46 ms of
+real owner work live during ramp (whole-event validation is not split; offline
+~5–10 ms); a session end invalidating 1,000 books takes ~5–14 ms; the stop-time
+depth sample takes ~47 ms once.
 
-**Not established:** a live run of the fixed branch (expected: no per-minute
-stall, ~1–2 ms end-to-end p50); exchange/network latency; exchange-wide
-losslessness (the feed has no replay/sequence guarantee); two-replica
-full-universe operation.
+**Not established:** the cause of two r4 steady minutes with 53 and 70 ms owner
+waits (no timed operation above 3 ms, largest message 7.5 ms; descheduling or an
+arrival pile-up, not attributed); the live effect of the stop-time fix;
+exchange/network latency; exchange-wide losslessness (the feed has no
+replay/sequence guarantee); two-replica full-universe operation.
 
 ### Opt-in extensions and acceptance limits
 

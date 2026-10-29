@@ -400,3 +400,18 @@ Offline A/B of perf-local vs bcadca6 (550k books, 70 s, A/B/A/B, orb): running
 window S2 max 126.2/109.7 → 11.1/10.3 ms; desired_chunk max 120.9/104.3 →
 5.6/4.9 ms; 1,660,000 records matched per run; slow S3 messages were on-CPU work
 (perf sched run-delay overlap ≤0.06 ms), so "descheduled" was refuted.
+
+## H32 — stop-time deadline reset (done, not measured live)
+
+r4 (`c5c6bc5`, 25 min live) confirmed the earlier fixes: one depth walk (at
+stop), S7 p50/p99 6.0/13.1 → 1.6/4.5 ms, S2 p99 5.8 → 2.0 ms, `success=true`.
+Its stop window still reached 259 ms with ~210 ms untimed. `stop_snapshots`
+walked the ~510k-entry deadline set and wrote `snapshot_due = None` into each
+book's ~1.3 KB `Instrument` — the same scattered-access pattern as the depth
+walk. Every reader of that field `take()`s it and removes the key from the
+set (a no-op once cleared), and no interval remains to reschedule, so the
+per-book writes are removed; only the set is cleared. The extended
+`book_lifecycle` stop test replaces and retires books after cutoff and checks
+that nothing reschedules or captures. Attribution of the 210 ms to this walk
+is likely but unmeasured. Two steady r4 minutes (53, 70 ms S2 max) remain
+unattributed. Gates: 211 passed / 0 failed / 12 ignored, debug and release.

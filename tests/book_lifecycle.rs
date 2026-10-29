@@ -1170,4 +1170,29 @@ fn periodic_sweeps_are_fair_and_replacement_and_retirement_cancel_old_deadlines(
     })
     .unwrap();
     assert_eq!(p.next_snapshot_due(), None);
+    // Drained input after cutoff still replaces and retires books whose
+    // per-book deadline is stale; neither reschedules nor captures.
+    p.process(
+        &Message::Data {
+            session: s,
+            ordinal: 3,
+            received_at: Utc::now(),
+            received_mono: Instant::now(),
+            payload:
+                r#"{"event_type":"book","asset_id":"A2","timestamp":"41","bids":[],"asks":[]}"#
+                    .into(),
+        },
+        Duration::from_secs(121),
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    for message in reconciliation(s.adapter, 3, &[], &["A3"]) {
+        p.process(&message, Duration::from_secs(121), &mut |_| Ok(()))
+            .unwrap();
+    }
+    p.capture_due(&mut || (Duration::from_secs(300), Utc::now()), &mut |_| {
+        panic!("a post-cutoff event rescheduled a snapshot")
+    })
+    .unwrap();
+    assert_eq!(p.next_snapshot_due(), None);
 }
