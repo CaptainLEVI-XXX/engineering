@@ -157,7 +157,7 @@ these delays changes recorded times.
 | `json!` sidecar rows per snapshot / invalidation | ~2.1 µs per snapshot row (8× its SBE encoding) | Typed rows, byte-identical | 5,000 + 600 generated-case byte oracles; ~3.7× cheaper per snapshot row |
 | 5 ms publish/flush cadence | ~5 ms of p50 | 1 ms default | r4 p50 6.0 → 1.6 ms; writer CPU 2.9% → 7.3% |
 | Clean worker exit joined before the manager saw stop | false `success=false` (r3) | Read the stop flag; keep the report | r4 `success=true`; root cause of the ordering not proven |
-| Stop-time reset of ~510k per-book deadlines | likely most of r4's ~210 ms untimed stop stall | Clear the deadline set only | Lifecycle test drains, replaces and retires after cutoff; **not yet measured live** |
+| Stop-time reset of ~510k per-book deadlines | likely most of r4's ~210 ms untimed stop stall | Clear the deadline set only | Simulated 510k books: 237 ms → 1.1 ms cold; lifecycle test drains, replaces and retires after cutoff; **not yet measured live** |
 
 Remaining, measured but accepted: initial subscription arrays take 25–46 ms of
 real owner work live during ramp (whole-event validation is not split; offline

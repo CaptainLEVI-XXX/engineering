@@ -413,5 +413,8 @@ set (a no-op once cleared), and no interval remains to reschedule, so the
 per-book writes are removed; only the set is cleared. The extended
 `book_lifecycle` stop test replaces and retires books after cutoff and checks
 that nothing reschedules or captures. Attribution of the 210 ms to this walk
-is likely but unmeasured. Two steady r4 minutes (53, 70 ms S2 max) remain
+is likely but unmeasured live. Standalone M2 replica (510k books of ~1.3 KB,
+510k-entry deadline set in random deadline order, caches evicted first): old
+walk + clear 237 ms cold / 4.9 ms warm; clear only 1.1 / 1.2 ms. The cold case
+matches r4's ~210 ms. Two steady r4 minutes (53, 70 ms S2 max) remain
 unattributed. Gates: 211 passed / 0 failed / 12 ignored, debug and release.
