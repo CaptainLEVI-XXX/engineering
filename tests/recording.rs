@@ -667,7 +667,7 @@ fn selected_replicas_and_generated_snapshots_preserve_provenance_and_file_order(
         processor.process(&message, Duration::from_secs(63), &mut |o| recorder.observe(o)).unwrap();
         if matches!(message, Message::Data { ordinal: 2, .. }) {
             // Existing policy is manual after switching slots; automatic
-            // candidate choice belongs to R3, not this baseline replay.
+            // candidate choice is covered by the dual-feed tests.
             processor.select(a.adapter, "A", 0, Duration::from_secs(63), received, &mut |o| recorder.observe(o)).unwrap();
         }
     }

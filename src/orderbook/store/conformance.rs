@@ -1,4 +1,4 @@
-//! Synthetic R6 conformance, compiled only as a child of `orderbook::store`.
+//! Synthetic protocol conformance, compiled only as a child of `orderbook::store`.
 //!
 //! This is deliberately NOT Kalshi and makes no exchange-compatibility claim.
 //! ALT/1 uses line envelopes, signed decimal changes, and one sequence per

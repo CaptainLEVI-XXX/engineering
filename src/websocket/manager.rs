@@ -564,8 +564,8 @@ pub async fn run_manager(
                 _ = stopping(&mut shutdown) => return Ok(()),
                 finished = workers.join_next(), if !workers.is_empty() => {
                     let report = finished.context("worker set ended")???;
-                    // A worker exits cleanly only after observing stop, yet r3
-                    // joined one before the stop branch above fired. Read the
+                    // A worker exits cleanly only after observing stop, yet one
+                    // was seen joined before the stop branch above fired. Read the
                     // flag itself: a clean exit after stop is shutdown, not a
                     // failure, and its report is kept with the others.
                     if *shutdown.borrow() {

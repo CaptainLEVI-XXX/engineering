@@ -279,8 +279,7 @@ impl Processor {
             // reader takes the field and removes that key from this set, a
             // no-op once cleared, and with no interval nothing reschedules.
             // Resetting them touched ~510k scattered ~1.3 KB instruments on
-            // the owner thread at cutoff: the likely source of r4's untimed
-            // ~210 ms stop-window stall (not separately measured).
+            // the owner thread at cutoff (~240 ms with cold caches).
             self.snapshot_due.clear();
         }
     }

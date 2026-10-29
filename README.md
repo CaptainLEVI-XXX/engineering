@@ -1,306 +1,218 @@
-# Read before getting started!!
+# Polymarket full-universe L2 market-data collector
 
-## Running Components 1–5
+A Rust collector for the [Voluntas engineering challenge](https://voluntas.io/engineering-challenge),
+using **Polymarket** as the exchange. It discovers every eligible active
+instrument, spreads subscriptions across many WebSockets, maintains an exact L2
+book per instrument, and writes every accepted price-level update plus a full
+snapshot of every live book each minute to **binary stdout**, using the supplied
+SBE schema and helpers. It keeps discovering additions and retirements while it
+runs, and shuts down gracefully on SIGINT.
 
-The executable runs continuous discovery and stable per-adapter WebSocket
-subscriptions. **The default mode records selected L2 history to binary stdout:**
-one consumer validates exact Polymarket values and reconstructs source-specific
-L2 books. Invalid input marks the affected replicas unavailable and requests a
-bounded session restart. Source selection exposes snapshots before its deltas.
-Every selected absolute level update (including no-ops and zero deletes),
-authoritative snapshot, and periodic selected-live snapshot is encoded through
-the supplied SBE codecs/helper. A separate, newly created JSONL integrity file
-records snapshot provenance and selected-source unavailability. Diagnostics go
-to stderr; never direct binary stdout to a terminal.
-See [architecture](docs/architecture.md) and [protocol evidence](docs/protocol.md).
+Priorities, in order: numerical exactness → correct books → honest accounting of
+what was observed → timestamp fidelity → throughput → latency.
+
+## Quick start
 
 ```sh
 cargo build --locked --release
-target/release/engineering-challenge --seconds 120 --integrity-path run.integrity.jsonl > run.sbe 2> collector.log
+target/release/engineering-challenge --seconds 600 \
+  --integrity-path run.integrity.jsonl > run.sbe 2> collector.log
 ```
 
-### Configuration
+- **stdout** carries SBE records only; never point it at a terminal.
+- **`--integrity-path`** names a new JSONL provenance file (an existing path is
+  rejected, never overwritten).
+- **stderr** carries diagnostics and the shutdown summary.
+- Omit `--seconds` to run until SIGINT. Keep the exit status and both output
+  files: a nonzero exit means the capture is incomplete.
 
-Limits and timings come from an optional YAML file; per-run settings stay on the
-command line. Precedence is built-in defaults < `--config FILE` < override flags
-(`--ws-url`, `--max-sockets`, `--monitoring`, …). [`collector.example.yaml`](collector.example.yaml)
-lists every key at its default (a test keeps it in sync); unknown keys and
-unrecordable values (for example `levels_per_side` above 65535) fail at startup.
-The effective configuration, including values the collector derives (sessions,
-selection, the 60 s snapshot cadence, decoder message bytes), is written as the
-integrity file's first control row, so each capture records its own limits.
+## How each requirement is met
+
+| Requirement | Implementation |
+|---|---|
+| Discover every eligible instrument | Paginated Gamma REST scans (keyset), exact opaque IDs per adapter namespace, periodic full reconciliation; an incomplete scan never erases prior desired state |
+| Multiple WebSockets | Stable assignment of up to 1,000 assets per socket; one Tokio task owns each socket, its subscriptions and its connection generation |
+| L2 book per instrument | One owner thread; `BTreeMap` price levels; a `book` message replaces the book, a `price_change` sets an absolute quantity, zero deletes; every event is validated whole before any change applies |
+| Every update to binary stdout | Each accepted level change, including no-ops and deletes, is encoded with the supplied SBE codecs into 64 MiB reader-compatible chunks |
+| Snapshot of every live book each minute | Each selected live book is due 60 s after its last authoritative snapshot; captured in bounded ≤1 ms slices between messages; lateness is reported |
+| Additions and retirements | Continuous reconciliation sends ordered subscribe/unsubscribe fences per socket; retired books stop at an exact input cutoff |
+| Graceful SIGINT | Stop discovery and reconnects, cut off intake, close sockets, drain accepted messages, flush output, join workers; a failed drain exits nonzero |
+
+## Architecture
+
+```
+Gamma REST ──► C1 discovery/registry ──► C2 subscription manager
+                                            │ 1 task per socket (×~527)
+                                            ▼
+                                  bounded ingress queue (fails closed when full)
+                                            ▼
+                     owner thread: C3 decode → C4 books → snapshot schedule
+                                            ▼
+                     C5 recorder: fixed batch pool → writer thread → stdout
+                                                              └► integrity JSONL
+```
+
+| Component | Code |
+|---|---|
+| Entry point and wiring | `src/main.rs`, `src/collector/` (`options.rs` CLI, `config.rs` YAML, `owner.rs` the market-data owner thread) |
+| C1 discovery | `src/discovery/` |
+| C2 ingestion | `src/websocket/` (`manager.rs` assignments, `worker/` one socket per task, `ingress.rs` bounded handoff) |
+| C3 decoding | `src/market_data/` (`decimal.rs` exact scaling, `polymarket.rs` bounded parsing) |
+| C4 books | `src/orderbook/` (`book.rs` levels; `store/` the single-owner `Processor`: events, reconciliation, invalidation, selection, timers) |
+| C5 recording | `src/recording/` (encoding, batching, writer, integrity sidecar) |
+| Supplied SBE helpers | `src/util/`, `sbe_schemas/` (unchanged schema and reader) |
+
+`src/bin/discovery.rs` is a small standalone discovery tool used by the
+discovery tests.
+
+## Correctness guarantees
+
+- **Exact numbers.** Prices and sizes are parsed from decimal strings into
+  checked `i64` at the schema's 1,000,000 scale. No floats, and no silent
+  rounding: an inexact value invalidates the affected book.
+- **Book semantics.** Snapshots replace; level updates are absolute; zero
+  deletes. A whole event is validated before any part of it is applied.
+- **Order.** Per-instrument feed order is preserved, including snapshots and
+  batches. Records are never sorted by exchange time; replay in file order.
+- **No silent loss.** Every queue is bounded with an explicit failure policy. A
+  full ingress queue or exhausted output pool stops the run visibly; nothing is
+  dropped, coalesced or relabelled.
+- **Visible gaps.** Invalid input or a lost source marks the affected books
+  unavailable in the integrity file and requests a session restart. A book is
+  published again only after a fresh snapshot. A replacement snapshot restores
+  state, not missed history.
+- **Bounded memory.** `books.total_levels` caps book memory across all books. A
+  book that exceeds a budget is quarantined and reported, never truncated.
+- **Timestamps.** Application-receive time is captured as soon as a complete
+  WebSocket message arrives, before parsing or queueing. Exchange time is kept
+  separately. Internal delays never change recorded times.
+
+## Output
+
+- **SBE stdout:** `PriceLevelUpdate` and `Snapshot` records from the supplied
+  schema, in 64 MiB chunks. Sparse chunks are completed after 60 s or at finish.
+  The supplied reader reads completed files; it is not a live tailing reader.
+- **Symbols:** `polymarket:v1:<exact-id>` / `polymarket:v2:<exact-id>`.
+- **Timestamps:** microseconds. Generated snapshots carry the actual capture
+  time and the last applied exchange time.
+- **Integrity file (JSONL):** the effective configuration first, then snapshot
+  provenance, subscription and reconciliation fences, unavailability, and a final
+  `run_end` with written/confirmed record counts and `success`.
+
+## Configuration
+
+Precedence: built-in defaults < `--config FILE` < command-line flags. Every key
+and its default is in [`collector.example.yaml`](collector.example.yaml) (a test
+keeps them in sync); unknown keys fail at startup.
 
 ```sh
-cp collector.example.yaml collector.yaml   # edit books.total_levels etc.
+cp collector.example.yaml collector.yaml
 target/release/engineering-challenge --config collector.yaml --seconds 600 \
   --integrity-path run.integrity.jsonl > run.sbe 2> collector.log
 ```
 
-**Sizing a full-book run.** `books.total_levels` bounds book memory across every
-replica, including the old+new peak while a snapshot replaces a book (roughly
-30–40 bytes per level). A book that does not fit is quarantined, visibly, rather
-than truncated or crashing the process. Size it from a sampled run: the shutdown
-summary and the integrity file's `owner_summary` report `peak_levels`,
-`resource_quarantines` and a `depth` sample (live replicas, levels, p50/p95/p99/max
-per replica, sampled once at stop: a per-minute walk of every replica stalled
-ingress by 50–92 ms at full-universe size). Set
-`total_levels` comfortably above the observed peak for the replicas you run, and
-budget disk for minute snapshots (about 36 + 16 × levels + ~90 symbol bytes per
-selected book per minute).
+Flags: `--seconds`, `--integrity-path`, `--transport-only` (validate messages
+with empty stdout), `--gamma-url`, `--ws-url`, `--assets-per-socket` (1000),
+`--max-sockets` (1024), `--replicas-per-market` (1 or 2), `--monitoring`,
+`--lifecycle-hints`, `--queue-items` (65536), `--queue-bytes` (67108864).
 
-Omit `--seconds` to run until SIGINT. The library boundary supplies owned raw text,
-application-receive timestamps, adapter/session identity, per-session ordinals and
-ordered lifecycle/subscription-request events. Full/closed ingress fails visibly;
-shutdown allows 15 seconds overall to drain accepted messages and finish output.
-Retain the exit status and both output files: successful flush does not establish
-durability, full-universe coverage or exchange-wide losslessness. Use
-`--transport-only true` to retain opaque-message validation with empty stdout and
-no required integrity file. An existing integrity path is rejected, never overwritten.
+**Sizing a full-universe run.** About 517k books needed 527 sockets, peaked at
+5.72M levels and 2.5 GB RSS, and wrote ~250 MB of SBE per minute plus ~200 MB of
+integrity rows. Set `books.total_levels` comfortably above the `peak_levels`
+reported in the shutdown summary (default 10M). Output is published and flushed
+every 1 ms (`recording.publish_age_ms`, `flush_age_ms`; minimum 1).
 
-The output pool reserves 16 × 4 MiB plus descriptors (~65 MiB); book, ingress,
-symbol-cache and physical-buffer memory is additional. Publication targets
-256 KiB / 1 ms; physical flush targets 1 ms (configurable, minimum 1 ms). These are checked between work items,
-not hard-real-time guarantees. With multiple batches, if all other batches are
-outstanding, soft size/age publication retains the last batch and appends exact
-records within its existing limits; age retries every publish interval. Hard byte/descriptor
-exhaustion still fails closed when no reusable batch remains. Records never
-cross 64 MiB logical chunks. Sparse
-chunks are padded after 60 seconds or at finish, potentially adding ~64 MiB/minute.
-The supplied reader opens completed files and ignores incomplete final chunks;
-it is not a live pipe/tailing reader. Physical visibility is not reader compatibility.
+**Two replicas** (`--replicas-per-market 2`) subscribe every market on two
+independent sockets with sticky automatic source selection; a failover publishes
+a replacement snapshot before the new source's deltas. At the current universe
+size this needs more than the default 1,024 sockets.
 
-Symbols are `polymarket:v1:<exact-id>` / `polymarket:v2:<exact-id>`. Timestamps use
-microseconds; generated snapshots use actual capture/selection time and the last
-applied exchange time. Replay **file order**, not sorted timestamps. A replacement
-snapshot restores state, not missed history. Each selected-live book is due 60s
-after its last authoritative snapshot; actual lateness is reported. Missing an
-additional whole interval fails recording rather than backdating a snapshot.
-
-The book consumer performs no diagnostic I/O. It returns exact invalidation
-observation counts and the first four diagnostic samples (asset/reason previews
-limited to 128 characters) after draining, or attaches them to a processing error.
-Additional per-book details are omitted explicitly; this summary is not a history
-archive or live monitoring feed. Main prints the summary after joining the consumer.
-Other control-plane/transport stderr output is still synchronous: an indefinitely
-blocked stderr can delay ordinary diagnostic delivery. A blocked output/drain
-deadline exits nonzero without logging or joining stuck threads; it cannot cancel
-an OS write or guarantee the tail. Keep stderr draining in operational runs.
-
-Options (each requires a value): `--seconds`, `--gamma-url`, `--ws-url`,
-`--assets-per-socket` (1000), `--max-sockets` (1024),
-`--queue-items` (65536), `--queue-bytes` (67108864), `--transport-only` (false),
-`--replicas-per-market` (1 or 2, default 1), `--monitoring` (false),
-`--lifecycle-hints` (false),
-`--integrity-path` (required for recording). Socket/message/queue settings are
-collector safety budgets, **not verified exchange limits or a total RSS cap**.
-
-The ingress item allowance includes headroom above a measured 23,404-message
-live backlog that drained within its one-second observation window. The separate
-64 MiB accounted-byte limit is unchanged; both bounds still fail explicitly.
-This absorbs temporary bursts, not sustained overload, and does not make each
-message faster. Queue-slot allocation adds memory outside the accounted-byte
-limit. See the full-owner evidence in [EXPERIMENTS.md](EXPERIMENTS.md).
-
-### Full-universe results and latency
+## Performance
 
 Measured on an 8-vCPU (Xeon 2.6 GHz) / 16 GB Linux VM, rustc 1.93.0, single
-replica, default limits, public read-only Polymarket feed. r1 ran `5269cf6`;
-r2/r3 ran it plus opt-in stage/operation timers (`latency_histograms`, `bcadca6`);
-r4 ran the fixed code with the same timers (`c5c6bc5` = `perf-local` 144d6b5 +
-`bcadca6`).
+replica, default limits, live public Polymarket feed, 25–30 minute runs.
 
-| Run | Duration | Records written = confirmed | Output | Notes |
-|---|---|---|---|---|
-| r1 | 30 min | 40,301,598 | 7.58 GB SBE, 113 complete 64 MiB chunks | 516,858 desired, 514,075 selected live, 1,785 coverage-overdue at end; 527 sockets; peak 5.72M levels, 0 quarantines |
-| r2 | 25 min | 35,141,365 | 6.58 GB SBE + 5.07 GB sidecar | peak RSS 2.50 GB; stage timings below |
-| r3 | 25 min | 38,338,474 | — | owner-operation attribution; 164 network interruptions (r2: 4); false `success=false` at shutdown |
-| r4 | 25 min | 34,768,552 | 6.44 GB SBE + 4.58 GB sidecar | fixed code; `success=true`; peak RSS 2.53 GB |
-
-Per-replica depth at r1's stop: p50 6, p95 40, p99 86, max 329 levels.
-
-**Where a message's time goes** (r2 steady state, 11 one-minute windows, before
-the fixes):
-
-| Stage | p50 | p99 | max |
-|---|---:|---:|---:|
-| Receive → ingress | 0.3 µs | 1.4 µs | 3.0 ms |
-| Ingress wait for the owner | 26 µs | 2.4 ms | 130.5 ms |
-| Decode + book + encode (owner) | 6.9 µs | 27.6 µs | 49.8 ms |
-| Published → writer | 74 µs | 262 µs | 18.1 ms |
-| Writer received → flushed | 3.3 ms | 5.8 ms | 22.3 ms |
-| **Receive → flushed** | **6.0 ms** | **11.0 ms** | 58.8 ms |
-
-Processing is microseconds; at the then-default 5 ms cadence ~95% of the
-end-to-end p50 was deliberate batching. The owner averaged 21% of one core
-(10 s peak 33%), each of four Tokio workers ~13%, the writer 2.6%; no dirty-page
-throttling occurred. Receive timestamps are taken before parsing, so none of
-these delays changes recorded times.
-
-**After the fixes** (steady state, r3 → r4):
-
-| | r3 | r4 |
-|---|---:|---:|
-| Receive → flushed p50 / p99 | 6.0 / 13.1 ms | **1.6 / 4.5 ms** |
-| Owner wait p99 / p99.9 | 5.8 / 44.0 ms | **2.0 / 31.5 ms** |
-| Owner wait per-minute max | 47–103 ms every minute | 14–38 ms in 6 of 8 minutes; 53, 70 ms in two; 259 ms in the stop window |
-| Depth walks | 25 (one per minute) | **1** (at stop) |
-| Owner / writer CPU (mean) | 22.5% / 2.9% | 21.7% / 7.3% |
-| `run_end.success` | false | **true** |
-
-**Tail causes found and fixed** (branch `perf-local`; details in
-[HYPOTHESES.md](HYPOTHESES.md) H20–H32):
-
-| Cause (attributed in r3) | Stall | Fix | Evidence |
+| Run | Records written = confirmed | Coverage | Result |
 |---|---|---|---|
-| Per-minute depth walk over every ~1.3 KB replica | 50–92 ms each minute | Sampled once at stop | r4: one walk, at stop; per-minute 47–103 ms maxima gone |
-| Asset-ID `HashMap` rehash during ramp | doubling to 106–121 ms | Reserve `instruments` once | Offline A/B: running-window owner wait max 110–126 → 10–11 ms; 1,660,000 records matched the oracle in each of 4 runs |
-| `json!` sidecar rows per snapshot / invalidation | ~2.1 µs per snapshot row (8× its SBE encoding) | Typed rows, byte-identical | 5,000 + 600 generated-case byte oracles; ~3.7× cheaper per snapshot row |
-| 5 ms publish/flush cadence | ~5 ms of p50 | 1 ms default | r4 p50 6.0 → 1.6 ms; writer CPU 2.9% → 7.3% |
-| Clean worker exit joined before the manager saw stop | false `success=false` (r3) | Read the stop flag; keep the report | r4 `success=true`; root cause of the ordering not proven |
-| Stop-time reset of ~510k per-book deadlines | likely most of r4's ~210 ms untimed stop stall | Clear the deadline set only | Simulated 510k books: 237 ms → 1.1 ms cold; lifecycle test drains, replaces and retires after cutoff; **not yet measured live** |
+| 30 min | 40,301,598 | 516,858 desired, 514,075 live; 527 sockets | 7.58 GB SBE, 0 quarantines |
+| 25 min (final code) | 34,768,552 | full universe | `success=true`, peak RSS 2.53 GB |
 
-Remaining, measured but accepted: initial subscription arrays take 25–46 ms of
-real owner work live during ramp (whole-event validation is not split; offline
-~5–10 ms); a session end invalidating 1,000 books takes ~5–14 ms; the stop-time
-depth sample takes ~47 ms once.
+**Where a message's time goes** (steady state; the first two rows are from an
+earlier instrumented run, the last two from the final code):
 
-**Not established:** the cause of two r4 steady minutes with 53 and 70 ms owner
-waits (no timed operation above 3 ms, largest message 7.5 ms; descheduling or an
-arrival pile-up, not attributed); the live effect of the stop-time fix;
-exchange/network latency; exchange-wide losslessness (the feed has no
-replay/sequence guarantee); two-replica full-universe operation.
+| Stage | p50 | p99 |
+|---|---:|---:|
+| Socket receive → ingress queue | 0.3 µs | 1.4 µs |
+| Decode + book update + encode | ~7 µs | ~28 µs |
+| Waiting for the owner thread | 26 µs | 2.0 ms |
+| **Receive → flushed to stdout** | **1.6 ms** | **4.5 ms** |
 
-### Opt-in extensions and acceptance limits
+Processing is single-digit microseconds; most end-to-end time is the 1 ms output
+cadence. The owner thread averaged ~22% of one core and the writer ~7%, leaving
+ample headroom.
 
-Two-replica mode uses independent worker generations and automatic, sticky source
-selection. A failover publishes a replacement snapshot before that source's
-deltas. The sidecar preserves desired reconciliation cutoffs, successful requests,
-standby initialization/loss, selected gaps and selection freshness evidence.
-Neither a replacement nor a recently received message proves missing history was
-recovered. The default remains one replica; monitoring and lifecycle hints are
-separate opt-ins. Monitoring uses accepted L2 activity, not PONG or trade counts.
-Guarded periodic renewal requires a usable peer and defers in single-source mode.
-Missing instruments cannot trigger overlapping repairs that remove a neighboring
-book's last usable redundant copy; fewer-attempted replicas get priority when
-both repairs are due. This does not isolate failures in single-replica mode or
-make an upstream-missing book available.
+**Tail stalls found by live attribution and removed:**
 
-**Do not enable full-universe redundancy from these defaults alone.** R0 observed
-556,974 desired assets, requiring 1,116 packed two-replica sockets, above the
-configured 1,024 limit. Discovery also retained 44 unresolved V1 identities.
-Capacity rejection names unadmitted identities rather than silently sampling.
-Single-replica full-universe capacity, 30-minute live coverage and live stage
-latency were measured; see [Full-universe results](#full-universe-results-and-latency).
-Two-replica full-universe operation remains a separate gate.
-See [the requirement/evidence ledger](docs/revision-check.md).
+| Cause | Before | Fix |
+|---|---|---|
+| Per-minute depth statistic walking every book | 50–92 ms every minute | Sampled once, at stop |
+| Asset-ID map rehashing as discovery added books | doubling to ~120 ms | Map reserved at the configured bound |
+| Building integrity rows as `serde_json::Value` | ~2.1 µs per snapshot row | Typed rows, byte-identical output, ~3.7× cheaper |
+| 5 ms publish/flush cadence | ~6 ms p50 | 1 ms cadence: 1.6 ms p50 |
+| Resetting ~510k per-book deadlines at stop | ~240 ms (cold) | Clear the deadline set only |
+| A clean worker exit noticed before the stop flag | false `success=false` | Read the stop flag directly |
 
-`latency_probe` is an isolated, bounded two-feed research executable, not an
-automatic source-selection optimization. It requires explicit live approval and
-a fixed sample. See [the research protocol](docs/latency-research.md); no live
-performance improvement is claimed merely because the probe is implemented.
-Local socket/control/failure tests and a 40,000-change loopback load passed.
-`python3 -B tools/check_latency_probe.py <trial>/raw.jsonl` independently checks
-financial match decisions against retained raw evidence, including timer-driven
-window progress. It refuses incomplete captures and unsupported resource resets;
-also check the probe's exit status, since a terminal row cannot prove final sync.
+An offline A/B with 550k books cut the worst queue wait from 110–126 ms to
+10–11 ms, with every record matching an independent oracle.
 
-The opt-in production-owner capacity check runs the executable's real owner loop,
-bounded ingress, minute snapshots and recorder against a file, then independently
-checks every financial record. It defaults to 550,000 synthetic books, 550 sessions
-and 70 seconds of 10,000 messages/second after paced initialization. Run it alone;
-allow several GiB of RAM and temporary disk space. It excludes REST, WebSockets,
-ongoing discovery churn and live coverage, and is not a latency percentile test.
-`OWNER_REPLICAS=2` doubles stored replicas/sessions, enables automatic selection
-and monitoring, and alternates equivalent deliveries across both sources. The
-rate counts physical input messages, not unique selected updates. It uses the
-production ingress item limit and unchanged 64 MiB accounted-byte limit.
-`OWNER_CHECK_HEALTH=1` additionally requires maximum revisit ≤11s and lateness ≤1s;
-these tolerances do not turn the 10s target into an exact real-time guarantee.
-
-```sh
-OWNER_BOOKS=550000 OWNER_RATE=100000 OWNER_SECONDS=70 cargo test --locked --release --lib production_owner_capacity -- --ignored --nocapture
-# Small dual-feed smoke before the expensive full-population replay:
-OWNER_BOOKS=1000 OWNER_REPLICAS=2 OWNER_RATE=10000 OWNER_SECONDS=3 OWNER_CHECK_HEALTH=1 cargo test --locked --release --lib production_owner_capacity -- --ignored --nocapture
-```
-
-`cargo test --locked --test dual_feed` exercises real localhost WebSocket workers,
-ingress, book processing, recording and the supplied SBE reader under forced
-disconnect, symbol silence, delayed batches, missing books and staggered renewal.
-Its logical health clock accelerates policy thresholds; it does not measure
-latency or exercise discovery/manager routing/shared connection admission.
-
-For local optimization experiments, use the [bounded latency harness](EXPERIMENTS.md).
-It compares explicit commits (or preserved source patches) with the existing replay
-oracle in isolated worktrees, requires research evidence for candidates, and never
-automatically promotes code. Shared test patches keep measurement changes identical
-on both arms; the caller's uncommitted work is never silently included.
-Ingress benchmarks use a dedicated sleeping producer with absolute deadlines;
-socket benchmarks retain Tokio's millisecond-granularity timers. Both report
-actual offered lag and interarrival gaps: equal average rates do not guarantee
-equivalent arrival patterns. Changing the pacer establishes a new measurement
-baseline, not a collector speedup.
-The independent reference books and expected SBE stream are reconstructed after
-output drain, from bounded input timestamps and periodic capture cutoffs. Exact
-record-by-record checking remains mandatory. Timing and metadata instrumentation
-still perturb the run; reference generation time is reported separately.
-The [research ledger](RESEARCH.md) and [hypothesis backlog](HYPOTHESES.md) separate
-observed costs from ideas that still need investigation.
-Optimization decisions separate computational efficiency, bounded load response
-and tail latency. The harness can reuse equivalent release builds across
-`--rates 1000 3000 5000` and compare the same public decoder API with
-`--decoder-profile`. Use `--baseline-patch` to compare a previous experimental
-candidate against a combination without committing either. Optional
-`--allocation-profile` captures a fixed small heaptrack replay after all timing;
-instrumented timing is never included in latency comparisons. These are
-experimental screens, not automatic promotion:
-promising local savings retain any unresolved pipeline-regression warning until
-the integrated collector passes qualification.
-Shape-specific owner and recorder spans distinguish replacement arrays from
-1/4/16-entry updates. Snapshot-neighborhood queue groups separately report the
-first three affected and unrelated updates behind an array, based on offered
-identities/ordinals. These diagnose head-of-line delay; they do not establish its
-cause or maximum sustainable capacity. Empty groups have null quantiles.
+## Testing
 
 ```sh
 cargo fmt --all -- --check
-cargo check --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo test --locked --release
-cargo test --locked --release --test ingestion_load -- --ignored --nocapture
+```
+
+182 tests pass in debug and release (11 more are opt-in, below). They cover:
+
+- exact decimal parsing and bounded, typed decoding against real Polymarket
+  fixtures and generated adversarial cases;
+- book replay and lifecycle against an independent reference implementation;
+- local HTTP and WebSocket servers for discovery, subscriptions, reconnects,
+  heartbeats, stalls, oversized messages and shutdown;
+- recording round trips through the supplied SBE reader, including chunk
+  framing and byte-identical integrity rows;
+- the executable end to end, including config files and resource budgets.
+
+Ignored by default (run explicitly, some use the live feed or several GiB):
+
+```sh
+# Full owner loop, 550k synthetic books, every record checked by an oracle
+OWNER_BOOKS=550000 OWNER_SECONDS=70 cargo test --locked --release --lib production_owner_capacity -- --ignored --nocapture
 cargo test --locked --release --test recording_load -- --ignored --nocapture
-# Read-only live coverage gate, bounded to 120 seconds; may fail honestly:
+cargo test --locked --release --test ingestion_load -- --ignored --nocapture
 cargo test --locked --test discovery_http live_discovery_coverage -- --ignored --nocapture
 ```
 
-The original schema, generated codecs and reader remain unchanged. The supplied
-writer now separates physical flushing from chunk completion. See [the C5 plan](5.md),
-[protocol contracts](docs/protocol.md) and [remaining checks](docs/revision-check.md).
+## Limitations
 
-### Where the code lives
+- Polymarket's feed has no replay or sequence guarantee, so exchange-wide
+  losslessness cannot be proven; the collector proves only that every accepted
+  message was recorded, and marks every known gap.
+- Network latency from Polymarket is not measured; the public feed arrives over
+  the internet with tens of milliseconds of delay.
+- Opening ~527 sockets takes about 13 minutes at the deliberately polite
+  connection pacing.
+- Occasional owner-thread waits of 30–70 ms remain unattributed; initial
+  subscription arrays cost 25–46 ms of real work during ramp.
+- Two-replica full-universe operation has not been measured. Kalshi is not
+  implemented; the adapter boundary admits it later.
 
-| Component | Files |
-|---|---|
-| Entry point | `src/main.rs` (runtime + exit status only); `src/collector/` wires C1–C5 and owns ordered shutdown: `options.rs` (CLI), `owner.rs` (the market-data owner thread) |
-| C1 discovery | `src/discovery/` |
-| C2 ingestion | `src/websocket/` (`manager.rs` assignments, `worker.rs` one socket per task, `ingress.rs` bounded handoff) |
-| C3 decoding | `src/market_data/` (`decimal.rs` exact scaling, `polymarket.rs` bounded parsing; `ResourceLimit` marks budget rejections) |
-| C4 books | `src/orderbook/` — `book.rs` levels; `store/` the single-owner `Processor`: `apply.rs` events, `subscription.rs`, `desired.rs` reconciliation, `invalidation.rs`, `selection.rs`, `schedule.rs` timers, `slots.rs` replicas; `health.rs` policy |
-| C5 recording | `src/recording/` |
+## About the SBE schema
 
-This repo uses the [FIX SBE standard](https://fixtrading.org/packages/simple-binary-encoding-technical-specification-v2-rc2/)
-for its binary output. The supplied Rust helpers abstract encoding and decoding.
-
-### More background, in case you are curious!
-
-FIX SBE is defined in XML, which I find extremely cumbersome to edit, especially
-when updating schemas frequently. To solve this, I have also introduced some
-helper code that takes our own custom YAML format, and turns it into FIX SBE
-XML, which in turn is used to generate rust code to encode and decode the
-messages. **You don't need to edit any of these files**. This explanation is
-simply to help you understand the origins of the various files in this repo.
-
-If you're curious to see the YAML schema, take a look at [challenge_orderbook.yaml](https://github.com/voluntas-io/engineering-challenge/blob/main/sbe_schemas/engineering_challenge/challenge_orderbook.yaml).
-We also use a custom timestamp field, so that the Rust struct can use
-`chrono::DateTime` in the generated struct, and in SBE schema, it is a uint64
-representing the timestamp as the number of microseconds since unix epoch.
+The schema is written in the template's YAML format
+([`challenge_orderbook.yaml`](sbe_schemas/engineering_challenge/challenge_orderbook.yaml)),
+converted to FIX SBE XML at build time, and used to generate the Rust codecs.
+Timestamps use a custom field so the generated structs use `chrono::DateTime`;
+on the wire they are `uint64` microseconds since the Unix epoch.
