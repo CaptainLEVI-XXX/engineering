@@ -1,7 +1,7 @@
 //! Opt-in capacity diagnostic through the actual production owner loop and C5.
 //! Synthetic independent arrivals; no REST, socket parsing or exchange coverage claim.
 use super::*;
-use crate::collector::DEFAULT_QUEUE_ITEMS;
+
 use crate::{
     Side,
     discovery::AdapterId,
@@ -17,7 +17,11 @@ fn number(name: &str, default: usize) -> usize {
 fn default_ingress_retains_a_live_sized_burst_in_order() {
     // The live diagnostic observed 23,404 queued messages that promptly drained.
     // Hold the consumer unscheduled to make a nearby 25k burst deterministic.
-    let (send, receive) = ingress::channel(DEFAULT_QUEUE_ITEMS, 64 << 20).unwrap();
+    let (send, receive) = ingress::channel(
+        crate::collector::CollectorConfig::default().run.queue_items,
+        64 << 20,
+    )
+    .unwrap();
     let session = Session {
         worker: 0,
         generation: 1,
@@ -99,7 +103,11 @@ fn production_owner_capacity_preserves_every_record() {
     });
     // Match the executable: no intake before the writer's startup flush.
     started.recv_timeout(Duration::from_secs(15)).unwrap();
-    let (send, receive) = ingress::channel(DEFAULT_QUEUE_ITEMS, 64 << 20).unwrap();
+    let (send, receive) = ingress::channel(
+        crate::collector::CollectorConfig::default().run.queue_items,
+        64 << 20,
+    )
+    .unwrap();
     let (recovery, mut requests) = mpsc::channel(workers);
     let (stop, stopped) = watch::channel(false);
     let start = Clock::now();
@@ -272,7 +280,7 @@ fn production_owner_capacity_preserves_every_record() {
     eprintln!(
         "owner_load_result {}",
         serde_json::json!({"books":books,"workers":workers,"replicas":replicas,"rate":rate,
-        "queue_items":DEFAULT_QUEUE_ITEMS,"queue_bytes":64 << 20,
+        "queue_items":crate::collector::CollectorConfig::default().run.queue_items,"queue_bytes":64 << 20,
         "seconds":seconds,"initialized_seconds":initialized_seconds,"accepted":accepted,
         "offered_seconds":offered_seconds,"max_offer_lag_us":max_offer_lag.as_micros(),
         "failure":failure,"owner":format!("{result:?}"),"output":output})

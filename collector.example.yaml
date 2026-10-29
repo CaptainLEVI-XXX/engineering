@@ -1,0 +1,65 @@
+# Collector configuration. Every key is optional; omitted keys keep these
+# built-in defaults. Unknown keys are rejected. Load with:
+#   engineering-challenge --config collector.yaml --integrity-path RUN.jsonl > RUN.sbe
+# Precedence: defaults < this file < command-line overrides. The effective
+# config (including derived values) is recorded as the sidecar's first
+# control row, so every capture states exactly which limits produced it.
+# A test keeps this file identical to the code defaults.
+
+run:
+  gamma_url: https://gamma-api.polymarket.com/markets/keyset
+  # Bounded ingress between socket workers and the book owner. A full queue is
+  # a terminal failure, never a silent drop.
+  queue_items: 65536
+  queue_bytes: 67108864
+
+transport:
+  endpoint: wss://ws-subscriptions-clob.polymarket.com/ws/market
+  assets_per_socket: 1000
+  # Must cover the whole desired universe (x2 with two replicas), or startup
+  # fails its capacity check rather than recording a silent sample.
+  max_sockets: 1024
+  # 1 or 2; 2 subscribes every market on two independent sockets.
+  replicas_per_market: 1
+  lifecycle_hints: false
+  subscription_batch: 100
+  # Larger messages end their session (visible boundary) and reconnect.
+  max_message_bytes: 2097152
+  io_timeout_ms: 10000
+  heartbeat_ms: 10000
+  pong_timeout_ms: 30000
+  reconnect_min_ms: 250
+  reconnect_max_ms: 30000
+  shutdown_timeout_ms: 15000
+  connection_concurrency: 2
+  connection_interval_ms: 1000
+  initialization_timeout_ms: 30000
+
+books:
+  monitoring: false
+  renewal_interval_ms: 1800000
+  instruments: 1000000
+  replicas: 2000000
+  # Per book side; at most 65535 (SBE group count). Deeper books are
+  # quarantined (visible invalidation), never truncated.
+  levels_per_side: 65535
+  # Memory bound across ALL replicas, including the old+new peak while a
+  # snapshot replaces a book. Size it from a sampled run's `peak_levels` and
+  # depth summary; each level costs roughly 30-40 bytes of book memory.
+  total_levels: 10000000
+  initialization_timeout_ms: 30000
+  recovery_timeout_ms: 120000
+  recovery_attempts: 3
+  wire_events: 4096
+  wire_entries: 65535
+  identity_bytes: 256
+
+recording:
+  batches: 16
+  batch_bytes: 4194304
+  entries: 4096
+  publish_bytes: 262144
+  publish_age_ms: 5
+  buffer_bytes: 262144
+  flush_age_ms: 5
+  chunk_age_ms: 60000

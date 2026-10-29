@@ -228,4 +228,7 @@ pub struct Stats {
     pub renewals_granted: u64,
     pub lifecycle_hints_dropped: u64,
     pub resource_quarantines: u64,
+    /// Highest committed level count across all replicas; compare with
+    /// `Config::total_levels` to size the budget for the observed universe.
+    pub peak_levels: usize,
 }

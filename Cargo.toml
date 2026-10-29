@@ -10,6 +10,8 @@ chrono = "0.4"
 crossbeam = "0.8.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+# Operator config file; already locked as a build dependency (SBE schema).
+serde_yaml_ng = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net", "io-util"] }
 tokio-tungstenite = { version = "=0.28.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }

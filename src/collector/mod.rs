@@ -2,7 +2,7 @@
 //! thread (C3/C4) -> output thread (C5), then ordered shutdown and drain.
 use crate::{
     discovery::polymarket::{Command, Discovery, Gamma},
-    orderbook, recording,
+    recording,
     websocket::{ingress, run_manager},
 };
 use anyhow::{Context, Result, ensure};
@@ -12,22 +12,28 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
+mod config;
 mod options;
 mod owner;
-pub use options::{DEFAULT_QUEUE_ITEMS, Options};
+pub use config::CollectorConfig;
+pub use options::Options;
 use owner::{ConsumerReport, process_books, validate_transport};
 
 pub async fn run(options: Options) -> Result<()> {
     let Options {
-        transport: config,
-        gamma,
+        config: collector,
         seconds,
-        queue_items,
-        queue_bytes,
         transport_only,
-        monitoring,
         integrity_path,
     } = options;
+    let effective = collector.effective(transport_only);
+    let book_config = collector.book_config(transport_only);
+    let config = collector.transport_config();
+    let (gamma, queue_items, queue_bytes) = (
+        collector.run.gamma_url.as_str(),
+        collector.run.queue_items,
+        collector.run.queue_bytes,
+    );
     if transport_only {
         eprintln!(
             "transport validation only: raw messages are counted and discarded; stdout remains empty"
@@ -39,26 +45,11 @@ pub async fn run(options: Options) -> Result<()> {
         );
     }
     let config = Arc::new(config);
-    let (mut discovery, commands, changes) = Discovery::new(Gamma::new(&gamma)?);
+    let (mut discovery, commands, changes) = Discovery::new(Gamma::new(gamma)?);
     let (output, receiver) = ingress::channel(queue_items, queue_bytes)?;
     let (stop, _) = watch::channel(false);
     let (recovery_send, recovery_receive) = mpsc::channel(config.max_sockets);
     let consumer_stop = stop.subscribe();
-    let book_config = orderbook::Config {
-        sessions: config.max_sockets,
-        selection: if config.replicas_per_market == 2 || monitoring {
-            orderbook::SelectionPolicy::Automatic
-        } else {
-            orderbook::SelectionPolicy::Manual
-        },
-        monitoring,
-        snapshot_interval: (!transport_only).then_some(Duration::from_secs(60)),
-        wire: crate::market_data::Limits {
-            message_bytes: config.max_message_bytes,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
     let (approval_send, approval) = crossbeam::channel::bounded(1);
     let (writer_send, mut writer_receive) = oneshot::channel();
     let mut writer_thread = None;
@@ -73,7 +64,8 @@ pub async fn run(options: Options) -> Result<()> {
             .open(&label)
             .context("create integrity sidecar")?;
         let stdout = std::fs::File::from(std::io::stdout().as_fd().try_clone_to_owned()?);
-        let (recorder, output) = recording::channel(recording::Config::default(), &book_config)?;
+        let (mut recorder, output) =
+            recording::channel(collector.recording_config(), &book_config)?;
         let (ready_send, ready) = oneshot::channel();
         writer_thread = Some(
             std::thread::Builder::new()
@@ -95,6 +87,8 @@ pub async fn run(options: Options) -> Result<()> {
             Ok(result) => result.context("output startup failed")?,
             Err(_) => std::process::exit(1), // blocked output: no locks or thread joins
         }
+        // Provenance first: the sidecar states every limit that shaped the capture.
+        recorder.control(0, &effective)?;
         Some(recorder)
     };
     let (consumer_send, mut consumer_receive) = oneshot::channel();

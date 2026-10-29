@@ -84,6 +84,65 @@ pub(super) struct ConsumerReport {
     pub(super) diagnostics: String,
 }
 
+/// Committed depth across live replicas, sampled during the run (not at
+/// shutdown, when every session has ended and no replica is live). Sizes
+/// `books.total_levels` from an observed universe instead of a guess.
+#[derive(Debug, Default, PartialEq, serde::Serialize)]
+pub(super) struct DepthSummary {
+    /// Owner time of the reported sample: the deepest one taken.
+    pub(super) sampled_at_ms: u64,
+    pub(super) live_replicas: usize,
+    pub(super) levels: usize,
+    pub(super) p50: usize,
+    pub(super) p95: usize,
+    pub(super) p99: usize,
+    pub(super) max: usize,
+}
+impl DepthSummary {
+    /// Nearest-rank percentiles over levels per live replica.
+    pub(super) fn from_levels(mut levels: Vec<usize>) -> Self {
+        levels.sort_unstable();
+        // Nearest rank: the smallest value with at least p% of samples <= it.
+        let rank = |p: usize| match levels.len() {
+            0 => 0,
+            n => levels[(n * p).div_ceil(100).max(1) - 1],
+        };
+        Self {
+            sampled_at_ms: 0,
+            live_replicas: levels.len(),
+            levels: levels.iter().sum(),
+            p50: rank(50),
+            p95: rank(95),
+            p99: rank(99),
+            max: levels.last().copied().unwrap_or(0),
+        }
+    }
+    fn of(processor: &Processor, at: Duration) -> Self {
+        let mut sample = Self::from_levels(
+            processor
+                .coverage()
+                .filter(|r| r.state == orderbook::Validity::Live)
+                .map(|r| r.levels)
+                .collect(),
+        );
+        sample.sampled_at_ms = u64::try_from(at.as_millis()).unwrap_or(u64::MAX);
+        sample
+    }
+    /// Keep whichever sample held more committed levels; on a tie the newer
+    /// one, so an idle run still reports its live replica count.
+    fn deeper(self, newer: Self) -> Self {
+        if newer.levels >= self.levels {
+            newer
+        } else {
+            self
+        }
+    }
+}
+
+/// One owner-thread scan of every replica per interval: the same cadence and
+/// order of cost as the minute snapshots, absorbed by the bounded ingress.
+const DEPTH_SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
+
 pub(super) fn process_books(
     receiver: crossbeam::channel::Receiver<ingress::Envelope>,
     config: orderbook::Config,
@@ -107,6 +166,9 @@ pub(super) fn process_books(
     }
     let mut processor = Processor::with_receive_clock(config, start)?;
     let mut next_tick = Duration::ZERO;
+    let mut depth = DepthSummary::default();
+    let mut next_depth = DEPTH_SAMPLE_INTERVAL;
+    let mut sampled_at_stop = false;
     let mut invalidations = 0u64;
     let mut samples = Vec::new();
     let result: Result<()> = (|| {
@@ -145,6 +207,14 @@ pub(super) fn process_books(
             };
             let envelope = match receiver.recv_timeout(wait) {
                 Ok(envelope) => {
+                    // Workers send shutdown boundaries only after observing
+                    // stop, so checking here, before processing, samples the
+                    // books while every session is still live.
+                    if !sampled_at_stop && *stop.borrow() {
+                        sampled_at_stop = true;
+                        depth = std::mem::take(&mut depth)
+                            .deeper(DepthSummary::of(&processor, start.elapsed()));
+                    }
                     processor
                         .process(&envelope.message, start.elapsed(), &mut |o| {
                             sink(o, &mut recorder)
@@ -162,6 +232,10 @@ pub(super) fn process_books(
             }
             if !*stop.borrow() {
                 let now = start.elapsed();
+                if now >= next_depth {
+                    depth = std::mem::take(&mut depth).deeper(DepthSummary::of(&processor, now));
+                    next_depth = now + DEPTH_SAMPLE_INTERVAL;
+                }
                 if now >= next_tick {
                     processor.tick(now)?;
                     // A tick is a bounded slice, not necessarily all due work.
@@ -235,7 +309,7 @@ pub(super) fn process_books(
         let evidence = recorder.control(
             processor.input_cutoff(),
             &serde_json::json!({"kind":"owner_summary",
-            "stats":processor.stats(),"reconciliation":processor.reconciliation(),
+            "stats":processor.stats(),"reconciliation":processor.reconciliation(),"depth":depth,
             "coverage_counts":"rolling owner samples, not full-universe acceptance"}),
         );
         recorder.finish(result.and(evidence))
@@ -243,7 +317,7 @@ pub(super) fn process_books(
         result
     };
     let diagnostics = format!(
-        "books {:?}; invalidation_observations={invalidations} omitted_invalidation_details={} first_samples={samples:?}; asset/reason previews capped at 128 characters; initialization counts are observations, not full-universe coverage; replacement cannot recover missed history",
+        "books {:?}; depth {depth:?}; invalidation_observations={invalidations} omitted_invalidation_details={} first_samples={samples:?}; asset/reason previews capped at 128 characters; initialization counts are observations, not full-universe coverage; replacement cannot recover missed history",
         processor.stats(),
         invalidations - samples.len() as u64
     );
@@ -292,6 +366,32 @@ mod load_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depth_summary_uses_nearest_rank_over_live_replicas() {
+        assert_eq!(DepthSummary::from_levels(vec![]), DepthSummary::default());
+        let one = DepthSummary::from_levels(vec![7]);
+        assert_eq!(
+            (one.live_replicas, one.levels, one.p50, one.p99, one.max),
+            (1, 7, 7, 7, 7)
+        );
+        // Small samples: p95 of [1, 2, 3] is the largest value, p50 the middle.
+        let few = DepthSummary::from_levels(vec![3, 1, 2]);
+        assert_eq!((few.p50, few.p95, few.max), (2, 3, 3));
+        // Deepest sample wins; ties (including empty books) take the newer.
+        let mut empty_live = DepthSummary::from_levels(vec![0, 0]);
+        empty_live.sampled_at_ms = 9;
+        let kept = DepthSummary::default().deeper(empty_live);
+        assert_eq!((kept.live_replicas, kept.sampled_at_ms), (2, 9));
+        let deep = DepthSummary::from_levels(vec![5]);
+        assert_eq!(deep.deeper(DepthSummary::from_levels(vec![1, 1])).levels, 5);
+        // 1..=100 in reverse: ranks are exact, order of input is irrelevant.
+        let d = DepthSummary::from_levels((1..=100).rev().collect());
+        assert_eq!(
+            (d.live_replicas, d.levels, d.p50, d.p95, d.p99, d.max),
+            (100, 5050, 50, 95, 99, 100)
+        );
+    }
 
     #[test]
     fn invalidation_burst_drains_without_stderr_progress() {

@@ -254,6 +254,7 @@ async fn collector_records_or_validates_and_bounds_stalled_output_shutdown() {
         "books-dual-sigint",
         "books-blocked",
         "books-broken",
+        "books-budget",
     ] {
         let books = mode.starts_with("books");
         let dual = mode.contains("dual");
@@ -261,6 +262,9 @@ async fn collector_records_or_validates_and_bounds_stalled_output_shutdown() {
         let interrupt = mode.ends_with("sigint");
         let blocked = mode.ends_with("blocked");
         let broken = mode.ends_with("broken");
+        // A one-level side limit quarantines both two-level 00456 books
+        // deterministically, while 00123 keeps recording on both adapters.
+        let budget = mode.ends_with("budget");
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gamma_url = format!("http://{}/markets/keyset", http.local_addr().unwrap());
@@ -308,7 +312,8 @@ async fn collector_records_or_validates_and_bounds_stalled_output_shutdown() {
                     if books {
                         socket.send(Message::Text(json!([
                             {"event_type":"book","asset_id":"00123","timestamp":"42","bids":[{"price":"0.2","size":"3"}],"asks":[]},
-                            {"event_type":"book","asset_id":"00456","timestamp":"41","bids":[],"asks":[]}
+                            {"event_type":"book","asset_id":"00456","timestamp":"41","asks":[],
+                                "bids":if budget {json!([{"price":"0.2","size":"1"},{"price":"0.1","size":"1"}])} else {json!([])}}
                         ]).to_string().into())).await.unwrap();
                         socket.send(Message::Text(json!({"event_type":"price_change","timestamp":"42","price_changes":[
                             {"asset_id":"00123","side":"BUY","price":"0.2","size":"5"},
@@ -376,6 +381,16 @@ async fn collector_records_or_validates_and_bounds_stalled_output_shutdown() {
             .stderr(Stdio::piped());
         if books {
             command.arg("--integrity-path").arg(&integrity);
+        }
+        if budget {
+            // Budgets come from the operator config file, not code or flags.
+            let file = directory.path().join("collector.yaml");
+            std::fs::write(
+                &file,
+                "books:\n  levels_per_side: 1\n  total_levels: 12345\n",
+            )
+            .unwrap();
+            command.arg("--config").arg(&file);
         }
         let mut child = command.spawn().unwrap();
         if broken {
@@ -455,6 +470,61 @@ async fn collector_records_or_validates_and_bounds_stalled_output_shutdown() {
                     _ => panic!("unexpected SBE template"),
                 }
             }
+            let text = std::fs::read_to_string(&integrity).unwrap();
+            let rows: Vec<Value> = text
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            if budget {
+                for version in ["v1", "v2"] {
+                    assert_eq!(
+                        traces[&format!("polymarket:{version}:00123")],
+                        [3_000_000, 5_000_000, 0]
+                    );
+                }
+                assert_eq!(
+                    traces.len(),
+                    2,
+                    "quarantined books emit no records: {traces:?}"
+                );
+                assert_eq!(rows.last().unwrap()["output"]["records_confirmed"], 6);
+                assert_eq!(
+                    rows.iter()
+                        .filter(|r| r["cause"] == "resource_limit")
+                        .count(),
+                    2,
+                    "{text}"
+                );
+                let control = |kind: &str| {
+                    rows.iter()
+                        .find(|r| r["kind"] == "control" && r["event"]["kind"] == kind)
+                        .map(|r| r["event"].clone())
+                        .unwrap_or_else(|| panic!("no {kind} control row"))
+                };
+                // The effective config precedes all market data and owner rows.
+                let config = control("config");
+                assert_eq!(config["config"]["books"]["levels_per_side"], 1);
+                assert_eq!(config["config"]["books"]["total_levels"], 12345);
+                assert_eq!(config["derived"]["snapshot_interval_ms"], 60_000);
+                let first_control = rows.iter().find(|r| r["kind"] == "control").unwrap();
+                assert_eq!(first_control["event"]["kind"], "config");
+                let summary = control("owner_summary");
+                assert_eq!(summary["stats"]["resource_quarantines"], 2);
+                // 1 or 2: each 00123 book holds one level until its final
+                // change empties it; the two adapters may or may not overlap.
+                let peak = summary["stats"]["peak_levels"].as_u64().unwrap();
+                assert!((1..=2).contains(&peak), "{peak}");
+                assert_eq!(
+                    summary["depth"]["live_replicas"], 2,
+                    "{summary}\n{diagnostics}"
+                );
+                assert!(
+                    diagnostics.contains("resource_quarantines: 2"),
+                    "{diagnostics}"
+                );
+                assert!(diagnostics.contains("depth DepthSummary"), "{diagnostics}");
+                continue;
+            }
             assert_eq!(traces.len(), 4);
             for version in ["v1", "v2"] {
                 assert_eq!(
@@ -463,8 +533,7 @@ async fn collector_records_or_validates_and_bounds_stalled_output_shutdown() {
                 );
                 assert_eq!(traces[&format!("polymarket:{version}:00456")], [-1]);
             }
-            let text = std::fs::read_to_string(&integrity).unwrap();
-            let last: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+            let last = rows.last().unwrap();
             assert_eq!(last["kind"], "run_end");
             assert_eq!(last["success"], true);
             assert_eq!(last["output"]["records_confirmed"], 8);

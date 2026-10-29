@@ -19,6 +19,34 @@ cargo build --locked --release
 target/release/engineering-challenge --seconds 120 --integrity-path run.integrity.jsonl > run.sbe 2> collector.log
 ```
 
+### Configuration
+
+Limits and timings come from an optional YAML file; per-run settings stay on the
+command line. Precedence is built-in defaults < `--config FILE` < override flags
+(`--ws-url`, `--max-sockets`, `--monitoring`, …). [`collector.example.yaml`](collector.example.yaml)
+lists every key at its default (a test keeps it in sync); unknown keys and
+unrecordable values (for example `levels_per_side` above 65535) fail at startup.
+The effective configuration, including values the collector derives (sessions,
+selection, the 60 s snapshot cadence, decoder message bytes), is written as the
+integrity file's first control row, so each capture records its own limits.
+
+```sh
+cp collector.example.yaml collector.yaml   # edit books.total_levels etc.
+target/release/engineering-challenge --config collector.yaml --seconds 600 \
+  --integrity-path run.integrity.jsonl > run.sbe 2> collector.log
+```
+
+**Sizing a full-book run.** `books.total_levels` bounds book memory across every
+replica, including the old+new peak while a snapshot replaces a book (roughly
+30–40 bytes per level). A book that does not fit is quarantined, visibly, rather
+than truncated or crashing the process. Size it from a sampled run: the shutdown
+summary and the integrity file's `owner_summary` report `peak_levels`,
+`resource_quarantines` and a `depth` sample (live replicas, levels, p50/p95/p99/max
+per replica; the deepest of one sample per minute and one at stop). Set
+`total_levels` comfortably above the observed peak for the replicas you run, and
+budget disk for minute snapshots (about 36 + 16 × levels + ~90 symbol bytes per
+selected book per minute).
+
 Omit `--seconds` to run until SIGINT. The library boundary supplies owned raw text,
 application-receive timestamps, adapter/session identity, per-session ordinals and
 ordered lifecycle/subscription-request events. Full/closed ingress fails visibly;

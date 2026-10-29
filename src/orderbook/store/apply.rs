@@ -188,6 +188,7 @@ impl Processor {
         let instrument = &mut self.books[binding.book.0 as usize];
         let replica = instrument.replicas.get_mut(&binding.session.slot).unwrap();
         self.total_levels = self.total_levels - replica.book.len() + book.len();
+        self.stats.peak_levels = self.stats.peak_levels.max(self.total_levels);
         replica.book = book;
         if replica.state != Validity::Live {
             self.sources.get_mut(&session.worker).unwrap().initialized += 1;
@@ -377,6 +378,7 @@ impl Processor {
             replica.last = Some(metadata);
         }
         self.total_levels = total;
+        self.stats.peak_levels = self.stats.peak_levels.max(total);
         self.stats.changes += self.prepared.len() as u64;
         for PreparedLevel {
             binding,
