@@ -234,3 +234,151 @@ claiming any win. Not implemented in E21.
 Do not add persistent epochs or assume a two-asset feed. First establish the
 remaining count cost and binding distribution; fallback must migrate provisional
 counts and preserve intermediate peaks. No implementation or speed claim.
+
+## H20–H26 — full-universe run evidence and horizontal build/output research (2026-10-29)
+
+Inputs: the 30-minute, 527-socket orb run (40,301,598 records, 7.58 GB, 516,858
+desired books, `max_batch_age_us` 104,036, `max_snapshot_lateness_us` 87,946),
+the existing E20 analysis of the same Lemire article, pinned external sources
+(reth `966010c9`, NautilusTrader `49ad9ca7`, hftbacktest `5f3ec40b`, dbn
+`a7769303`, Rust Performance Book, kernel vm/pipe docs, LWN dirty-throttling
+series) and code reading. No production source changed; nothing below is a
+measured win.
+
+Load context: ~22k records/s and ~4.2 MB/s on average. Byte budget from the
+schema (snapshot 36 + 16/level + symbol, level 45 + symbol, ~91-byte symbol,
+~11 levels/book) estimates ~7.4 GB, consistent with the measured 7.58 GB:
+periodic snapshots are ~43% of bytes, level updates ~52%. Per-message CPU is
+not the live bottleneck; the observed tail is output-side.
+
+**Tail mechanism (code-confirmed, cause of stall unmeasured).** `publish_due`
+runs on every owner-loop pass (`collector/owner.rs:302`) and snapshot capture
+is sliced to ≤1 ms, so the owner cannot hold a batch for 100 ms by itself.
+When the free pool is empty, `publish_due` deliberately retains and keeps
+filling the current batch (`recording/mod.rs:203`); its age then grows until
+the writer returns a batch. A ~100 ms batch age therefore implies the writer
+was stalled ~100 ms. Linux dirty-page throttling pauses writers up to 100 ms by
+design (LWN 419638/415838); a slow stdout pipe consumer is the other candidate.
+
+| Id | Hypothesis | Expected effect | Confidence | Confirm / refute |
+|---|---|---|---|---|
+| H20 | Stall tolerance is ~80 ms + one batch fill, not 64 MiB. 5 ms aging publishes ~20 KB batches, so 16 slots empty after ~80 ms of writer stall; the retained batch then fills 4 MiB (~1 s) and the next acquire fails closed ("output pool exhausted"). More, smaller batches (config only, e.g. 64 × 1 MiB) raise tolerance with the same 64 MiB. | Fewer fatal stops under writer stalls; no CPU change | High (mechanism), unmeasured magnitude | Throttled-destination replay: stall duration that kills the run, 16×4 MiB vs 64×1 MiB; record min free-pool per minute |
+| H21 | Writer stalls come from page-cache writeback throttling (file) or the 64 KiB pipe (pipe). | Explains 104 ms tail | Medium | Per-`write_all`/flush duration histogram; `writeback:balance_dirty_pages` trace; rerun to file vs `/dev/null` vs pipe; `dirty_background_bytes=32M` operator test |
+| H22 | Done (uncommitted): `[profile.profiling]` = release + `debug = "line-tables-only"`. Release is deliberately unchanged: line tables changed generated code (`__text` 3,474,604 → 3,483,436 bytes, +0.25%, aarch64-apple-darwin, Rust toolchain of this repo), so a profile of the profiling build is attribution, not release timing. | Readable perf/samply profiles | High | Confirm hot spots against plain release before acting on them |
+| H23 | `maxperf` profile (`lto = "fat"`, `codegen-units = 1`), also try thin LTO. reth ships this as opt-in; rustc measured cgu=1 at −1.9% cycles; fat LTO can regress (rust#103453). | Low–medium CPU, no tail effect | Medium | Harness A/A then A/B on identical oracle; build time recorded |
+| H24 | Allocator (jemalloc/mimalloc) for BTreeMap node churn on snapshot replacement. Needs a dependency → only if a Linux profile shows malloc/free ≳10% of owner self-time. Nautilus measured large wins on Windows/glibc; reth measured mimalloc v3 worse and +0.8–2.5 GiB RSS. | Unknown | Low until profiled | H22 profile first; then A/B with RSS |
+| H25 | Done (uncommitted): replace the 60 s depth sort with a counting histogram; 500-case sorted nearest-rank oracle test. Sort of 515k values measured 1.3–3.5 ms (M2 standalone) plus the instrument walk. | Removes a few ms/min of owner work | High (small) | Same summary values from both methods on random inputs |
+| H26 | SIMD JSON (sonic-rs/simd-json). No published small-message (100 B–10 KB) evidence; unsafe-heavy; no exactness advantage over borrowed `&str`. New parser dependency needs separate approval. | Unknown CPU, no tail effect | Low | Criterion on retained Polymarket fixtures vs current decoder |
+
+
+**H27 — per-snapshot integrity rows (found while reviewing the r1 sidecar).**
+Every snapshot record (r1: ~11.3M, mostly periodic) also builds a
+`serde_json::Value` row on the owner thread (`recording/mod.rs:280`, nested
+`binding()` with `format!`), zero-fills an 8 KiB slot, serializes and
+truncates. This explains the 5.8 GB r1 sidecar (~483 B/row) next to 7.58 GB of
+SBE, both written synchronously by the one writer thread. Standalone M2
+replica of that code, 1M rows × 3 rounds: ~2.1 µs/row, of which Value
+construction+drop ~1.47 µs, serialization ~0.52 µs, 8 KiB memset ~0.14 µs —
+about 8× the ~250 ns SBE encoding of an 11-level snapshot. ~24 s owner CPU per
+30 min (~1.3% of a core): not a tail cause by itself, but ~43% of disk bytes
+feed the H21 writeback pressure. Lemire's "pay once" fits here: symbol,
+binding and origin are fixed per binding, so a direct writer could emit
+precomputed static bytes plus integers. The output must stay byte-identical to
+today's serde_json (BTreeMap key order); oracle = byte comparison against the
+current `json!` row on generated cases. Reducing what periodic rows contain is
+a C5 contract change and needs user approval; a faster identical writer does not.
+
+*Implemented (uncommitted, local, base 5269cf6):* snapshot rows are a typed
+`SnapshotFields` serialized by a hand-ordered `Serialize` impl (alphabetical,
+matching serde_json's BTreeMap), with a non-allocating binding object; other
+row kinds keep `json!`. Oracle: 5,000 generated cases (escaped/control/unicode
+symbols, integer boundaries, None/Some, selection objects, both adapters) are
+byte-identical to the former construction kept verbatim in the test; oversized
+rows fail in both. One intended difference: the former `json!` panicked for
+`due_us`/`receive_age_us` above u64::MAX (unreachable: ~584,000 years of
+microseconds); the typed row writes the number. Standalone M2 replica,
+1M rows × 3 rounds: 2,107–2,168 → 572–574 ns/row (~3.7×), the 8 KiB zero-fill
+(~140 ns) now a quarter of what remains. Same bytes on disk, so no change to
+H21 writeback pressure. Debug and release: 209 passed, 0 failed, 12 ignored;
+fmt and strict clippy clean. Pipeline A/B on the orb harness still pending.
+
+**Correction after the r2 live latency run (orb, 25 min, 2026-10-29).** The
+code-reading inference above — "a ~100 ms batch age implies a writer stall" —
+was wrong. r2 measured S5 p99 0.23–0.29 ms and S6 at the 5 ms flush cadence in
+every window, `nr_throttled_written` 0, dirty pages far below threshold. The
+tail is the owner: S2 queue wait max 24–40 ms in every minute window and
+130–141 ms twice; S3 single-message max 49.8 ms. H21 is refuted for this host;
+H20 remains an unobserved fail-closed risk, not the tail cause. Missed: an
+open batch also ages while the *owner* is busy outside message processing.
+
+**H28 — the once-a-minute depth walk.** `Replica` is 600 bytes and each
+instrument holds two inline, so `DepthSummary::of` strides ~517k × 1.3 KB
+(~640 MB) to read two fields per replica, on the owner thread. Simulated on the
+M2: 7.7 ms per walk once streaming, 198 ms on the first cold walk; a VM Xeon
+with 4 KiB pages will be slower. Plausible for the 24–40 ms per-minute floor;
+H25 removed only the sort. Unproven until timed in place. Candidate fix: count
+depth during the existing periodic snapshot pass (no extra walk, but samples
+spread over the minute — a documented semantic change), or slice the walk.
+
+**Rejected after analysis:**
+
+- *Cached encoded snapshots of unchanged books* (Lemire "pay once"). E21 measured
+  encoding at ~20–25 ns/level; 5.7M snapshot levels/min ≈ 125 ms CPU/min
+  (~0.2% of a core). The cache would hold ~150 MB and add invalidation risk on
+  every mutation path. No precedent found beyond CME MDP3's re-emitted
+  (not byte-cached) snapshot loop.
+- *`Vec::swap_remove`*: no hot-path `Vec` removal exists; remaining removals are
+  control-plane and order-sensitive.
+- *`panic = "abort"`*: removes the panicked consumer/writer reporting via
+  `join().is_err()` (`collector/mod.rs:211`, `:237`) and skips destructor
+  flushing of stdout and the integrity sidecar.
+- *`target-cpu=native` as default*: host-specific; at most a local experiment,
+  with a portable level (e.g. x86-64-v3) if ever shipped.
+
+Order: H21 measurement (in progress on the orb) and H20 tolerance test first,
+because they address the only observed tail and a fail-closed risk; then H22 →
+H23; H24/H26 only with profile evidence and approval; H25 any time.
+
+## H28/H29 fixes (local, uncommitted, base 5269cf6)
+
+**H28 fixed by removal.** r3 attributed the steady ~50 ms per-minute S2 floor
+to `DepthSummary::of` (matched S2 max within ~1 ms in 6 of 11 windows; 92 ms
+max live, ~50 ms offline). The periodic sample is removed; one sample is taken
+at stop (on the first envelope after stop, or on an idle timeout after stop).
+`peak_levels` remains exact for the whole run. `deeper()` is deleted with its
+only caller.
+
+**H29 confirmed and fixed.** The doubling `DesiredChunk` stalls (5→117 ms) are
+`HashMap<String, BookId>` resizes rehashing every ~77-byte asset ID. Standalone
+M2 replica, 550k inserts: stalls >1 ms at 14,336 / 28,672 / 57,344 / 114,688 /
+229,376 / 458,752 entries = 1.3 / 1.9 / 4.1 / 11.9 / 22.9 / 53.6 ms; none with
+`with_capacity(1_000_000)`. The adapter map now reserves `config.instruments`
+when the adapter first appears (~2M buckets, mostly untouched virtual memory).
+Rejected alternative: `books: Vec<Instrument>` growth. On the M2, 550k pushes
+of 1,304-byte elements had a worst push of 0.46–1.8 ms with or without
+reservation, because large reallocations remap pages (glibc `mremap` on Linux
+similarly), so it is left to grow. Regression test: the map's capacity is
+unchanged from the first to the bound-th identity, and the bound still rejects.
+
+Gates: fmt, strict clippy, debug and release 210 passed / 0 failed / 12
+ignored. Not yet re-measured: the offline owner-capacity test with the orb's
+instrumentation (`engineering/test`, bcadca6) is the A/B.
+
+## H30 — 1 ms publish/flush cadence (default changed, not yet measured)
+
+r2 steady state: ~6 ms p50 end to end, of which S6 (writer received → flushed)
+was 3.3 ms p50 and the rest mostly batch aging; S3 processing 6.9 µs. Defaults
+`publish_age` and `flush_age` are now 1 ms (minimum the config admits). Expected
+p50 ~1–2 ms; cost ~5× more publish/flush calls. Receive timestamps unchanged.
+
+Pool left at 16 × 4 MiB. Correction to H20's earlier "64 × 1 MiB" suggestion:
+`recording::channel` requires a batch to hold the largest admitted snapshot
+plus its 8 KiB sidecar slot (~2.1 MB at 65,535 levels/side), so 1 MiB batches
+fail at startup. Also, a shorter age shortens only the first part of the stall
+tolerance (slots × age: 80 → 16 ms); the retained last batch still fills its
+4 MiB before the fail-closed acquire, so total tolerance stays near one batch
+fill (~1 s at r2's ~4.4 MB/s), not 16 ms.
+
+A/B caution: arms that differ in these defaults are not comparable on batch
+age, S4–S7 or recorder metrics. Compare the H28/H29 stall fixes on S2 and
+owner-operation timings, or pin both arms to the same cadence.

@@ -59,8 +59,10 @@ recording:
   batch_bytes: 4194304
   entries: 4096
   publish_bytes: 262144
-  publish_age_ms: 5
+  # Output visibility cadence (minimum 1). Lower means fresher output and
+  # more write/flush calls; recorded receive timestamps do not change.
+  publish_age_ms: 1
   buffer_bytes: 262144
-  flush_age_ms: 5
+  flush_age_ms: 1
   chunk_age_ms: 60000
   latency_histograms: false

@@ -42,7 +42,8 @@ replica, including the old+new peak while a snapshot replaces a book (roughly
 than truncated or crashing the process. Size it from a sampled run: the shutdown
 summary and the integrity file's `owner_summary` report `peak_levels`,
 `resource_quarantines` and a `depth` sample (live replicas, levels, p50/p95/p99/max
-per replica; the deepest of one sample per minute and one at stop). Set
+per replica, sampled once at stop: a per-minute walk of every replica stalled
+ingress by 50–92 ms at full-universe size). Set
 `total_levels` comfortably above the observed peak for the replicas you run, and
 budget disk for minute snapshots (about 36 + 16 × levels + ~90 symbol bytes per
 selected book per minute).
@@ -58,10 +59,10 @@ no required integrity file. An existing integrity path is rejected, never overwr
 
 The output pool reserves 16 × 4 MiB plus descriptors (~65 MiB); book, ingress,
 symbol-cache and physical-buffer memory is additional. Publication targets
-256 KiB / 5 ms; physical flush targets 5 ms. These are checked between work items,
+256 KiB / 1 ms; physical flush targets 1 ms (configurable, minimum 1 ms). These are checked between work items,
 not hard-real-time guarantees. With multiple batches, if all other batches are
 outstanding, soft size/age publication retains the last batch and appends exact
-records within its existing limits; age retries every 5 ms. Hard byte/descriptor
+records within its existing limits; age retries every publish interval. Hard byte/descriptor
 exhaustion still fails closed when no reusable batch remains. Records never
 cross 64 MiB logical chunks. Sparse
 chunks are padded after 60 seconds or at finish, potentially adding ~64 MiB/minute.

@@ -36,9 +36,16 @@ impl Processor {
                         reserved: None,
                     });
                     self.health_due.insert((self.now, id));
+                    // Reserve the configured bound when an adapter first appears.
+                    // On-demand growth rehashed every ~77-byte asset ID on the
+                    // owner thread, and each doubling's stall doubled (53.6 ms at
+                    // 458,752 IDs on an M2; 117 ms during a live ramp). Large
+                    // `books` growth is a page remap, not a copy, so it is left
+                    // to grow.
+                    let capacity = self.config.instruments;
                     self.by_adapter
                         .entry(adapter)
-                        .or_default()
+                        .or_insert_with(|| HashMap::with_capacity(capacity))
                         .insert(asset.into(), id);
                     id
                 }
